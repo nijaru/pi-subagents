@@ -23,6 +23,7 @@ interface AgentConfig {
   name: string;
   description: string;
   model?: string;
+  taskType?: string;
   tools?: string[];
   systemPrompt: string;
   source: "user" | "project";
@@ -61,6 +62,19 @@ const MAX_CONCURRENCY = 4;
 const MAX_RETRIES = 3;
 const MAX_OUTPUT_BYTES = 100 * 1024; // 100KB per agent output
 const DEFAULT_GATE_TIMEOUT_MS = 30_000;
+
+/** Task-type to model tier routing. Agents without an explicit model get routed based on task-type. */
+const TASK_TYPE_MODELS: Record<string, string> = {
+  simple: "openrouter/deepseek/deepseek-v4-flash",
+  search: "openrouter/deepseek/deepseek-v4-flash",
+  explore: "openrouter/deepseek/deepseek-v4-flash",
+  code: "xiaomi-tp/mimo-v2.5-pro",
+  implement: "xiaomi-tp/mimo-v2.5-pro",
+  debug: "xiaomi-tp/mimo-v2.5-pro",
+  reasoning: "openrouter/deepseek/deepseek-v4-pro",
+  review: "parasail/parasail-kimi-k27-code",
+  architecture: "parasail/parasail-kimi-k27-code",
+};
 const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
 
 // ── State ───────────────────────────────────────────────────────────────────
@@ -248,6 +262,7 @@ function loadAgents(dir: string, source: "user" | "project"): AgentConfig[] {
     agents.push({
       name: meta.name, description: meta.description,
       model: meta.model || undefined,
+      taskType: meta["task-type"] || undefined,
       tools: tools?.length ? tools : undefined,
       systemPrompt: body, source,
     });
@@ -290,6 +305,20 @@ function discoverAgents(cwd: string): AgentConfig[] {
   return Array.from(map.values());
 }
 
+/** Find the .md file path for an agent by name. Checks project then user dirs. */
+function findAgentFile(cwd: string, name: string): string | undefined {
+  // Check project .pi/agents/ first
+  const projectPath = path.join(cwd, ".pi", "agents", `${name}.md`);
+  if (fs.existsSync(projectPath)) return projectPath;
+  // Check project agents/ (no .pi prefix)
+  const projectAgents = path.join(cwd, "agents", `${name}.md`);
+  if (fs.existsSync(projectAgents)) return projectAgents;
+  // Check user global
+  const userPath = path.join(os.homedir(), ".pi", "agents", `${name}.md`);
+  if (fs.existsSync(userPath)) return userPath;
+  return undefined;
+}
+
 // ── Subprocess Runner ───────────────────────────────────────────────────────
 
 function getPiCmd(): { cmd: string; baseArgs: string[] } {
@@ -302,12 +331,25 @@ function getPiCmd(): { cmd: string; baseArgs: string[] } {
   return { cmd: process.execPath, baseArgs: [] };
 }
 
+function resolveModel(agent: AgentConfig, overrideModel?: string): string | undefined {
+  if (overrideModel) return overrideModel;
+  if (agent.model) return agent.model;
+  if (agent.taskType) return TASK_TYPE_MODELS[agent.taskType];
+  return undefined;
+}
+
 function buildArgs(
-  agent: AgentConfig, task: string, sessionDir: string, overrideModel?: string,
+  agent: AgentConfig, task: string, sessionDir: string, overrideModel?: string, opts?: { context?: "fresh" | "fork"; parentSessionFile?: string },
 ): { args: string[]; tmpFile?: string; cmd: string; baseArgs: string[] } {
   const { cmd, baseArgs } = getPiCmd();
-  const args = [...baseArgs, "--mode", "json", "-p", "--session-dir", sessionDir];
-  const model = overrideModel ?? agent.model;
+  const args = [...baseArgs, "--mode", "json", "-p"];
+  // Context mode: fork inherits parent session, fresh starts clean
+  if (opts?.context === "fork" && opts.parentSessionFile) {
+    args.push("--fork", opts.parentSessionFile);
+  } else {
+    args.push("--session-dir", sessionDir);
+  }
+  const model = resolveModel(agent, overrideModel);
   if (model) args.push("--model", model);
   if (agent.tools?.length) args.push("--tools", agent.tools.join(","));
   let tmpFile: string | undefined;
@@ -374,7 +416,7 @@ function spawnAndParse(
 
 /** Foreground run — blocks until the subprocess exits. */
 async function runAgentSync(
-  agents: AgentConfig[], name: string, task: string, cwd: string, depth: number, signal?: AbortSignal, overrideModel?: string,
+  agents: AgentConfig[], name: string, task: string, cwd: string, depth: number, signal?: AbortSignal, overrideModel?: string, contextOpts?: { context?: "fresh" | "fork"; parentSessionFile?: string },
 ): Promise<RunResult> {
   const agent = agents.find(a => a.name === name);
   if (!agent) {
@@ -383,7 +425,7 @@ async function runAgentSync(
   }
 
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
-  const { args, tmpFile, cmd } = buildArgs(agent, task, sessionDir, overrideModel);
+  const { args, tmpFile, cmd } = buildArgs(agent, task, sessionDir, overrideModel, contextOpts);
   const start = Date.now();
 
   try {
@@ -407,7 +449,7 @@ async function runAgentSync(
 
 /** Background run — spawns detached, returns immediately. stdout ignored (read from session files). */
 function runAgentAsync(
-  agents: AgentConfig[], name: string, task: string, cwd: string, depth: number, overrideModel?: string,
+  agents: AgentConfig[], name: string, task: string, cwd: string, depth: number, overrideModel?: string, contextOpts?: { context?: "fresh" | "fork"; parentSessionFile?: string },
 ): RunRecord {
   const agent = agents.find(a => a.name === name);
   const id = genId();
@@ -424,7 +466,7 @@ function runAgentAsync(
     return record;
   }
 
-  const { args, tmpFile, cmd } = buildArgs(agent, task, sessionDir, overrideModel);
+  const { args, tmpFile, cmd } = buildArgs(agent, task, sessionDir, overrideModel, contextOpts);
   // stdout ignored — we read from session files. This prevents pipe buffer hangs.
   const proc = spawn(cmd, args, {
     cwd, shell: false, stdio: ["ignore", "ignore", "pipe"],
@@ -583,7 +625,7 @@ export default function (pi: ExtensionAPI) {
     ].join("\n"),
 
     parameters: Type.Object({
-      action: Type.Optional(Type.String({ enum: ["list", "status", "wait", "resume"], description: "Lifecycle action." })),
+      action: Type.Optional(Type.String({ enum: ["list", "status", "wait", "resume", "interrupt", "create", "update", "delete"], description: "Lifecycle action. interrupt: cancel running agent. create/update/delete: manage agent definitions." })),
       id: Type.Optional(Type.String({ description: "Run id for status/wait/resume actions" })),
       background: Type.Optional(Type.Boolean({ description: "Run in background (single mode only). Returns immediately." })),
       agent: Type.Optional(Type.String({ description: "Agent name for single mode" })),
@@ -601,8 +643,17 @@ export default function (pi: ExtensionAPI) {
         gate: Type.Optional(Type.String({ description: "Shell command to validate step output. Exit 0 = pass. Step output in $SUBAGENT_OUTPUT env var." })),
         gateTimeout: Type.Optional(Type.Integer({ description: "Gate timeout in ms. Default: 30000." })),
         onFail: Type.Optional(Type.String({ enum: ["retry", "skip", "abort"], description: "Action on gate failure. retry: re-run step (max 3). skip: continue chain. abort: stop. Default: abort." })),
+        as: Type.Optional(Type.String({ description: "Named output. Available as {outputs.name} in later chain steps." })),
       }), { description: "Chain mode: sequential steps with optional quality gates between them." })),
+      context: Type.Optional(Type.String({ enum: ["fresh", "fork"], description: "Context mode. 'fresh' (default): child gets only the task. 'fork': child inherits parent's session history." })),
       cwd: Type.Optional(Type.String({ description: "Working directory for the run (absolute path). Defaults to the current project directory." })),
+      acceptance: Type.Optional(Type.Object({
+        criteria: Type.Optional(Type.Array(Type.String(), { description: "Describes what 'done' looks like. Reported in output for parent to evaluate." })),
+        verify: Type.Optional(Type.Array(Type.String(), { description: "Shell commands to validate output. All must exit 0 for acceptance to pass." })),
+        maxAttempts: Type.Optional(Type.Integer({ description: "Max retry attempts on acceptance failure. Default: 1 (no retries)." })),
+      }, { description: "Acceptance contract. Defines success criteria and verification for the agent's output." })),
+      prompt: Type.Optional(Type.String({ description: "System prompt for create/update actions. The agent's instructions." })),
+      taskType: Type.Optional(Type.String({ description: "Task type for create/update actions. Routes to model tier if no explicit model. Values: simple, search, explore, code, implement, debug, reasoning, review, architecture." })),
     }),
 
     async execute(_id, params, signal, _onUpdate, ctx) {
@@ -612,7 +663,7 @@ export default function (pi: ExtensionAPI) {
           const agents = discoverAgents(ctx.cwd);
           if (!agents.length) return ok("No agents found. Place .md files in .pi/agents/ (project) or ~/.pi/agents/ (global).");
           const lines = agents.map(a => {
-            const model = a.model ? ` [${a.model}]` : "";
+            const model = a.model ? ` [${a.model}]` : a.taskType ? ` [task:${a.taskType}]` : "";
             const tools = a.tools?.length ? ` tools:${a.tools.join(",")}` : "";
             return `${a.name}: ${a.description}${model}${tools} (${a.source})`;
           });
@@ -668,6 +719,67 @@ export default function (pi: ExtensionAPI) {
           return r.exitCode === 0 ? ok(r.output, d) : err(`Resume failed: ${r.stderr || r.output}`, d);
         }
 
+        if (params.action === "interrupt") {
+          if (!params.id) return err("Provide id for interrupt action.");
+          const match = findRun(params.id);
+          if (!match) return err(`Run not found: ${params.id}`);
+          if ("ambiguous" in match) return err(`Ambiguous id "${params.id}" — matches ${match.ambiguous.join(", ")}. Provide more characters.`);
+          if (match.status !== "running") return err(`Run ${match.id} is ${match.status}, not running. Cannot interrupt.`);
+          if (!match.proc) return err(`Run ${match.id} has no process handle. It may have been started in a different session.`);
+          try {
+            killProc(match.proc, "SIGTERM");
+            return ok(`Sent SIGTERM to ${match.agent} (${match.id}). It may take a few seconds to stop.`);
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            return err(`Failed to interrupt ${match.id}: ${msg}`);
+          }
+        }
+
+        if (params.action === "create") {
+          if (!params.agent) return err("Provide agent name for create action.");
+          if (!params.task) return err("Provide task (description) for create action.");
+          if (!params.prompt) return err("Provide prompt (system prompt) for create action.");
+          const agentsDir = path.join(ctx.cwd, ".pi", "agents");
+          fs.mkdirSync(agentsDir, { recursive: true });
+          const fp = path.join(agentsDir, `${params.agent}.md`);
+          if (fs.existsSync(fp)) return err(`Agent "${params.agent}" already exists at ${fp}. Use update to modify.`);
+          const fm = [
+            "---",
+            `name: ${params.agent}`,
+            `description: ${params.task}`,
+            params.model ? `model: ${params.model}` : "",
+            params.taskType ? `task-type: ${params.taskType}` : "",
+            "---",
+            "",
+            params.prompt,
+          ].filter(Boolean).join("\n");
+          fs.writeFileSync(fp, fm, "utf-8");
+          return ok(`Created agent "${params.agent}" at ${fp}`);
+        }
+
+        if (params.action === "update") {
+          if (!params.agent) return err("Provide agent name for update action.");
+          const existing = findAgentFile(ctx.cwd, params.agent);
+          if (!existing) return err(`Agent "${params.agent}" not found.`);
+          const raw = fs.readFileSync(existing, "utf-8");
+          const { meta, body } = parseFrontmatter(raw);
+          if (params.task) meta.description = params.task;
+          if (params.model) meta.model = params.model;
+          if (params.taskType) meta["task-type"] = params.taskType;
+          const prompt = params.prompt || body;
+          const fm = ["---", ...Object.entries(meta).map(([k, v]) => `${k}: ${v}`), "---", "", prompt].join("\n");
+          fs.writeFileSync(existing, fm, "utf-8");
+          return ok(`Updated agent "${params.agent}" at ${existing}`);
+        }
+
+        if (params.action === "delete") {
+          if (!params.agent) return err("Provide agent name for delete action.");
+          const existing = findAgentFile(ctx.cwd, params.agent);
+          if (!existing) return err(`Agent "${params.agent}" not found.`);
+          fs.unlinkSync(existing);
+          return ok(`Deleted agent "${params.agent}" (${existing})`);
+        }
+
         return err(`Unknown action: ${params.action}`);
       }
 
@@ -689,9 +801,17 @@ export default function (pi: ExtensionAPI) {
       const depth = getDepth();
       if (depth >= MAX_DEPTH) return err(`Max depth (${MAX_DEPTH}) reached. Cannot spawn deeper.`);
 
+      // Build context options for fork mode
+      const contextOpts = params.context === "fork"
+        ? { context: "fork" as const, parentSessionFile: ctx.sessionManager?.getSessionFile?.() ?? undefined }
+        : undefined;
+      if (params.context === "fork" && !contextOpts?.parentSessionFile) {
+        return err("Cannot use context: 'fork' — no parent session file available.");
+      }
+
       // ── Background single ──
       if (hasSingle && params.background) {
-        const record = runAgentAsync(agents, params.agent!, params.task!, cwd, depth + 1, params.model);
+        const record = runAgentAsync(agents, params.agent!, params.task!, cwd, depth + 1, params.model, contextOpts);
         return ok(
           `Background run started: ${record.id}\nAgent: ${record.agent}\nSession: ${record.sessionPath}\n\nUse action: 'wait', id: '${record.id}' to get the result.`,
           { mode: "background", runId: record.id, sessionPath: record.sessionPath },
@@ -700,9 +820,47 @@ export default function (pi: ExtensionAPI) {
 
       // ── Foreground single ──
       if (hasSingle) {
-        const r = await runAgentSync(agents, params.agent!, params.task!, cwd, depth + 1, signal, params.model);
-        const d = { mode: "single", results: [r] };
-        return r.exitCode === 0 ? ok(r.output, d) : err(`Agent failed: ${r.stderr || r.output}`, d);
+        const maxAttempts = params.acceptance?.maxAttempts ?? 1;
+        let lastResult: RunResult | undefined;
+
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          const r = await runAgentSync(agents, params.agent!, params.task!, cwd, depth + 1, signal, params.model, contextOpts);
+          lastResult = r;
+
+          if (r.exitCode !== 0) {
+            const d = { mode: "single" as const, results: [r] };
+            return err(`Agent failed: ${r.stderr || r.output}`, d);
+          }
+
+          // Run acceptance verification if specified
+          if (params.acceptance?.verify?.length) {
+            const verifyResults: string[] = [];
+            let allPassed = true;
+            for (const cmd of params.acceptance.verify) {
+              const { exitCode, stderr } = await runGate(cmd, r.output, cwd, 30_000, signal);
+              const passed = exitCode === 0;
+              verifyResults.push(`${passed ? "✓" : "✗"} ${cmd}`);
+              if (!passed) allPassed = false;
+            }
+
+            if (allPassed) {
+              const criteria = params.acceptance.criteria?.length
+                ? `\nCriteria: ${params.acceptance.criteria.join(", ")}` : "";
+              return ok(`${r.output}\n\nAcceptance: all checks passed${criteria}\n${verifyResults.join("\n")}`, { mode: "single", results: [r], accepted: true });
+            }
+
+            if (attempt < maxAttempts) continue; // retry
+            return err(`Acceptance failed after ${attempt} attempt(s):\n${verifyResults.join("\n")}`, { mode: "single", results: [r], accepted: false });
+          }
+
+          // No acceptance — return directly
+          const d = { mode: "single" as const, results: [r] };
+          return ok(r.output, d);
+        }
+
+        // Should not reach here, but safety fallback
+        const d = { mode: "single" as const, results: lastResult ? [lastResult] : [] };
+        return err("Agent did not produce a result.", d);
       }
 
       // ── Chain with quality gates ──
@@ -715,6 +873,7 @@ export default function (pi: ExtensionAPI) {
         }
 
         const results: RunResult[] = [];
+        const outputs: Record<string, string> = {};
         let previous = "";
         let i = 0;
         let retries = 0;
@@ -723,12 +882,17 @@ export default function (pi: ExtensionAPI) {
           const step = params.chain![i]!;
           let task = step.task.replace(/\{previous\}/g, previous);
           task = task.replace(/\{task\}/g, params.task ?? "");
-          const r = await runAgentSync(agents, step.agent, task, step.cwd ? path.resolve(step.cwd) : cwd, depth + 1, signal);
+          // Replace {outputs.name} with stored named outputs
+          task = task.replace(/\{outputs\.([^}]+)\}/g, (_: string, key: string) => outputs[key] ?? "");
+          const r = await runAgentSync(agents, step.agent, task, step.cwd ? path.resolve(step.cwd) : cwd, depth + 1, signal, undefined, contextOpts);
           results.push(r);
 
           if (r.exitCode !== 0) {
             return err(`Chain failed at step ${i + 1} (${step.agent}): ${r.stderr || r.output}`, { mode: "chain", results });
           }
+
+          // Store named output if step defines 'as'
+          if (step.as) outputs[step.as] = r.output;
 
           if (step.gate) {
             const timeout = step.gateTimeout ?? DEFAULT_GATE_TIMEOUT_MS;
@@ -765,7 +929,7 @@ export default function (pi: ExtensionAPI) {
         if (params.tasks!.length > MAX_PARALLEL) return err(`Too many tasks (${params.tasks!.length}). Max: ${MAX_PARALLEL}.`);
 
         const results = await mapConcurrent(params.tasks!, MAX_CONCURRENCY, (t) =>
-          runAgentSync(agents, t.agent, t.task, t.cwd ? path.resolve(t.cwd) : cwd, depth + 1, signal)
+          runAgentSync(agents, t.agent, t.task, t.cwd ? path.resolve(t.cwd) : cwd, depth + 1, signal, undefined, contextOpts)
         );
 
         const okCount = results.filter(r => r.exitCode === 0).length;
