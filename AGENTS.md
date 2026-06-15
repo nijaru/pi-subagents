@@ -2,18 +2,14 @@
 
 Clean declarative agent delegation for pi. Define agents, chain them, run them.
 
-## Design
-
-See DESIGN.md for the full API design and implementation notes.
-
 ## Architecture
 
-- Single extension, ~200-300 lines
+- Single extension, ~800 lines
 - Entry: `extensions/pi-subagents/index.ts`
-- Agent defs: `.pi/agents/*.md` (YAML frontmatter)
-- Three patterns: spawn(), chain(), parallel()
-- Context isolation by default (fresh)
-- Quality gates between steps
+- Agent defs: `agents/*.md` (YAML frontmatter)
+- Three patterns: single, chain, parallel
+- Quality gates between chain steps
+- Background execution with persistence
 - Bounded depth (default 3)
 
 ## Stack
@@ -21,7 +17,7 @@ See DESIGN.md for the full API design and implementation notes.
 - TypeScript, Bun
 - Pi extension API (`@earendil-works/pi-coding-agent`)
 - Pi TUI (`@earendil-works/pi-tui`)
-- Pi AI types (`@earendil-works/pi-ai`)
+- Typebox (parameter schemas)
 
 ## Testing
 
@@ -29,10 +25,12 @@ See DESIGN.md for the full API design and implementation notes.
 bun test
 ```
 
-## Key Patterns
+## Key Files
 
-- Markdown agent definitions (YAML frontmatter)
-- Fresh context by default, fork on demand
-- Quality gates: async functions between steps
-- Bounded depth: configurable max nesting
-- Intercom: pi's existing messaging
+```
+extensions/pi-subagents/index.ts   # extension entry point
+agents/*.md                        # agent definitions
+skills/pi-subagents/SKILL.md       # skill definition
+DESIGN.md                          # API design and implementation notes
+README.md                          # user-facing docs
+```
