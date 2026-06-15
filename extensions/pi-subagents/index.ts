@@ -578,7 +578,7 @@ export default function (pi: ExtensionAPI) {
       "Modes: agent+task (single), chain[...] (sequential), tasks[...] (parallel, max 8). Use exactly one.",
       "Actions: list (agents), status/wait (background runs), resume (follow-up). Set action, omit mode.",
       "Background: background=true returns run id. action=wait to block for result.",
-      "Chain: {previous} = prior step output (empty on first step). Gates: shell cmd, exit 0 = pass, $SUBAGENT_OUTPUT = step output.",
+      "Chain templates: {task} = original request, {previous} = prior step output (empty on first step). Gates: shell cmd, exit 0 = pass, $SUBAGENT_OUTPUT = step output.",
       "Model: agent definition sets default, parent can override with model param. Max depth: 3.",
     ].join("\n"),
 
@@ -587,7 +587,7 @@ export default function (pi: ExtensionAPI) {
       id: Type.Optional(Type.String({ description: "Run id for status/wait/resume actions" })),
       background: Type.Optional(Type.Boolean({ description: "Run in background (single mode only). Returns immediately." })),
       agent: Type.Optional(Type.String({ description: "Agent name for single mode" })),
-      task: Type.Optional(Type.String({ description: "Task for single mode, or follow-up message for resume" })),
+      task: Type.Optional(Type.String({ description: "Task for single mode, {task} template source for chain mode, or follow-up message for resume" })),
       model: Type.Optional(Type.String({ description: "Override agent's default model (actual model name, e.g. 'openrouter/deepseek/deepseek-v4-flash')" })),
       tasks: Type.Optional(Type.Array(Type.Object({
         agent: Type.String({ description: "Agent name. Use action=list to see available agents." }),
@@ -596,7 +596,7 @@ export default function (pi: ExtensionAPI) {
       }), { description: "Parallel mode: array of agent+task pairs. Max 8 tasks, 4 run concurrently." })),
       chain: Type.Optional(Type.Array(Type.Object({
         agent: Type.String({ description: "Agent name. Use action=list to see available agents." }),
-        task: Type.String({ description: "Task description. Use {previous} to include prior step output. On first step, {previous} is empty." }),
+        task: Type.String({ description: "Task template. {task} = original request, {previous} = prior step output (empty on first step)." }),
         cwd: Type.Optional(Type.String({ description: "Working directory for this step (absolute path). Defaults to top-level cwd." })),
         gate: Type.Optional(Type.String({ description: "Shell command to validate step output. Exit 0 = pass. Step output in $SUBAGENT_OUTPUT env var." })),
         gateTimeout: Type.Optional(Type.Integer({ description: "Gate timeout in ms. Default: 30000." })),
@@ -707,6 +707,13 @@ export default function (pi: ExtensionAPI) {
 
       // ── Chain with quality gates ──
       if (hasChain) {
+        // Validate all chain agents exist before executing any
+        for (let si = 0; si < params.chain!.length; si++) {
+          const step = params.chain![si]!;
+          const cfg = agents.find(a => a.name === step.agent);
+          if (!cfg) return err(`Chain step ${si + 1}: unknown agent "${step.agent}". Use action="list" to see available agents.`);
+        }
+
         const results: RunResult[] = [];
         let previous = "";
         let i = 0;
@@ -714,7 +721,8 @@ export default function (pi: ExtensionAPI) {
 
         while (i < params.chain!.length) {
           const step = params.chain![i]!;
-          const task = step.task.replace(/\{previous\}/g, previous);
+          let task = step.task.replace(/\{previous\}/g, previous);
+          task = task.replace(/\{task\}/g, params.task ?? "");
           const r = await runAgentSync(agents, step.agent, task, step.cwd ? path.resolve(step.cwd) : cwd, depth + 1, signal);
           results.push(r);
 
