@@ -86,21 +86,28 @@ tools: read, write, edit, bash, grep, find, ls
 Review code for correctness, safety, and style. Report findings with file:line references.
 ```
 
-Required fields: `name`, `description`. Optional: `tools` (comma-separated), `model` (actual model name).
+Supported frontmatter fields:
 
-If no model is specified, the agent inherits the parent's model. The parent can override at spawn time with the `model` parameter.
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | yes | Agent identifier used in `agent` param |
+| `description` | yes | Shown in `action=list` output |
+| `model` | no | Default model for this agent (parent can override) |
+| `tools` | no | Comma-separated tool list. Omit to inherit all tools |
+
+All other frontmatter fields are ignored.
 
 ### Included Agents
 
-| Agent | Purpose |
-|-------|---------|
-| architect | Design systems, produce implementation plans |
-| explore | Codebase reconnaissance |
-| profiler | Performance analysis |
-| researcher | External docs, web, library lookup |
-| reviewer | Code review, build, test |
-| security-auditor | Security review, trust boundaries |
-| worker | General-purpose (default) |
+| Agent | Purpose | Default Model |
+|-------|---------|---------------|
+| architect | Design systems, produce implementation plans | kimi-k27-code |
+| explore | Codebase reconnaissance | deepseek-v4-flash |
+| profiler | Performance analysis | mimo-v2.5-pro |
+| researcher | External docs, web, library lookup | mimo-v2.5-pro |
+| reviewer | Code review, build, test | kimi-k27-code |
+| security-auditor | Security review, trust boundaries | kimi-k27-code |
+| worker | General-purpose (default) | inherits parent |
 
 ## Bounded Depth
 

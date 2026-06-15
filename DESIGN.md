@@ -8,7 +8,7 @@ The existing pi-subagents (nicobailon, 2.1K stars) has the right ideas but wrong
 
 ## Agent Definitions
 
-Markdown files with YAML frontmatter. Place in `agents/` (project) or `~/.pi/agents/` (global).
+Markdown files with YAML frontmatter. Place in `agents/` (project) or `~/.pi/agents/` (global). Project-level agents are discovered by walking up from cwd, stopping at the first directory containing `.git`, `package.json`, `Cargo.toml`, or `go.mod`.
 
 ```markdown
 ---
@@ -23,6 +23,17 @@ Review code for correctness, safety, and style. Report findings with file:line r
 Required: `name`, `description`. Optional: `tools` (comma-separated), `model` (actual model name).
 
 If no model is specified, the agent inherits the parent's model. The parent can override at spawn time.
+
+### Supported frontmatter fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | yes | Agent identifier used in `agent` param |
+| `description` | yes | Shown in `action=list` output |
+| `model` | no | Default model for this agent (parent can override) |
+| `tools` | no | Comma-separated tool list. Omit to inherit all tools |
+
+All other fields in the frontmatter are ignored by the extension.
 
 ## Execution Patterns
 

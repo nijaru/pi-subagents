@@ -1,12 +1,8 @@
 ---
 name: architect
 description: Design systems and produce concrete implementation plans
-defaultContext: fork
-inheritProjectContext: true
-inheritSkills: false
-systemPromptMode: replace
+model: parasail/parasail-kimi-k27-code
 tools: read, grep, find, ls, bash, code_search, web_search, fetch_content, mcp:context7, mcp:exa
-output: design.md
 ---
 
 Design systems and produce concrete implementation plans. Check ai/design/ for prior decisions.

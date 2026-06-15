@@ -194,8 +194,13 @@ function fmtRunStatus(r: RunRecord): string {
   return `${r.agent} [${r.status}] (${ms}${costStr}) id:${r.id}`;
 }
 
-function findRun(id: string): RunRecord | undefined {
-  return runs.get(id) ?? Array.from(runs.values()).find(r => r.id.startsWith(id));
+function findRun(id: string): RunRecord | { ambiguous: string[] } | undefined {
+  const exact = runs.get(id);
+  if (exact) return exact;
+  const matches = Array.from(runs.values()).filter(r => r.id.startsWith(id));
+  if (matches.length === 0) return undefined;
+  if (matches.length === 1) return matches[0]!;
+  return { ambiguous: matches.map(r => r.id) };
 }
 
 /** Kill a process group (not just the direct child). */
@@ -250,10 +255,18 @@ function loadAgents(dir: string, source: "user" | "project"): AgentConfig[] {
   return agents;
 }
 
+function isProjectRoot(dir: string): boolean {
+  return fs.existsSync(path.join(dir, ".git"))
+    || fs.existsSync(path.join(dir, "package.json"))
+    || fs.existsSync(path.join(dir, "Cargo.toml"))
+    || fs.existsSync(path.join(dir, "go.mod"));
+}
+
 function discoverAgents(cwd: string): AgentConfig[] {
   const map = new Map<string, AgentConfig>();
   for (const a of loadAgents(path.join(os.homedir(), ".pi", "agents"), "user")) map.set(a.name, a);
   let dir = cwd;
+  const home = os.homedir();
   while (true) {
     // Check both .pi/agents/ and agents/ at each level
     const piAgents = path.join(dir, ".pi", "agents");
@@ -268,6 +281,8 @@ function discoverAgents(cwd: string): AgentConfig[] {
       found = true;
     }
     if (found) break;
+    // Stop at project root or home directory to avoid walking to /
+    if (isProjectRoot(dir) || dir === home) break;
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;
@@ -560,23 +575,11 @@ export default function (pi: ExtensionAPI) {
     label: "Subagent",
     description: [
       "Delegate tasks to specialized subagents with isolated context.",
-      "",
-      "Execution modes (use exactly one):",
-      "- single: { agent, task } — one agent, one task (blocks until done)",
-      "- chain: { chain: [...] } — sequential steps with {previous} placeholder and optional quality gates",
-      "- parallel: { tasks: [...] } — concurrent execution (max 8, 4 concurrent)",
-      "",
-      "Lifecycle actions (set action, omit mode):",
-      "- list: list available agents",
-      "- status: check a background run (requires id)",
-      "- wait: block until a background run completes (requires id)",
-      "- resume: continue a completed/failed run with a follow-up message (requires id + task)",
-      "",
-      "Background: set background: true with agent+task. Returns run id. Use action:wait to get result.",
-      "Template variables in chain tasks: {previous} = prior step output.",
-      "Quality gates: shell command, exit 0 = pass. Output in $SUBAGENT_OUTPUT env var.",
-      "Gate timeout: 30s default, configurable per step via gateTimeout (ms).",
-      "Model: agent definition can specify model, parent can override. Bounded depth: max 3 levels.",
+      "Modes: agent+task (single), chain[...] (sequential), tasks[...] (parallel, max 8). Use exactly one.",
+      "Actions: list (agents), status/wait (background runs), resume (follow-up). Set action, omit mode.",
+      "Background: background=true returns run id. action=wait to block for result.",
+      "Chain: {previous} = prior step output (empty on first step). Gates: shell cmd, exit 0 = pass, $SUBAGENT_OUTPUT = step output.",
+      "Model: agent definition sets default, parent can override with model param. Max depth: 3.",
     ].join("\n"),
 
     parameters: Type.Object({
@@ -587,19 +590,19 @@ export default function (pi: ExtensionAPI) {
       task: Type.Optional(Type.String({ description: "Task for single mode, or follow-up message for resume" })),
       model: Type.Optional(Type.String({ description: "Override agent's default model (actual model name, e.g. 'openrouter/deepseek/deepseek-v4-flash')" })),
       tasks: Type.Optional(Type.Array(Type.Object({
-        agent: Type.String(),
-        task: Type.String(),
-        cwd: Type.Optional(Type.String()),
-      }), { description: "Parallel mode: array of {agent, task}" })),
+        agent: Type.String({ description: "Agent name. Use action=list to see available agents." }),
+        task: Type.String({ description: "Task description for this agent." }),
+        cwd: Type.Optional(Type.String({ description: "Working directory for this agent (absolute path). Defaults to top-level cwd." })),
+      }), { description: "Parallel mode: array of agent+task pairs. Max 8 tasks, 4 run concurrently." })),
       chain: Type.Optional(Type.Array(Type.Object({
-        agent: Type.String(),
-        task: Type.String(),
-        cwd: Type.Optional(Type.String()),
-        gate: Type.Optional(Type.String({ description: "Shell command to validate. Exit 0 = pass. Output in $SUBAGENT_OUTPUT env var." })),
+        agent: Type.String({ description: "Agent name. Use action=list to see available agents." }),
+        task: Type.String({ description: "Task description. Use {previous} to include prior step output. On first step, {previous} is empty." }),
+        cwd: Type.Optional(Type.String({ description: "Working directory for this step (absolute path). Defaults to top-level cwd." })),
+        gate: Type.Optional(Type.String({ description: "Shell command to validate step output. Exit 0 = pass. Step output in $SUBAGENT_OUTPUT env var." })),
         gateTimeout: Type.Optional(Type.Integer({ description: "Gate timeout in ms. Default: 30000." })),
-        onFail: Type.Optional(Type.String({ enum: ["retry", "skip", "abort"], description: "Action on gate failure. Default: abort." })),
-      }), { description: "Chain mode: sequential steps with {previous} placeholder and optional quality gates" })),
-      cwd: Type.Optional(Type.String({ description: "Working directory (absolute path)" })),
+        onFail: Type.Optional(Type.String({ enum: ["retry", "skip", "abort"], description: "Action on gate failure. retry: re-run step (max 3). skip: continue chain. abort: stop. Default: abort." })),
+      }), { description: "Chain mode: sequential steps with optional quality gates between them." })),
+      cwd: Type.Optional(Type.String({ description: "Working directory for the run (absolute path). Defaults to the current project directory." })),
     }),
 
     async execute(_id, params, signal, _onUpdate, ctx) {
@@ -620,6 +623,7 @@ export default function (pi: ExtensionAPI) {
           if (!params.id) return err("Provide id for status action.");
           const match = findRun(params.id);
           if (!match) return err(`Run not found: ${params.id}`);
+          if ("ambiguous" in match) return err(`Ambiguous id "${params.id}" — matches ${match.ambiguous.join(", ")}. Provide more characters.`);
           return ok(fmtRunStatus(match), { run: match });
         }
 
@@ -627,6 +631,7 @@ export default function (pi: ExtensionAPI) {
           if (!params.id) return err("Provide id for wait action.");
           const match = findRun(params.id);
           if (!match) return err(`Run not found: ${params.id}`);
+          if ("ambiguous" in match) return err(`Ambiguous id "${params.id}" — matches ${match.ambiguous.join(", ")}. Provide more characters.`);
           if (match.status !== "running") {
             const r = match.result!;
             const d = { mode: "background", results: [r] };
@@ -648,6 +653,7 @@ export default function (pi: ExtensionAPI) {
           if (!params.task) return err("Provide task (follow-up message) for resume action.");
           const match = findRun(params.id);
           if (!match) return err(`Run not found: ${params.id}`);
+          if ("ambiguous" in match) return err(`Ambiguous id "${params.id}" — matches ${match.ambiguous.join(", ")}. Provide more characters.`);
           const cwd = params.cwd ? path.resolve(params.cwd) : ctx.cwd;
           const r = await resumeRun(match, params.task, cwd, signal);
           // Create a new run record for the resumed turn

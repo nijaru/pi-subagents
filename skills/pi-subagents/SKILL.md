@@ -20,10 +20,11 @@ Delegate tasks to specialized subagents with isolated context.
 
 | Mode | Parameters | Description |
 |------|-----------|-------------|
-| Single | `{ agent, task }` | One agent, one task |
-| Chain | `{ chain: [...] }` | Sequential with `{previous}` placeholder |
+| Single | `{ agent, task }` | One agent, one task (blocks until done) |
+| Single + model | `{ agent, task, model }` | Override agent's default model |
+| Single + bg | `{ agent, task, background: true }` | Non-blocking, returns run ID |
+| Chain | `{ chain: [...] }` | Sequential with `{previous}` placeholder and optional quality gates |
 | Parallel | `{ tasks: [...] }` | Concurrent execution (max 8, 4 concurrent) |
-| Background | `{ agent, task, background: true }` | Non-blocking, returns run ID |
 
 ## Agent Definitions
 
@@ -76,16 +77,19 @@ Run 2 researchers in parallel: one for OAuth docs, one for session management
 ### Background
 ```
 subagent(agent="worker", task="Refactor auth module", background=true)
+subagent(action="status", id="<run-id>")
 subagent(action="wait", id="<run-id>")
+subagent(action="resume", id="<run-id>", task="Now add tests")
 ```
 
 ## Key Patterns
 
 - **Context isolation**: each agent gets fresh context by default
-- **{previous}**: chain steps receive prior step output
+- **{previous}**: chain steps receive prior step output (empty string on first step)
 - **Quality gates**: shell commands between chain steps, `$SUBAGENT_OUTPUT` has step output
 - **Bounded depth**: max 3 levels of nesting
 - **Model inheritance**: agent can specify model, parent can override, otherwise inherits parent's model
+- **Run persistence**: background runs persist to `~/.pi/agent/subagent-runs.json`, reconciled on startup
 
 ## Best Practices
 
