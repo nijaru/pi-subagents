@@ -1,0 +1,36 @@
+{
+  "name": "pi-subagents",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Clean declarative agent delegation for pi — define agents, chain them, run them.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "subagents",
+    "agents",
+    "chain",
+    "parallel"
+  ],
+  "license": "MIT",
+  "author": "Nick Naru <nick@nijaru.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nijaru/pi-subagents.git"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "scripts": {
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.0.0"
+  }
+}
