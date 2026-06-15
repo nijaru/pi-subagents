@@ -1,6 +1,8 @@
 ---
 name: worker
 description: General-purpose agent for any task. Use when no specialist is needed.
+task-type: implementation
+execution: inline
 tools: read, write, edit, bash, grep, find, ls
 ---
 

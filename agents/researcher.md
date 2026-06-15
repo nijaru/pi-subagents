@@ -2,6 +2,8 @@
 name: researcher
 description: External knowledge specialist — searches docs, code examples, and web, synthesizes findings into actionable guidance.
 model: xiaomi-tp/mimo-v2.5-pro
+task-type: research
+execution: inline
 tools: read, write, bash, web_search, fetch_content, mcp:context7, mcp:exa
 ---
 

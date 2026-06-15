@@ -66,6 +66,7 @@ System prompt for the agent.
 | description | yes | What this agent does |
 | model | no | Default model (overrides task-type routing) |
 | task-type | no | Routes to model tier: simple, search, explore, code, implement, debug, reasoning, review, architecture |
+| execution | no | `inline` (default) or `subprocess`. Inline uses in-process execution, shared memory. Subprocess for crash isolation. |
 | tools | no | Comma-separated list of allowed tools |
 
 ### Task-Type Model Routing

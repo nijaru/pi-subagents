@@ -30,6 +30,7 @@ Review code for correctness, safety, and style. Report findings with file:line r
 | `description` | yes | Shown in `action=list` output |
 | `model` | no | Default model (overrides task-type routing) |
 | `task-type` | no | Routes to model tier (see below) |
+| `execution` | no | `inline` (default) or `subprocess`. Inline uses in-process execution with `createAgentSession()`, shared memory, EventBus access. Subprocess for crash isolation. |
 | `tools` | no | Comma-separated tool list. Omit to inherit all tools |
 
 ### Task-Type Model Routing
@@ -44,6 +45,38 @@ When no explicit `model` is set, agents are routed by `task-type`:
 | `review`, `architecture` | kimi-k27-code | High-quality review |
 
 If no model or task-type is set, the agent inherits the parent's model. The parent can override at spawn time.
+
+## Execution Modes
+
+Two modes. Inline is default.
+
+| Mode | API | Memory | Isolation | Intercom |
+|------|-----|--------|-----------|----------|
+| **inline** (default) | `createAgentSession()` + `SessionManager.inMemory()` | Shared parent process | None | EventBus (same process) |
+| **subprocess** | `spawn("pi", args)` | 230MB per agent | Full | Cross-process (pid addressing) |
+
+### Inline (default)
+
+Uses SDK's `createAgentSession()` API. Agent runs in the same process as the parent, sharing memory and EventBus.
+
+**Benefits:**
+- No 230MB overhead per agent
+- EventBus access for intercom messaging
+- Real-time event subscription via `session.subscribe()`
+- Ephemeral sessions via `SessionManager.inMemory()` (no disk writes)
+
+**Tradeoff:** No crash isolation. A crashing agent takes down the parent. But pi's tool execution already runs in child processes (bash), so this is acceptable.
+
+### Subprocess
+
+Spawns a new `pi` CLI process. Full isolation, 230MB per agent.
+
+**Use cases:**
+- Crash isolation for untrusted agents
+- Running agents with different pi versions
+- Agents that need their own extensions
+
+Set via `execution: "subprocess"` in agent frontmatter or `execution` param in tool call.
 
 ## Execution Patterns
 

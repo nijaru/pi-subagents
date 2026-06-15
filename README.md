@@ -137,6 +137,7 @@ Review code for correctness, safety, and style. Report findings with file:line r
 | `description` | yes | Shown in `action=list` output |
 | `model` | no | Default model (overrides task-type routing) |
 | `task-type` | no | Routes to model tier (see below) |
+| `execution` | no | `inline` (default) or `subprocess`. Inline uses in-process execution, shared memory, EventBus access. Subprocess for crash isolation. |
 | `tools` | no | Comma-separated tool list. Omit to inherit all tools |
 
 ### Task-Type Model Routing

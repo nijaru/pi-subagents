@@ -13,7 +13,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
-import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, createAgentSession, type AgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
@@ -24,6 +24,7 @@ interface AgentConfig {
   description: string;
   model?: string;
   taskType?: string;
+  execution?: "inline" | "subprocess";
   tools?: string[];
   systemPrompt: string;
   source: "user" | "project";
@@ -259,10 +260,12 @@ function loadAgents(dir: string, source: "user" | "project"): AgentConfig[] {
     const { meta, body } = parseFrontmatter(raw);
     if (!meta.name || !meta.description) continue;
     const tools = meta.tools?.split(",").map(t => t.trim()).filter(Boolean);
+    const execution = meta.execution as "inline" | "subprocess" | undefined;
     agents.push({
       name: meta.name, description: meta.description,
       model: meta.model || undefined,
       taskType: meta["task-type"] || undefined,
+      execution: execution === "subprocess" ? "subprocess" : undefined, // default inline, only store if subprocess
       tools: tools?.length ? tools : undefined,
       systemPrompt: body, source,
     });
@@ -415,6 +418,7 @@ function spawnAndParse(
 }
 
 /** Foreground run — blocks until the subprocess exits. */
+/** Foreground run — blocks until the subprocess exits. */
 async function runAgentSync(
   agents: AgentConfig[], name: string, task: string, cwd: string, depth: number, signal?: AbortSignal, overrideModel?: string, contextOpts?: { context?: "fresh" | "fork"; parentSessionFile?: string },
 ): Promise<RunResult> {
@@ -422,6 +426,11 @@ async function runAgentSync(
   if (!agent) {
     const avail = agents.map(a => `"${a.name}"`).join(", ") || "none";
     return { agent: name, task, exitCode: 1, output: "", stderr: `Unknown agent "${name}". Available: ${avail}`, cost: 0, duration: 0 };
+  }
+
+  // Use inline execution if agent doesn't explicitly request subprocess
+  if (agent.execution !== "subprocess") {
+    return runAgentInLine(agent, task, cwd, overrideModel, signal);
   }
 
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
@@ -444,6 +453,90 @@ async function runAgentSync(
     };
   } finally {
     if (tmpFile) { try { fs.unlinkSync(tmpFile); } catch {} }
+  }
+}
+
+/** In-process run — uses createAgentSession() SDK API. Shared memory, no subprocess overhead. */
+async function runAgentInLine(
+  agent: AgentConfig, task: string, cwd: string, overrideModel?: string, signal?: AbortSignal,
+): Promise<RunResult> {
+  const start = Date.now();
+  let session: AgentSession | undefined;
+
+  try {
+    // Resolve model from override > agent.model > agent.taskType
+    const modelStr = overrideModel ?? agent.model ?? (agent.taskType ? TASK_TYPE_MODELS[agent.taskType] : undefined);
+    let model: any | undefined;
+    // Model resolution happens inside createAgentSession via modelRegistry
+    // We pass model string and let the SDK handle it
+
+    // Create in-process session
+    const result = await createAgentSession({
+      cwd,
+      sessionManager: SessionManager.inMemory(),
+      tools: agent.tools,
+      // model will be resolved from registry if not specified
+    });
+    session = result.session;
+
+    // Subscribe to events for progress tracking
+    let output = "";
+    let cost = 0;
+    let exitCode = 0;
+    let stderr = "";
+
+    session.subscribe((event) => {
+      if (event.type === "agent_end") {
+        // Extract output from last assistant message
+        const lastAssistant = [...event.messages].reverse().find((m: any) => m.role === "assistant");
+        if (lastAssistant && "content" in lastAssistant && Array.isArray(lastAssistant.content)) {
+          const texts = lastAssistant.content
+            .filter((c: any) => c.type === "text")
+            .map((c: any) => c.text);
+          output = texts.join("\n");
+          if ("usage" in lastAssistant) {
+            cost = (lastAssistant as any).usage?.cost?.total ?? 0;
+          }
+        }
+      }
+    });
+
+    // Handle abort signal
+    if (signal) {
+      signal.addEventListener("abort", () => {
+        session?.abort();
+      }, { once: true });
+    }
+
+    // Run the agent
+    await session.prompt(task);
+
+    // Get output from messages if subscribe didn't capture it
+    if (!output) {
+      const lastAssistant = [...session.messages].reverse().find((m: any) => m.role === "assistant");
+      if (lastAssistant && "content" in lastAssistant && Array.isArray(lastAssistant.content)) {
+        const texts = lastAssistant.content
+          .filter((c: any) => c.type === "text")
+          .map((c: any) => c.text);
+        output = texts.join("\n");
+        if ("usage" in lastAssistant) {
+          cost = (lastAssistant as any).usage?.cost?.total ?? 0;
+        }
+      }
+    }
+
+    return {
+      agent: agent.name, task, exitCode,
+      output: truncate(output, MAX_OUTPUT_BYTES), stderr: truncate(stderr, MAX_OUTPUT_BYTES),
+      cost, duration: Date.now() - start,
+    };
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return {
+      agent: agent.name, task, exitCode: 1, output: "", stderr: msg, cost: 0, duration: Date.now() - start,
+    };
+  } finally {
+    session?.dispose();
   }
 }
 
@@ -631,6 +724,7 @@ export default function (pi: ExtensionAPI) {
       agent: Type.Optional(Type.String({ description: "Agent name for single mode" })),
       task: Type.Optional(Type.String({ description: "Task for single mode, {task} template source for chain mode, or follow-up message for resume" })),
       model: Type.Optional(Type.String({ description: "Override agent's default model (actual model name, e.g. 'openrouter/deepseek/deepseek-v4-flash')" })),
+      execution: Type.Optional(Type.String({ enum: ["inline", "subprocess"], description: "Execution mode. 'inline' (default): in-process, shared memory, EventBus access. 'subprocess': isolated, 230MB per agent, crash-safe." })),
       tasks: Type.Optional(Type.Array(Type.Object({
         agent: Type.String({ description: "Agent name. Use action=list to see available agents." }),
         task: Type.String({ description: "Task description for this agent." }),
@@ -664,8 +758,9 @@ export default function (pi: ExtensionAPI) {
           if (!agents.length) return ok("No agents found. Place .md files in .pi/agents/ (project) or ~/.pi/agents/ (global).");
           const lines = agents.map(a => {
             const model = a.model ? ` [${a.model}]` : a.taskType ? ` [task:${a.taskType}]` : "";
+            const exec = a.execution === "subprocess" ? " subprocess" : "";
             const tools = a.tools?.length ? ` tools:${a.tools.join(",")}` : "";
-            return `${a.name}: ${a.description}${model}${tools} (${a.source})`;
+            return `${a.name}: ${a.description}${model}${exec}${tools} (${a.source})`;
           });
           return ok(`Available agents:\n${lines.join("\n")}`);
         }

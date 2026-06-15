@@ -2,6 +2,8 @@
 name: profiler
 description: Performance specialist — profiles, identifies bottlenecks, recommends optimizations with measured evidence.
 model: xiaomi-tp/mimo-v2.5-pro
+task-type: profiling
+execution: inline
 tools: read, write, bash, grep, find, ls
 ---
 

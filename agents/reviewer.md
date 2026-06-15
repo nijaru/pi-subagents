@@ -2,6 +2,8 @@
 name: reviewer
 description: Code reviewer — validates correctness, safety, quality, and adherence to project conventions. Builds, runs tests, verifies behavior. Reports findings and applies small inline fixes.
 model: parasail/parasail-kimi-k27-code
+task-type: review
+execution: inline
 tools: read, write, edit, bash, grep, find, ls
 ---
 
