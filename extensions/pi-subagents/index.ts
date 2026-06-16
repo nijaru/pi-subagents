@@ -60,7 +60,7 @@ type ToolResult = { content: { type: "text"; text: string }[]; details: unknown;
 
 const MAX_DEPTH = 3;
 const MAX_PARALLEL = 8;
-const MAX_CONCURRENCY = 4;
+const MAX_CONCURRENCY = 8; // inline agents are cheap — same process, shared memory
 const MAX_RETRIES = 3;
 const MAX_OUTPUT_BYTES = 100 * 1024; // 100KB per agent output
 const DEFAULT_GATE_TIMEOUT_MS = 30_000;
@@ -713,7 +713,8 @@ export default function (pi: ExtensionAPI) {
         agent: Type.String({ description: "Agent name. Use action=list to see available agents." }),
         task: Type.String({ description: "Task description for this agent." }),
         cwd: Type.Optional(Type.String({ description: "Working directory for this agent (absolute path). Defaults to top-level cwd." })),
-      }), { description: "Parallel mode: array of agent+task pairs. Max 8 tasks, 4 run concurrently." })),
+      }), { description: "Parallel mode: array of agent+task pairs. Max 8 tasks, all run concurrently by default." })),
+      concurrency: Type.Optional(Type.Integer({ description: "Max concurrent agents in parallel mode. Default: 8 (inline agents are cheap)." })),
       chain: Type.Optional(Type.Array(Type.Object({
         agent: Type.String({ description: "Agent name. Use action=list to see available agents." }),
         task: Type.String({ description: "Task template. {task} = original request, {previous} = prior step output (empty on first step)." }),
@@ -1007,7 +1008,8 @@ export default function (pi: ExtensionAPI) {
       if (hasParallel) {
         if (params.tasks!.length > MAX_PARALLEL) return err(`Too many tasks (${params.tasks!.length}). Max: ${MAX_PARALLEL}.`);
 
-        const results = await mapConcurrent(params.tasks!, MAX_CONCURRENCY, (t) =>
+        const concurrency = params.concurrency ?? MAX_CONCURRENCY;
+        const results = await mapConcurrent(params.tasks!, concurrency, (t) =>
           runAgentSync(agents, t.agent, t.task, t.cwd ? path.resolve(t.cwd) : cwd, depth + 1, signal, undefined, contextOpts, ctx)
         );
 

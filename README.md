@@ -18,7 +18,7 @@ The extension registers a `subagent` tool with four modes:
 
 **Chain** — sequential steps with quality gates between them. Each step gets the previous step's output. Gates are shell commands that must exit 0 to proceed.
 
-**Parallel** — up to 4 agents concurrently. Useful for research, review, and profiling in one shot.
+**Parallel** — up to 8 agents concurrently. Useful for research, review, and profiling in one shot.
 
 **Background** — non-blocking. Returns a run ID. Check status or wait for the result later.
 
