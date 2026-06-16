@@ -342,6 +342,15 @@ function resolveModel(agent: AgentConfig, overrideModel?: string): string | unde
   return undefined;
 }
 
+/** Resolve model string to a Model object via the registry. */
+function findModel(modelStr: string | undefined, ctx?: ExtensionContext): unknown {
+  if (!modelStr || !ctx?.modelRegistry) return undefined;
+  const [provider, ...rest] = modelStr.split("/");
+  const modelId = rest.join("/");
+  if (!provider || !modelId) return undefined;
+  return ctx.modelRegistry.find(provider, modelId);
+}
+
 function buildArgs(
   agent: AgentConfig, task: string, sessionDir: string, overrideModel?: string, opts?: { context?: "fresh" | "fork"; parentSessionFile?: string },
 ): { args: string[]; tmpFile?: string; cmd: string; baseArgs: string[] } {
@@ -431,7 +440,7 @@ async function runAgentSync(
   // Execution routing: param override > agent config > default (inline)
   const execution = overrideExecution ?? agent.execution;
   if (execution !== "subprocess") {
-    return runAgentInLine(agent, task, cwd, overrideModel, signal, ctx);
+    return runAgentInLine(agent, task, cwd, overrideModel, signal, ctx); // contextOpts not applicable — inline shares parent memory
   }
 
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
@@ -467,13 +476,7 @@ async function runAgentInLine(
 
   try {
     // Resolve model: override > agent.model > agent.taskType
-    const modelStr = overrideModel ?? agent.model ?? (agent.taskType ? TASK_TYPE_MODELS[agent.taskType] : undefined);
-    let model: unknown;
-    if (modelStr && ctx?.modelRegistry) {
-      const [provider, ...rest] = modelStr.split("/");
-      const modelId = rest.join("/");
-      if (provider && modelId) model = ctx.modelRegistry.find(provider, modelId);
-    }
+    const model = findModel(resolveModel(agent, overrideModel), ctx);
 
     // Prepend system prompt to task (createAgentSession doesn't accept systemPrompt)
     const fullTask = agent.systemPrompt.trim()
@@ -701,7 +704,9 @@ export default function (pi: ExtensionAPI) {
       "Actions: list (agents), status/wait (background runs), resume (follow-up). Set action, omit mode.",
       "Background: background=true returns run id. action=wait to block for result.",
       "Chain templates: {task} = original request, {previous} = prior step output (empty on first step). Gates: shell cmd, exit 0 = pass, $SUBAGENT_OUTPUT = step output.",
-      "Model: agent definition sets default, parent can override with model param. Max depth: 3.",
+      "Model: agent definition sets default, parent can override with model param.",
+      "Execution: execution param overrides agent default. inline (default): in-process, shared memory. subprocess: isolated, crash-safe.",
+      "Max depth: 3.",
     ].join("\n"),
 
     parameters: Type.Object({
