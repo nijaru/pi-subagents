@@ -39,6 +39,7 @@ interface RunResult {
   cost: number;
   duration: number;
   sessionPath?: string;
+  sessionId?: string;
 }
 
 interface RunRecord {
@@ -511,7 +512,7 @@ async function runAgentInLine(
     return {
       agent: agent.name, task, exitCode: 0,
       output: truncate(output, MAX_OUTPUT_BYTES), stderr: "",
-      cost, duration: Date.now() - start,
+      cost, duration: Date.now() - start, sessionId: session.sessionId,
     };
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
