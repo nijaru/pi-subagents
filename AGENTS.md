@@ -82,7 +82,6 @@ For integration tests: use the `subagent` tool directly (single, chain, parallel
 extensions/pi-subagents/index.ts   # extension entry point (~800 lines)
 agents/*.md                        # 7 agent definitions
 skills/pi-subagents/SKILL.md       # skill definition (agent-facing)
-DESIGN.md                          # API design and implementation notes
 README.md                          # user-facing docs
 tests/agents.test.ts               # unit tests (14 tests)
 ```
