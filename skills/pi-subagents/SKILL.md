@@ -25,9 +25,11 @@ Delegate tasks to specialized subagents with isolated context.
 | Single + model | `{ agent, task, model }` | Override agent's default model |
 | Single + bg | `{ agent, task, background: true }` | Non-blocking, returns run ID |
 | Single + fork | `{ agent, task, context: "fork" }` | Child inherits parent's session history |
+| Single + execution | `{ agent, task, execution: "subprocess" }` | Override execution mode |
 | Single + acceptance | `{ agent, task, acceptance: {...} }` | Verify output with shell commands, retry on failure |
 | Chain | `{ chain: [...] }` | Sequential with `{previous}`, `{task}`, `{outputs.name}` placeholders |
-| Parallel | `{ tasks: [...] }` | Concurrent execution (max 8, 4 concurrent) |
+| Parallel | `{ tasks: [...] }` | Concurrent execution (max 8) |
+| Parallel + concurrency | `{ tasks: [...], concurrency: N }` | Limit concurrent agents (default 8) |
 
 ## Lifecycle Actions
 
@@ -52,6 +54,7 @@ name: my-agent
 description: What this agent does
 model: openrouter/deepseek/deepseek-v4-flash
 task-type: code
+execution: inline
 tools: read, grep, find, ls, bash
 ---
 

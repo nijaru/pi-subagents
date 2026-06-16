@@ -420,7 +420,7 @@ function spawnAndParse(
 
 /** Foreground run — blocks until the subprocess exits. */
 async function runAgentSync(
-  agents: AgentConfig[], name: string, task: string, cwd: string, depth: number, signal?: AbortSignal, overrideModel?: string, contextOpts?: { context?: "fresh" | "fork"; parentSessionFile?: string }, ctx?: ExtensionContext,
+  agents: AgentConfig[], name: string, task: string, cwd: string, depth: number, signal?: AbortSignal, overrideModel?: string, contextOpts?: { context?: "fresh" | "fork"; parentSessionFile?: string }, ctx?: ExtensionContext, overrideExecution?: "inline" | "subprocess",
 ): Promise<RunResult> {
   const agent = agents.find(a => a.name === name);
   if (!agent) {
@@ -428,8 +428,9 @@ async function runAgentSync(
     return { agent: name, task, exitCode: 1, output: "", stderr: `Unknown agent "${name}". Available: ${avail}`, cost: 0, duration: 0 };
   }
 
-  // Use inline execution if agent doesn't explicitly request subprocess
-  if (agent.execution !== "subprocess") {
+  // Execution routing: param override > agent config > default (inline)
+  const execution = overrideExecution ?? agent.execution;
+  if (execution !== "subprocess") {
     return runAgentInLine(agent, task, cwd, overrideModel, signal, ctx);
   }
 
@@ -462,11 +463,12 @@ async function runAgentInLine(
 ): Promise<RunResult> {
   const start = Date.now();
   let session: AgentSession | undefined;
+  let abortHandler: (() => void) | undefined;
 
   try {
     // Resolve model: override > agent.model > agent.taskType
     const modelStr = overrideModel ?? agent.model ?? (agent.taskType ? TASK_TYPE_MODELS[agent.taskType] : undefined);
-    let model: any | undefined;
+    let model: unknown;
     if (modelStr && ctx?.modelRegistry) {
       const [provider, ...rest] = modelStr.split("/");
       const modelId = rest.join("/");
@@ -483,13 +485,14 @@ async function runAgentInLine(
       cwd,
       sessionManager: SessionManager.inMemory(),
       tools: agent.tools,
-      ...(model ? { model } : {}),
+      ...(model ? { model: model as any } : {}),
     });
     session = result.session;
 
-    // Handle abort signal
+    // Handle abort signal — store reference for cleanup
     if (signal) {
-      signal.addEventListener("abort", () => { session?.abort(); }, { once: true });
+      abortHandler = () => { session?.abort(); };
+      signal.addEventListener("abort", abortHandler, { once: true });
     }
 
     // Run the agent
@@ -498,15 +501,14 @@ async function runAgentInLine(
     // Extract output from last assistant message
     let output = "";
     let cost = 0;
-    const lastAssistant = [...session.messages].reverse().find((m: any) => m.role === "assistant");
-    if (lastAssistant && "content" in lastAssistant && Array.isArray(lastAssistant.content)) {
+    const messages = session.messages as Array<{ role: string; content?: Array<{ type: string; text?: string }>; usage?: { cost?: { total?: number } } }>;
+    const lastAssistant = [...messages].reverse().find(m => m.role === "assistant");
+    if (lastAssistant?.content && Array.isArray(lastAssistant.content)) {
       const texts = lastAssistant.content
-        .filter((c: any) => c.type === "text")
-        .map((c: any) => c.text);
+        .filter(c => c.type === "text")
+        .map(c => c.text ?? "");
       output = texts.join("\n");
-      if ("usage" in lastAssistant) {
-        cost = (lastAssistant as any).usage?.cost?.total ?? 0;
-      }
+      cost = lastAssistant.usage?.cost?.total ?? 0;
     }
 
     return {
@@ -520,6 +522,7 @@ async function runAgentInLine(
       agent: agent.name, task, exitCode: 1, output: "", stderr: msg, cost: 0, duration: Date.now() - start,
     };
   } finally {
+    if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
     session?.dispose();
   }
 }
@@ -904,7 +907,7 @@ export default function (pi: ExtensionAPI) {
         let lastResult: RunResult | undefined;
 
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-          const r = await runAgentSync(agents, params.agent!, params.task!, cwd, depth + 1, signal, params.model, contextOpts, ctx);
+          const r = await runAgentSync(agents, params.agent!, params.task!, cwd, depth + 1, signal, params.model, contextOpts, ctx, params.execution as "inline" | "subprocess" | undefined);
           lastResult = r;
 
           if (r.exitCode !== 0) {
@@ -1008,9 +1011,9 @@ export default function (pi: ExtensionAPI) {
       if (hasParallel) {
         if (params.tasks!.length > MAX_PARALLEL) return err(`Too many tasks (${params.tasks!.length}). Max: ${MAX_PARALLEL}.`);
 
-        const concurrency = params.concurrency ?? MAX_CONCURRENCY;
+        const concurrency = Math.max(1, Math.min(params.concurrency ?? MAX_CONCURRENCY, MAX_PARALLEL));
         const results = await mapConcurrent(params.tasks!, concurrency, (t) =>
-          runAgentSync(agents, t.agent, t.task, t.cwd ? path.resolve(t.cwd) : cwd, depth + 1, signal, undefined, contextOpts, ctx)
+          runAgentSync(agents, t.agent, t.task, t.cwd ? path.resolve(t.cwd) : cwd, depth + 1, signal, undefined, contextOpts, ctx, params.execution as "inline" | "subprocess" | undefined)
         );
 
         const okCount = results.filter(r => r.exitCode === 0).length;
