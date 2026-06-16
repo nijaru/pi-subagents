@@ -13,7 +13,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
-import { type ExtensionAPI, createAgentSession, type AgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext, createAgentSession, type AgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
@@ -418,9 +418,8 @@ function spawnAndParse(
 }
 
 /** Foreground run — blocks until the subprocess exits. */
-/** Foreground run — blocks until the subprocess exits. */
 async function runAgentSync(
-  agents: AgentConfig[], name: string, task: string, cwd: string, depth: number, signal?: AbortSignal, overrideModel?: string, contextOpts?: { context?: "fresh" | "fork"; parentSessionFile?: string },
+  agents: AgentConfig[], name: string, task: string, cwd: string, depth: number, signal?: AbortSignal, overrideModel?: string, contextOpts?: { context?: "fresh" | "fork"; parentSessionFile?: string }, ctx?: ExtensionContext,
 ): Promise<RunResult> {
   const agent = agents.find(a => a.name === name);
   if (!agent) {
@@ -430,7 +429,7 @@ async function runAgentSync(
 
   // Use inline execution if agent doesn't explicitly request subprocess
   if (agent.execution !== "subprocess") {
-    return runAgentInLine(agent, task, cwd, overrideModel, signal);
+    return runAgentInLine(agent, task, cwd, overrideModel, signal, ctx);
   }
 
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
@@ -458,76 +457,60 @@ async function runAgentSync(
 
 /** In-process run — uses createAgentSession() SDK API. Shared memory, no subprocess overhead. */
 async function runAgentInLine(
-  agent: AgentConfig, task: string, cwd: string, overrideModel?: string, signal?: AbortSignal,
+  agent: AgentConfig, task: string, cwd: string, overrideModel?: string, signal?: AbortSignal, ctx?: ExtensionContext,
 ): Promise<RunResult> {
   const start = Date.now();
   let session: AgentSession | undefined;
 
   try {
-    // Resolve model from override > agent.model > agent.taskType
+    // Resolve model: override > agent.model > agent.taskType
     const modelStr = overrideModel ?? agent.model ?? (agent.taskType ? TASK_TYPE_MODELS[agent.taskType] : undefined);
     let model: any | undefined;
-    // Model resolution happens inside createAgentSession via modelRegistry
-    // We pass model string and let the SDK handle it
+    if (modelStr && ctx?.modelRegistry) {
+      const [provider, ...rest] = modelStr.split("/");
+      const modelId = rest.join("/");
+      if (provider && modelId) model = ctx.modelRegistry.find(provider, modelId);
+    }
+
+    // Prepend system prompt to task (createAgentSession doesn't accept systemPrompt)
+    const fullTask = agent.systemPrompt.trim()
+      ? `${agent.systemPrompt}\n\n---\n\nTask: ${task}`
+      : task;
 
     // Create in-process session
     const result = await createAgentSession({
       cwd,
       sessionManager: SessionManager.inMemory(),
       tools: agent.tools,
-      // model will be resolved from registry if not specified
+      ...(model ? { model } : {}),
     });
     session = result.session;
 
-    // Subscribe to events for progress tracking
-    let output = "";
-    let cost = 0;
-    let exitCode = 0;
-    let stderr = "";
-
-    session.subscribe((event) => {
-      if (event.type === "agent_end") {
-        // Extract output from last assistant message
-        const lastAssistant = [...event.messages].reverse().find((m: any) => m.role === "assistant");
-        if (lastAssistant && "content" in lastAssistant && Array.isArray(lastAssistant.content)) {
-          const texts = lastAssistant.content
-            .filter((c: any) => c.type === "text")
-            .map((c: any) => c.text);
-          output = texts.join("\n");
-          if ("usage" in lastAssistant) {
-            cost = (lastAssistant as any).usage?.cost?.total ?? 0;
-          }
-        }
-      }
-    });
-
     // Handle abort signal
     if (signal) {
-      signal.addEventListener("abort", () => {
-        session?.abort();
-      }, { once: true });
+      signal.addEventListener("abort", () => { session?.abort(); }, { once: true });
     }
 
     // Run the agent
-    await session.prompt(task);
+    await session.prompt(fullTask);
 
-    // Get output from messages if subscribe didn't capture it
-    if (!output) {
-      const lastAssistant = [...session.messages].reverse().find((m: any) => m.role === "assistant");
-      if (lastAssistant && "content" in lastAssistant && Array.isArray(lastAssistant.content)) {
-        const texts = lastAssistant.content
-          .filter((c: any) => c.type === "text")
-          .map((c: any) => c.text);
-        output = texts.join("\n");
-        if ("usage" in lastAssistant) {
-          cost = (lastAssistant as any).usage?.cost?.total ?? 0;
-        }
+    // Extract output from last assistant message
+    let output = "";
+    let cost = 0;
+    const lastAssistant = [...session.messages].reverse().find((m: any) => m.role === "assistant");
+    if (lastAssistant && "content" in lastAssistant && Array.isArray(lastAssistant.content)) {
+      const texts = lastAssistant.content
+        .filter((c: any) => c.type === "text")
+        .map((c: any) => c.text);
+      output = texts.join("\n");
+      if ("usage" in lastAssistant) {
+        cost = (lastAssistant as any).usage?.cost?.total ?? 0;
       }
     }
 
     return {
-      agent: agent.name, task, exitCode,
-      output: truncate(output, MAX_OUTPUT_BYTES), stderr: truncate(stderr, MAX_OUTPUT_BYTES),
+      agent: agent.name, task, exitCode: 0,
+      output: truncate(output, MAX_OUTPUT_BYTES), stderr: "",
       cost, duration: Date.now() - start,
     };
   } catch (e: unknown) {
@@ -919,7 +902,7 @@ export default function (pi: ExtensionAPI) {
         let lastResult: RunResult | undefined;
 
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-          const r = await runAgentSync(agents, params.agent!, params.task!, cwd, depth + 1, signal, params.model, contextOpts);
+          const r = await runAgentSync(agents, params.agent!, params.task!, cwd, depth + 1, signal, params.model, contextOpts, ctx);
           lastResult = r;
 
           if (r.exitCode !== 0) {
@@ -979,7 +962,7 @@ export default function (pi: ExtensionAPI) {
           task = task.replace(/\{task\}/g, params.task ?? "");
           // Replace {outputs.name} with stored named outputs
           task = task.replace(/\{outputs\.([^}]+)\}/g, (_: string, key: string) => outputs[key] ?? "");
-          const r = await runAgentSync(agents, step.agent, task, step.cwd ? path.resolve(step.cwd) : cwd, depth + 1, signal, undefined, contextOpts);
+          const r = await runAgentSync(agents, step.agent, task, step.cwd ? path.resolve(step.cwd) : cwd, depth + 1, signal, undefined, contextOpts, ctx);
           results.push(r);
 
           if (r.exitCode !== 0) {
@@ -1024,7 +1007,7 @@ export default function (pi: ExtensionAPI) {
         if (params.tasks!.length > MAX_PARALLEL) return err(`Too many tasks (${params.tasks!.length}). Max: ${MAX_PARALLEL}.`);
 
         const results = await mapConcurrent(params.tasks!, MAX_CONCURRENCY, (t) =>
-          runAgentSync(agents, t.agent, t.task, t.cwd ? path.resolve(t.cwd) : cwd, depth + 1, signal, undefined, contextOpts)
+          runAgentSync(agents, t.agent, t.task, t.cwd ? path.resolve(t.cwd) : cwd, depth + 1, signal, undefined, contextOpts, ctx)
         );
 
         const okCount = results.filter(r => r.exitCode === 0).length;
