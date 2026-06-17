@@ -101,7 +101,7 @@ Agents are markdown files with YAML frontmatter:
 ---
 name: my-agent
 description: What this agent does
-model: openrouter/deepseek/deepseek-v4-flash
+model: openrouter/anthropic/fable-5
 execution: inline
 tools: read, grep, find, ls, bash
 ---
@@ -183,8 +183,8 @@ subagent(
 
 ### Agent management
 ```
-subagent(action="create", agent="linter", task="Run and fix linting issues", prompt="You are a code linter. Fix all lint issues.", model="openrouter/deepseek/deepseek-v4-flash")
-subagent(action="update", agent="worker", model="openrouter/deepseek/deepseek-v4-pro")
+subagent(action="create", agent="linter", task="Run and fix linting issues", prompt="You are a code linter. Fix all lint issues.", model="openrouter/anthropic/fable-5")
+subagent(action="update", agent="worker", model="openrouter/anthropic/fable-5")
 subagent(action="delete", agent="old-agent")
 ```
 

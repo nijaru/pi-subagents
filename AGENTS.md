@@ -31,7 +31,7 @@ Markdown + YAML frontmatter in `agents/` (project) or `~/.pi/agents/` (global). 
 ---
 name: reviewer
 description: Code review for correctness and quality
-model: parasail/parasail-kimi-k27-code
+model: openrouter/anthropic/fable-5
 execution: inline
 tools: read,write,edit,bash,grep,find,ls
 ---

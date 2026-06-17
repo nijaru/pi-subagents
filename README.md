@@ -30,7 +30,7 @@ Agents are markdown files with YAML frontmatter. Place in `agents/` (project) or
 ---
 name: reviewer
 description: Code reviewer
-model: parasail/parasail-kimi-k27-code
+model: openrouter/anthropic/fable-5
 tools: read, write, edit, bash
 ---
 
