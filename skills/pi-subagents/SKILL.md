@@ -41,7 +41,7 @@ Delegate tasks to specialized subagents with isolated context.
 | resume | `{ id, task }` | Send follow-up message to completed/failed run |
 | interrupt | `{ id }` | Cancel a running background agent (SIGTERM) |
 | create | `{ agent, task, prompt }` | Create a new agent definition |
-| update | `{ agent, ... }` | Update agent fields (task, model, taskType, prompt) |
+| update | `{ agent, ... }` | Update agent fields (task, model, prompt) |
 | delete | `{ agent }` | Delete an agent definition |
 
 ## Agent Definitions
@@ -53,7 +53,6 @@ Agents are markdown files with YAML frontmatter:
 name: my-agent
 description: What this agent does
 model: openrouter/deepseek/deepseek-v4-flash
-task-type: code
 execution: inline
 tools: read, grep, find, ls, bash
 ---
@@ -67,21 +66,11 @@ System prompt for the agent.
 |-------|----------|-------------|
 | name | yes | Unique identifier |
 | description | yes | What this agent does |
-| model | no | Default model (overrides task-type routing) |
-| task-type | no | Routes to model tier: simple, search, explore, code, implement, debug, reasoning, review, architecture |
+| model | no | Model for this agent (inherits parent if omitted) |
 | execution | no | `inline` (default) or `subprocess`. Inline uses in-process execution, shared memory. Subprocess for crash isolation. |
 | tools | no | Comma-separated list of allowed tools |
 
-### Task-Type Model Routing
 
-When no explicit `model` is set, agents are routed by `task-type`:
-
-| Task Type | Model Tier | Use For |
-|-----------|-----------|---------|
-| simple, search, explore | deepseek-v4-flash | Fast, cheap tasks |
-| code, implement, debug | mimo-v2.5-pro | Default code work |
-| reasoning | deepseek-v4-pro | Complex analysis |
-| review, architecture | kimi-k27-code | High-quality review |
 
 **Locations:**
 - `~/.pi/agents/*.md` — User-level (always loaded)
@@ -157,7 +146,7 @@ subagent(
 
 ### Agent management
 ```
-subagent(action="create", agent="linter", task="Run and fix linting issues", prompt="You are a code linter. Fix all lint issues.", taskType="code")
+subagent(action="create", agent="linter", task="Run and fix linting issues", prompt="You are a code linter. Fix all lint issues.", model="openrouter/deepseek/deepseek-v4-flash")
 subagent(action="update", agent="worker", model="openrouter/deepseek/deepseek-v4-pro")
 subagent(action="delete", agent="old-agent")
 ```

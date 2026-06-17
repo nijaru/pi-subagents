@@ -25,14 +25,13 @@ tests/agents.test.ts               # unit tests
 
 ## Agent Definitions
 
-Markdown + YAML frontmatter in `agents/` (project) or `~/.pi/agents/` (global). Required: `name`, `description`. Optional: `model`, `task-type`, `execution`, `tools`.
+Markdown + YAML frontmatter in `agents/` (project) or `~/.pi/agents/` (global). Required: `name`, `description`. Optional: `model`, `execution`, `tools`.
 
 ```markdown
 ---
 name: reviewer
 description: Code review for correctness and quality
 model: parasail/parasail-kimi-k27-code
-task-type: review
 execution: inline
 tools: read,write,edit,bash,grep,find,ls
 ---

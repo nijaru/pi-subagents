@@ -23,7 +23,6 @@ interface AgentConfig {
   name: string;
   description: string;
   model?: string;
-  taskType?: string;
   execution?: "inline" | "subprocess";
   tools?: string[];
   systemPrompt: string;
@@ -64,19 +63,6 @@ const MAX_CONCURRENCY = 8; // inline agents are cheap — same process, shared m
 const MAX_RETRIES = 3;
 const MAX_OUTPUT_BYTES = 100 * 1024; // 100KB per agent output
 const DEFAULT_GATE_TIMEOUT_MS = 30_000;
-
-/** Task-type to model tier routing. Agents without an explicit model get routed based on task-type. */
-const TASK_TYPE_MODELS: Record<string, string> = {
-  simple: "openrouter/deepseek/deepseek-v4-flash",
-  search: "openrouter/deepseek/deepseek-v4-flash",
-  explore: "openrouter/deepseek/deepseek-v4-flash",
-  code: "xiaomi-tp/mimo-v2.5-pro",
-  implement: "xiaomi-tp/mimo-v2.5-pro",
-  debug: "xiaomi-tp/mimo-v2.5-pro",
-  reasoning: "openrouter/deepseek/deepseek-v4-pro",
-  review: "parasail/parasail-kimi-k27-code",
-  architecture: "parasail/parasail-kimi-k27-code",
-};
 const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
 
 // ── State ───────────────────────────────────────────────────────────────────
@@ -265,7 +251,6 @@ function loadAgents(dir: string, source: "user" | "project"): AgentConfig[] {
     agents.push({
       name: meta.name, description: meta.description,
       model: meta.model || undefined,
-      taskType: meta["task-type"] || undefined,
       execution: execution === "subprocess" ? "subprocess" : undefined, // default inline, only store if subprocess
       tools: tools?.length ? tools : undefined,
       systemPrompt: body, source,
@@ -336,10 +321,7 @@ function getPiCmd(): { cmd: string; baseArgs: string[] } {
 }
 
 function resolveModel(agent: AgentConfig, overrideModel?: string): string | undefined {
-  if (overrideModel) return overrideModel;
-  if (agent.model) return agent.model;
-  if (agent.taskType) return TASK_TYPE_MODELS[agent.taskType];
-  return undefined;
+  return overrideModel ?? agent.model;
 }
 
 /** Resolve model string to a Model object via the registry. */
@@ -475,7 +457,7 @@ async function runAgentInLine(
   let abortHandler: (() => void) | undefined;
 
   try {
-    // Resolve model: override > agent.model > agent.taskType
+    // Resolve model: override > agent.model > inherit parent
     const model = findModel(resolveModel(agent, overrideModel), ctx);
 
     // Prepend system prompt to task (createAgentSession doesn't accept systemPrompt)
@@ -701,7 +683,8 @@ export default function (pi: ExtensionAPI) {
     description: [
       "Delegate tasks to specialized subagents with isolated context.",
       "Modes: agent+task (single), chain[...] (sequential), tasks[...] (parallel, max 8). Use exactly one.",
-      "Actions: list (agents), status/wait (background runs), resume (follow-up). Set action, omit mode.",
+      "Actions: list (agents), status/wait (background runs), resume (follow-up), interrupt (cancel). Set action, omit mode.",
+      "Agent management: create/update/delete define NEW agent types (.md files). To run an existing agent, use agent+task directly.",
       "Background: background=true returns run id. action=wait to block for result.",
       "Chain templates: {task} = original request, {previous} = prior step output (empty on first step). Gates: shell cmd, exit 0 = pass, $SUBAGENT_OUTPUT = step output.",
       "Model: agent definition sets default, parent can override with model param.",
@@ -710,7 +693,7 @@ export default function (pi: ExtensionAPI) {
     ].join("\n"),
 
     parameters: Type.Object({
-      action: Type.Optional(Type.String({ enum: ["list", "status", "wait", "resume", "interrupt", "create", "update", "delete"], description: "Lifecycle action. interrupt: cancel running agent. create/update/delete: manage agent definitions." })),
+      action: Type.Optional(Type.String({ enum: ["list", "status", "wait", "resume", "interrupt", "create", "update", "delete"], description: "Lifecycle action. interrupt: cancel running agent. create/update/delete: manage agent DEFINITIONS (.md files) — NOT for running agents. To run an agent, use agent+task directly." })),
       id: Type.Optional(Type.String({ description: "Run id for status/wait/resume actions" })),
       background: Type.Optional(Type.Boolean({ description: "Run in background (single mode only). Returns immediately." })),
       agent: Type.Optional(Type.String({ description: "Agent name for single mode" })),
@@ -740,7 +723,6 @@ export default function (pi: ExtensionAPI) {
         maxAttempts: Type.Optional(Type.Integer({ description: "Max retry attempts on acceptance failure. Default: 1 (no retries)." })),
       }, { description: "Acceptance contract. Defines success criteria and verification for the agent's output." })),
       prompt: Type.Optional(Type.String({ description: "System prompt for create/update actions. The agent's instructions." })),
-      taskType: Type.Optional(Type.String({ description: "Task type for create/update actions. Routes to model tier if no explicit model. Values: simple, search, explore, code, implement, debug, reasoning, review, architecture." })),
     }),
 
     async execute(_id, params, signal, _onUpdate, ctx) {
@@ -750,7 +732,7 @@ export default function (pi: ExtensionAPI) {
           const agents = discoverAgents(ctx.cwd);
           if (!agents.length) return ok("No agents found. Place .md files in .pi/agents/ (project) or ~/.pi/agents/ (global).");
           const lines = agents.map(a => {
-            const model = a.model ? ` [${a.model}]` : a.taskType ? ` [task:${a.taskType}]` : "";
+            const model = a.model ? ` [${a.model}]` : "";
             const exec = a.execution === "subprocess" ? " subprocess" : "";
             const tools = a.tools?.length ? ` tools:${a.tools.join(",")}` : "";
             return `${a.name}: ${a.description}${model}${exec}${tools} (${a.source})`;
@@ -761,7 +743,15 @@ export default function (pi: ExtensionAPI) {
         if (params.action === "status") {
           if (!params.id) return err("Provide id for status action.");
           const match = findRun(params.id);
-          if (!match) return err(`Run not found: ${params.id}`);
+          if (!match) {
+            // Check if they passed an agent name instead of a run ID
+            const agents = discoverAgents(ctx.cwd);
+            const agentMatch = agents.find(a => a.name === params.id);
+            if (agentMatch) {
+              return err(`"${params.id}" is an agent name, not a run ID. To run an agent, use:\n\n  subagent(agent="${params.id}", task="your task here")\n\nThen use action="status" with the returned run ID.`);
+            }
+            return err(`Run not found: ${params.id}`);
+          }
           if ("ambiguous" in match) return err(`Ambiguous id "${params.id}" — matches ${match.ambiguous.join(", ")}. Provide more characters.`);
           return ok(fmtRunStatus(match), { run: match });
         }
@@ -769,7 +759,15 @@ export default function (pi: ExtensionAPI) {
         if (params.action === "wait") {
           if (!params.id) return err("Provide id for wait action.");
           const match = findRun(params.id);
-          if (!match) return err(`Run not found: ${params.id}`);
+          if (!match) {
+            // Check if they passed an agent name instead of a run ID
+            const agents = discoverAgents(ctx.cwd);
+            const agentMatch = agents.find(a => a.name === params.id);
+            if (agentMatch) {
+              return err(`"${params.id}" is an agent name, not a run ID. To run an agent, use:\n\n  subagent(agent="${params.id}", task="your task here")\n\nThen use action="wait" with the returned run ID.`);
+            }
+            return err(`Run not found: ${params.id}`);
+          }
           if ("ambiguous" in match) return err(`Ambiguous id "${params.id}" — matches ${match.ambiguous.join(", ")}. Provide more characters.`);
           if (match.status !== "running") {
             const r = match.result!;
@@ -827,16 +825,19 @@ export default function (pi: ExtensionAPI) {
           if (!params.agent) return err("Provide agent name for create action.");
           if (!params.task) return err("Provide task (description) for create action.");
           if (!params.prompt) return err("Provide prompt (system prompt) for create action.");
+          const existingAgents = discoverAgents(ctx.cwd);
+          const alreadyExists = existingAgents.find(a => a.name === params.agent);
+          if (alreadyExists) {
+            return err(`Agent "${params.agent}" already exists (${alreadyExists.source}). You don't need to create it — just run it directly:\n\n  subagent(agent="${params.agent}", task="your task here")\n\naction="create" is for defining NEW agent types. To run an existing agent, use agent+task.`);
+          }
           const agentsDir = path.join(ctx.cwd, ".pi", "agents");
           fs.mkdirSync(agentsDir, { recursive: true });
           const fp = path.join(agentsDir, `${params.agent}.md`);
-          if (fs.existsSync(fp)) return err(`Agent "${params.agent}" already exists at ${fp}. Use update to modify.`);
           const fm = [
             "---",
             `name: ${params.agent}`,
             `description: ${params.task}`,
             params.model ? `model: ${params.model}` : "",
-            params.taskType ? `task-type: ${params.taskType}` : "",
             "---",
             "",
             params.prompt,
@@ -853,7 +854,6 @@ export default function (pi: ExtensionAPI) {
           const { meta, body } = parseFrontmatter(raw);
           if (params.task) meta.description = params.task;
           if (params.model) meta.model = params.model;
-          if (params.taskType) meta["task-type"] = params.taskType;
           const prompt = params.prompt || body;
           const fm = ["---", ...Object.entries(meta).map(([k, v]) => `${k}: ${v}`), "---", "", prompt].join("\n");
           fs.writeFileSync(existing, fm, "utf-8");

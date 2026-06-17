@@ -31,14 +31,11 @@ Agents are markdown files with YAML frontmatter. Place in `agents/` (project) or
 name: reviewer
 description: Code reviewer
 model: parasail/parasail-kimi-k27-code
-task-type: review
 tools: read, write, edit, bash
 ---
 
 Review code for correctness, safety, and style.
 ```
-
-Task-type routes to model tiers automatically: `simple`/`search`/`explore` → flash, `code`/`implement`/`debug` → default, `reasoning` → pro, `review`/`architecture` → kimi.
 
 ## Included Agents
 

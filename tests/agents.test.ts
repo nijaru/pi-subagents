@@ -31,7 +31,7 @@ describe("agent definitions", () => {
   });
 
   test("no agent declares unsupported frontmatter fields", () => {
-    const SUPPORTED = new Set(["name", "description", "model", "tools", "task-type", "execution"]);
+    const SUPPORTED = new Set(["name", "description", "model", "tools", "execution"]);
     for (const file of agentFiles) {
       const raw = fs.readFileSync(path.join(AGENTS_DIR, file), "utf-8");
       const end = raw.indexOf("\n---", 3);

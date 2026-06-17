@@ -2,7 +2,6 @@
 name: security-auditor
 description: Security-focused reviewer. Audits trust boundaries, input validation, secrets handling, authentication/authorization, injection risks, and unsafe defaults. Reports findings and applies small safe fixes; escalates risky or behavior-changing fixes.
 model: parasail/parasail-kimi-k27-code
-task-type: security
 execution: inline
 tools: read, write, edit, bash, grep, find, ls
 ---

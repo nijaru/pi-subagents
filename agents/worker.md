@@ -1,7 +1,7 @@
 ---
 name: worker
 description: General-purpose agent for any task. Use when no specialist is needed.
-task-type: implementation
+model: xiaomi-tp/mimo-v2.5-pro
 execution: inline
 tools: read, write, edit, bash, grep, find, ls
 ---
