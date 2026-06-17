@@ -703,7 +703,7 @@ export default function (pi: ExtensionAPI) {
       background: Type.Optional(Type.Boolean({ description: "Run in background (single mode only). Returns immediately." })),
       agent: Type.Optional(Type.String({ description: "Agent name for single mode" })),
       task: Type.Optional(Type.String({ description: "Task for single mode, {task} template source for chain mode, or follow-up message for resume" })),
-      model: Type.Optional(Type.String({ description: "Override agent's default model (actual model name, e.g. 'openrouter/deepseek/deepseek-v4-flash')" })),
+      model: Type.Optional(Type.String({ description: "Override agent's default model (provider/model-id format, e.g. 'openrouter/anthropic/fable-5')" })),
       execution: Type.Optional(Type.String({ enum: ["inline", "subprocess"], description: "Execution mode. 'inline' (default): in-process, shared memory, EventBus access. 'subprocess': isolated, 230MB per agent, crash-safe." })),
       tasks: Type.Optional(Type.Array(Type.Object({
         agent: Type.String({ description: "Agent name. Use action=list to see available agents." }),
