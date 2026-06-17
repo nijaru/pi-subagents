@@ -1,7 +1,6 @@
 ---
 name: explore
 description: Codebase reconnaissance agent. Use for repo-wide search, unknown codebase structure, or when the main agent doesn't know where to look. Not for reading specific files — just read them directly.
-model: openrouter/deepseek/deepseek-v4-flash
 execution: inline
 tools: read, grep, find, ls, bash, code_search, write
 ---

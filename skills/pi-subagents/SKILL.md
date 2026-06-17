@@ -11,11 +11,49 @@ Delegate tasks to specialized subagents with isolated context.
 
 ## When to Use
 
-- **Code review**: fresh-context reviewer for adversarial review
-- **Implementation**: explore → architect → worker chain
-- **Research**: parallel exploration of multiple topics
-- **Multi-step workflows**: chain with `{previous}` handoff
-- **Acceptance testing**: agent runs, verify commands check output
+Concrete triggers — delegate when any of these apply:
+
+- **New feature touching 3+ files** → architect designs, worker implements, reviewer reviews
+- **Auth/security/crypto/input-validation change** → security-auditor reviews before commit
+- **Bug you can't reproduce in 2 attempts** → explore gets fresh eyes
+- **Large refactor** → explore maps impact, worker executes, reviewer validates
+- **PR-ready code** → reviewer does adversarial review
+- **Performance issue with measurable target** → profiler profiles and recommends
+- **Need external docs/API patterns/examples** → researcher searches and synthesizes
+- **Unknown codebase or scope** → explore maps structure
+
+## When NOT to Delegate
+
+- Reading specific files with known paths — read directly
+- Small changes (< 3 files, clear scope) — handle in main session
+- Quick targeted fixes — no delegation overhead
+- Iterative refinement — main session needs ongoing context
+
+## Agent Discovery
+
+Agents are loaded in priority order (highest wins):
+
+1. **Bundled** — ships with the extension (`agents/*.md` in the extension directory)
+2. **User-level** — `~/.pi/agents/*.md` (always loaded, overrides bundled)
+3. **Project-level** — `.pi/agents/*.md` or `agents/*.md` walking up from cwd (overrides user)
+
+To customize agents: place `.md` files in `~/.pi/agents/` (global) or `.pi/agents/` (project). Same name overrides the bundled definition.
+
+To override models for bundled agents: use `settings.json` `subagents.agentOverrides` — don't modify the bundled `.md` files.
+
+## Included Agents
+
+| Agent | Use when | Default model |
+|-------|----------|---------------|
+| architect | Designing a feature before implementation, need a plan | *(inherits parent)* |
+| explore | Scope unknown, need to map codebase structure | *(inherits parent)* |
+| profiler | Have a measurable perf target, need evidence-based optimization | *(inherits parent)* |
+| researcher | Need external docs, API patterns, library examples | *(inherits parent)* |
+| reviewer | Finished code needs adversarial review before merge | *(inherits parent)* |
+| security-auditor | Touching auth, crypto, input validation, trust boundaries | *(inherits parent)* |
+| worker | No specialist needed, general implementation | *(inherits parent)* |
+
+All agents inherit the parent session's model by default. Override per-agent via `~/.pi/agents/<name>.md` frontmatter or `settings.json` `subagents.agentOverrides`.
 
 ## Tool Modes
 
@@ -30,6 +68,17 @@ Delegate tasks to specialized subagents with isolated context.
 | Chain | `{ chain: [...] }` | Sequential with `{previous}`, `{task}`, `{outputs.name}` placeholders |
 | Parallel | `{ tasks: [...] }` | Concurrent execution (max 8) |
 | Parallel + concurrency | `{ tasks: [...], concurrency: N }` | Limit concurrent agents (default 8) |
+
+### Execution Modes
+
+- **inline** (default): in-process, shared memory, faster. Use when agent doesn't need crash isolation.
+- **subprocess**: isolated, crash-safe, ~230MB per agent. Use for background runs or untrusted code.
+- **context: "fork"**: agent inherits parent's conversation history. Use when agent needs prior context (e.g., "review what we just discussed").
+
+### Background vs Blocking
+
+- **blocking** (default): parent waits for result. Use for short tasks or when result is needed immediately.
+- **background**: returns run ID immediately. Use for long-running tasks (refactors, large reviews). Check with `action: "status"`, wait with `action: "wait"`.
 
 ## Lifecycle Actions
 
@@ -76,18 +125,6 @@ System prompt for the agent.
 - `~/.pi/agents/*.md` — User-level (always loaded)
 - `agents/*.md` — Project-level (overrides user)
 - `.pi/agents/*.md` — Project-level (alternative location)
-
-## Included Agents
-
-| Agent | Purpose | Default Model |
-|-------|---------|--------------|
-| architect | Design systems, produce implementation plans | kimi-k27-code |
-| explore | Codebase reconnaissance | deepseek-v4-flash |
-| profiler | Performance analysis | mimo-v2.5-pro |
-| researcher | External docs, web, library lookup | mimo-v2.5-pro |
-| reviewer | Code review, build, test | kimi-k27-code |
-| security-auditor | Security review, trust boundaries | kimi-k27-code |
-| worker | General-purpose (default) | *(inherits parent)* |
 
 ## Usage Examples
 

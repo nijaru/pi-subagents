@@ -26,7 +26,7 @@ interface AgentConfig {
   execution?: "inline" | "subprocess";
   tools?: string[];
   systemPrompt: string;
-  source: "user" | "project";
+  source: "bundled" | "user" | "project";
 }
 
 interface RunResult {
@@ -236,7 +236,7 @@ function parseFrontmatter(content: string): { meta: Record<string, string>; body
   return { meta, body: s.slice(end + 4).trim() };
 }
 
-function loadAgents(dir: string, source: "user" | "project"): AgentConfig[] {
+function loadAgents(dir: string, source: "bundled" | "user" | "project"): AgentConfig[] {
   if (!fs.existsSync(dir)) return [];
   const agents: AgentConfig[] = [];
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -268,7 +268,12 @@ function isProjectRoot(dir: string): boolean {
 
 function discoverAgents(cwd: string): AgentConfig[] {
   const map = new Map<string, AgentConfig>();
+  // 1. Bundled agents (lowest priority) — ships with the extension
+  const bundledDir = path.resolve(import.meta.dir, "..", "..", "agents");
+  for (const a of loadAgents(bundledDir, "bundled")) map.set(a.name, a);
+  // 2. User-level agents (override bundled)
   for (const a of loadAgents(path.join(os.homedir(), ".pi", "agents"), "user")) map.set(a.name, a);
+  // 3. Project-level agents (highest priority)
   let dir = cwd;
   const home = os.homedir();
   while (true) {
