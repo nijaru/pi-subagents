@@ -103,7 +103,9 @@ function persistRuns(): void {
     const tmp = fp + ".tmp";
     fs.writeFileSync(tmp, JSON.stringify(entries));
     fs.renameSync(tmp, fp);
-  } catch {}
+  } catch (e: unknown) {
+    console.error("[pi-subagents] Failed to persist runs:", e instanceof Error ? e.message : e);
+  }
 }
 
 function loadRuns(): void {
@@ -113,7 +115,12 @@ function loadRuns(): void {
     for (const r of data) {
       if (r.id && r.sessionPath) runs.set(r.id, r as RunRecord);
     }
-  } catch {}
+  } catch (e: unknown) {
+    // File not found is expected on first run
+    if (e instanceof Error && "code" in e && (e as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error("[pi-subagents] Failed to load runs:", e.message);
+    }
+  }
 }
 
 /** Reconcile persisted running records: if session file exists with output, mark completed. */
@@ -126,11 +133,14 @@ function reconcileRuns(): void {
     // Check if session file has output (process completed while we were away)
     const session = readSessionOutput(r.sessionPath);
     if (session.output) {
+      // Use session file mtime for duration (excludes downtime while pi was away)
+      const sessionFile = findSessionFile(r.sessionPath);
+      const endTime = sessionFile ? (fs.statSync(sessionFile).mtimeMs || Date.now()) : Date.now();
       r.status = "completed";
       r.result = {
         agent: r.agent, task: r.task, exitCode: 0,
         output: truncate(session.output, MAX_OUTPUT_BYTES), stderr: "",
-        cost: session.cost, duration: Date.now() - r.startedAt, sessionPath: r.sessionPath,
+        cost: session.cost, duration: Math.max(0, endTime - r.startedAt), sessionPath: r.sessionPath,
         messages: [], turns: 0,
       };
       changed = true;
@@ -453,7 +463,7 @@ function spawnAndParse(
         }
         if (texts.length) output = texts.join("\n");
         const u = ev.message.usage;
-        const usage = u ? { input: u.input ?? u.inputTokens ?? 0, output: u.output ?? u.outputTokens ?? 0, cacheRead: u.cacheRead ?? u.cache_read_input_tokens ?? 0, cacheWrite: u.cacheCreation ?? u.cache_write ?? 0, cost: u.cost?.total ?? u.cost ?? 0 } : undefined;
+        const usage = u ? { input: u.input ?? 0, output: u.output ?? 0, cacheRead: u.cacheRead ?? 0, cacheWrite: u.cacheWrite ?? 0, cost: u.cost?.total ?? 0 } : undefined;
         if (usage) cost += usage.cost;
         if (ev.message.model) model = ev.message.model;
         if (ev.message.stopReason) stopReason = ev.message.stopReason;
@@ -534,6 +544,7 @@ async function runAgentSync(
     };
   } finally {
     if (tmpFile) { try { fs.unlinkSync(tmpFile); } catch {} }
+    try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch {}
   }
 }
 
@@ -701,6 +712,7 @@ function runAgentAsync(
       duration: Date.now() - record.startedAt, sessionPath: sessionDir,
     };
     record.proc = undefined;
+    if (tmpFile) { try { fs.unlinkSync(tmpFile); } catch {} }
     persistRuns();
   });
 
@@ -742,6 +754,7 @@ async function resumeRun(
 async function runGate(
   gateCmd: string, stepOutput: string, cwd: string, timeoutMs: number, signal?: AbortSignal,
 ): Promise<{ exitCode: number; stderr: string }> {
+  if (signal?.aborted) return { exitCode: 1, stderr: "aborted" };
   return new Promise(resolve => {
     let stderr = "";
     let closed = false;
@@ -750,7 +763,6 @@ async function runGate(
     const proc = spawn("sh", ["-c", gateCmd], {
       cwd, stdio: ["ignore", "ignore", "pipe"],
       env: { ...process.env, SUBAGENT_OUTPUT: stepOutput },
-      signal: signal?.aborted ? AbortSignal.abort() : undefined,
     });
     const cleanup = () => {
       if (gateTimeout) clearTimeout(gateTimeout);
@@ -804,7 +816,7 @@ function fmtResult(r: RunResult): string {
   const ms = r.duration < 1000 ? `${r.duration}ms` : `${(r.duration / 1000).toFixed(1)}s`;
   const c = r.cost > 0 ? ` $${r.cost.toFixed(4)}` : "";
   const t = r.turns > 0 ? ` ${r.turns} turn${r.turns > 1 ? "s" : ""}` : "";
-  const tc = r.messages.filter(m => m.toolCalls?.length).length;
+  const tc = r.messages.reduce((s, m) => s + (m.toolCalls?.length ?? 0), 0);
   const tcStr = tc > 0 ? ` ${tc} tool call${tc > 1 ? "s" : ""}` : "";
   return `${icon} ${r.agent} (${ms}${c}${t}${tcStr})`;
 }
@@ -1211,7 +1223,7 @@ export default function (pi: ExtensionAPI) {
         if (totalCost > 0) summaryParts.push(`$${totalCost.toFixed(4)}`);
         if (totalTurns > 0) summaryParts.push(`${totalTurns} turn${totalTurns > 1 ? "s" : ""}`);
         // Count tool calls across all results
-        const toolCallCount = d.results.reduce((s, r) => s + r.messages.filter(m => m.toolCalls?.length).length, 0);
+        const toolCallCount = d.results.reduce((s, r) => s + r.messages.reduce((ms, m) => ms + (m.toolCalls?.length ?? 0), 0), 0);
         if (toolCallCount > 0) summaryParts.push(`${toolCallCount} tool call${toolCallCount > 1 ? "s" : ""}`);
       }
       const summaryLine = summaryParts.length ? ` ${theme.fg("muted", `(${summaryParts.join(", ")})`)}` : "";
