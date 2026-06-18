@@ -803,9 +803,9 @@ function fmtResult(r: RunResult): string {
   const icon = r.exitCode === 0 ? "✓" : "✗";
   const ms = r.duration < 1000 ? `${r.duration}ms` : `${(r.duration / 1000).toFixed(1)}s`;
   const c = r.cost > 0 ? ` $${r.cost.toFixed(4)}` : "";
-  const t = r.turns > 0 ? ` ${r.turns}t` : "";
+  const t = r.turns > 0 ? ` ${r.turns} turn${r.turns > 1 ? "s" : ""}` : "";
   const tc = r.messages.filter(m => m.toolCalls?.length).length;
-  const tcStr = tc > 0 ? ` ${tc}tc` : "";
+  const tcStr = tc > 0 ? ` ${tc} tool call${tc > 1 ? "s" : ""}` : "";
   return `${icon} ${r.agent} (${ms}${c}${t}${tcStr})`;
 }
 
