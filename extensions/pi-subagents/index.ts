@@ -292,7 +292,14 @@ function isProjectRoot(dir: string): boolean {
 function discoverAgents(cwd: string): AgentConfig[] {
   const map = new Map<string, AgentConfig>();
   // 1. Bundled agents (lowest priority) — ships with the extension
-  const bundledDir = path.resolve(import.meta.dir, "..", "..", "agents");
+  // import.meta.dir may be undefined in pi's extension loader
+  const extensionDir = import.meta.dir ?? __dirname;
+  let bundledDir: string;
+  try {
+    bundledDir = path.resolve(extensionDir, "..", "..", "agents");
+  } catch {
+    return []; // can't resolve bundled dir — skip
+  }
   for (const a of loadAgents(bundledDir, "bundled")) map.set(a.name, a);
   // 2. User-level agents (override bundled)
   for (const a of loadAgents(path.join(os.homedir(), ".pi", "agents"), "user")) map.set(a.name, a);
