@@ -27,7 +27,10 @@
     ]
   },
   "scripts": {
-    "test": "bun test"
+    "test": "bun test",
+    "lint": "oxlint extensions/ tests/",
+    "typecheck": "tsc --noEmit",
+    "check": "bun test && oxlint extensions/ tests/ && tsc --noEmit"
   },
   "devDependencies": {
     "@earendil-works/pi-agent-core": "^0.79.3",

@@ -29,6 +29,18 @@ interface AgentConfig {
   source: "bundled" | "user" | "project";
 }
 
+/** Parsed message from pi's JSON event stream. */
+interface AgentMessage {
+  role: "assistant" | "user" | "tool";
+  text?: string;
+  toolCalls?: Array<{ name: string; args: Record<string, unknown> }>;
+  toolResult?: { name: string; output: string };
+  usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
+  model?: string;
+  stopReason?: string;
+  errorMessage?: string;
+}
+
 interface RunResult {
   agent: string;
   task: string;
@@ -37,6 +49,10 @@ interface RunResult {
   stderr: string;
   cost: number;
   duration: number;
+  messages: AgentMessage[];
+  turns: number;
+  model?: string;
+  stopReason?: string;
   sessionPath?: string;
   sessionId?: string;
 }
@@ -59,9 +75,10 @@ type ToolResult = { content: { type: "text"; text: string }[]; details: unknown;
 
 const MAX_DEPTH = 3;
 const MAX_PARALLEL = 8;
-const MAX_CONCURRENCY = 8; // inline agents are cheap — same process, shared memory
+const MAX_CONCURRENCY = 4; // limit concurrent subprocess spawns
 const MAX_RETRIES = 3;
 const MAX_OUTPUT_BYTES = 100 * 1024; // 100KB per agent output
+const PER_TASK_OUTPUT_CAP = 50 * 1024; // 50KB per task in parallel mode
 const DEFAULT_GATE_TIMEOUT_MS = 30_000;
 const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
 
@@ -114,6 +131,7 @@ function reconcileRuns(): void {
         agent: r.agent, task: r.task, exitCode: 0,
         output: truncate(session.output, MAX_OUTPUT_BYTES), stderr: "",
         cost: session.cost, duration: Date.now() - r.startedAt, sessionPath: r.sessionPath,
+        messages: [], turns: 0,
       };
       changed = true;
     } else if (!fs.existsSync(r.sessionPath)) {
@@ -146,9 +164,14 @@ function childEnv(depth: number): NodeJS.ProcessEnv {
 
 function truncate(s: string, maxBytes: number): string {
   if (Buffer.byteLength(s, "utf-8") <= maxBytes) return s;
-  let t = s;
-  while (Buffer.byteLength(t, "utf-8") > maxBytes) t = t.slice(0, -1);
-  return `${t}\n[truncated — ${Buffer.byteLength(s, "utf-8")} bytes total]`;
+  // Binary search for the right cutoff point — O(n log n) vs O(n²) char-by-char
+  let lo = 0, hi = s.length;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >>> 1;
+    if (Buffer.byteLength(s.slice(0, mid), "utf-8") <= maxBytes) lo = mid;
+    else hi = mid - 1;
+  }
+  return `${s.slice(0, lo)}\n[truncated — ${Buffer.byteLength(s, "utf-8")} bytes total]`;
 }
 
 /** Find newest session JSONL file by modification time. */
@@ -299,16 +322,23 @@ function discoverAgents(cwd: string): AgentConfig[] {
   return Array.from(map.values());
 }
 
-/** Find the .md file path for an agent by name. Checks project then user dirs. */
+/** Find the .md file path for an agent by name. Walks up from cwd (like discoverAgents) then checks user global. */
 function findAgentFile(cwd: string, name: string): string | undefined {
-  // Check project .pi/agents/ first
-  const projectPath = path.join(cwd, ".pi", "agents", `${name}.md`);
-  if (fs.existsSync(projectPath)) return projectPath;
-  // Check project agents/ (no .pi prefix)
-  const projectAgents = path.join(cwd, "agents", `${name}.md`);
-  if (fs.existsSync(projectAgents)) return projectAgents;
+  // Walk up from cwd checking .pi/agents/ and agents/ at each level
+  let dir = cwd;
+  const home = os.homedir();
+  while (true) {
+    const piPath = path.join(dir, ".pi", "agents", `${name}.md`);
+    if (fs.existsSync(piPath)) return piPath;
+    const agentsPath = path.join(dir, "agents", `${name}.md`);
+    if (fs.existsSync(agentsPath)) return agentsPath;
+    if (isProjectRoot(dir) || dir === home) break;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
   // Check user global
-  const userPath = path.join(os.homedir(), ".pi", "agents", `${name}.md`);
+  const userPath = path.join(home, ".pi", "agents", `${name}.md`);
   if (fs.existsSync(userPath)) return userPath;
   return undefined;
 }
@@ -364,11 +394,12 @@ function buildArgs(
 
 /** Shared spawn + parse logic for foreground runs. */
 function spawnAndParse(
-  cmd: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv; signal?: AbortSignal; parseStdout?: boolean },
-): Promise<{ exitCode: number; output: string; stderr: string; cost: number }> {
-  const { cwd, env, signal, parseStdout = true } = opts;
+  cmd: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv; signal?: AbortSignal; parseStdout?: boolean; onMessage?: (msg: AgentMessage) => void },
+): Promise<{ exitCode: number; output: string; stderr: string; cost: number; messages: AgentMessage[]; turns: number; model?: string; stopReason?: string }> {
+  const { cwd, env, signal, parseStdout = true, onMessage } = opts;
   return new Promise(resolve => {
-    let output = "", stderr = "", cost = 0;
+    let output = "", stderr = "", cost = 0, turns = 0, model: string | undefined, stopReason: string | undefined;
+    const messages: AgentMessage[] = [];
     let closed = false;
     let killTimeout: ReturnType<typeof setTimeout> | undefined;
     const stdio: ["ignore", "pipe" | "ignore", "pipe"] = parseStdout ? ["ignore", "pipe", "pipe"] : ["ignore", "ignore", "pipe"];
@@ -379,11 +410,56 @@ function spawnAndParse(
       if (!line.trim()) return;
       let ev: any;
       try { ev = JSON.parse(line); } catch { return; }
+
+      // Capture tool calls from tool_use events (sub-agent invocations, file ops, etc.)
+      if (ev.type === "tool_use" || ev.type === "tool_use_start") {
+        const toolName = ev.name ?? ev.tool?.name ?? "unknown";
+        const toolArgs = ev.input ?? ev.args ?? {};
+        const msg: AgentMessage = { role: "assistant", toolCalls: [{ name: toolName, args: toolArgs }] };
+        messages.push(msg);
+        onMessage?.(msg);
+      }
+
+      // Capture tool results for visibility
+      if (ev.type === "tool_result_end" || ev.type === "tool_result") {
+        const toolName = ev.name ?? "tool";
+        let toolOutput = "";
+        if (typeof ev.result === "string") toolOutput = ev.result;
+        else if (ev.result?.text) toolOutput = ev.result.text;
+        else if (ev.content?.text) toolOutput = ev.content.text;
+        const msg: AgentMessage = { role: "tool", toolResult: { name: toolName, output: truncate(toolOutput, 2048) } };
+        messages.push(msg);
+        onMessage?.(msg);
+      }
+
+      // Capture assistant messages (final text + usage)
       if (ev.type === "message_end" && ev.message?.role === "assistant") {
+        turns++;
         const texts: string[] = [];
-        for (const p of ev.message.content ?? []) { if (p.type === "text") texts.push(p.text); }
+        for (const p of ev.message.content ?? []) {
+          if (p.type === "text" && p.text) texts.push(p.text);
+          if (p.type === "tool_use") {
+            const toolName = p.name ?? "tool";
+            const toolArgs = p.input ?? {};
+            messages.push({ role: "assistant", toolCalls: [{ name: toolName, args: toolArgs }] });
+          }
+        }
         if (texts.length) output = texts.join("\n");
-        cost += ev.message.usage?.cost?.total ?? 0;
+        const u = ev.message.usage;
+        const usage = u ? { input: u.input ?? u.inputTokens ?? 0, output: u.output ?? u.outputTokens ?? 0, cacheRead: u.cacheRead ?? u.cache_read_input_tokens ?? 0, cacheWrite: u.cacheCreation ?? u.cache_write ?? 0, cost: u.cost?.total ?? u.cost ?? 0 } : undefined;
+        if (usage) cost += usage.cost;
+        if (ev.message.model) model = ev.message.model;
+        if (ev.message.stopReason) stopReason = ev.message.stopReason;
+        const msg: AgentMessage = { role: "assistant", text: output, usage, model: ev.message.model, stopReason: ev.message.stopReason };
+        messages.push(msg);
+        onMessage?.(msg);
+      }
+
+      // Capture error messages
+      if (ev.type === "error") {
+        const msg: AgentMessage = { role: "assistant", errorMessage: ev.message ?? ev.error ?? "Unknown error" };
+        messages.push(msg);
+        onMessage?.(msg);
       }
     };
 
@@ -399,9 +475,9 @@ function spawnAndParse(
       closed = true;
       if (killTimeout) clearTimeout(killTimeout);
       if (buf.trim()) processLine(buf);
-      resolve({ exitCode: c ?? 0, output, stderr, cost });
+      resolve({ exitCode: c ?? 0, output, stderr, cost, messages, turns, model, stopReason });
     });
-    proc.on("error", () => { if (!closed) resolve({ exitCode: 1, output, stderr, cost }); });
+    proc.on("error", () => { if (!closed) resolve({ exitCode: 1, output, stderr, cost, messages, turns, model, stopReason }); });
 
     if (signal) {
       const kill = () => {
@@ -421,7 +497,7 @@ async function runAgentSync(
   const agent = agents.find(a => a.name === name);
   if (!agent) {
     const avail = agents.map(a => `"${a.name}"`).join(", ") || "none";
-    return { agent: name, task, exitCode: 1, output: "", stderr: `Unknown agent "${name}". Available: ${avail}`, cost: 0, duration: 0 };
+    return { agent: name, task, exitCode: 1, output: "", stderr: `Unknown agent "${name}". Available: ${avail}`, cost: 0, duration: 0, messages: [], turns: 0 };
   }
 
   // Execution routing: param override > agent config > default (inline)
@@ -447,6 +523,7 @@ async function runAgentSync(
       agent: name, task, exitCode: raw.exitCode,
       output: truncate(output, MAX_OUTPUT_BYTES), stderr: truncate(raw.stderr, MAX_OUTPUT_BYTES),
       cost, duration: Date.now() - start, sessionPath: sessionDir,
+      messages: raw.messages, turns: raw.turns, model: raw.model, stopReason: raw.stopReason,
     };
   } finally {
     if (tmpFile) { try { fs.unlinkSync(tmpFile); } catch {} }
@@ -463,7 +540,19 @@ async function runAgentInLine(
 
   try {
     // Resolve model: override > agent.model > inherit parent
-    const model = findModel(resolveModel(agent, overrideModel), ctx);
+    const modelStr = resolveModel(agent, overrideModel);
+    let model: unknown = undefined;
+    if (modelStr) {
+      model = findModel(modelStr, ctx);
+      if (!model) {
+        // Model configured but not in registry — return a clear error
+        return {
+          agent: agent.name, task, exitCode: 1, output: "",
+          stderr: `Model "${modelStr}" not found in registry. Check that the provider/model ID is correct and the API key is configured. Run 'pi models' to see available models.`,
+          cost: 0, duration: Date.now() - start, messages: [], turns: 0,
+        };
+      }
+    }
 
     // Prepend system prompt to task (createAgentSession doesn't accept systemPrompt)
     const fullTask = agent.systemPrompt.trim()
@@ -488,28 +577,57 @@ async function runAgentInLine(
     // Run the agent
     await session.prompt(fullTask);
 
-    // Extract output from last assistant message
+    // Extract messages with tool calls, usage, and text
+    const parsedMessages: AgentMessage[] = [];
     let output = "";
     let cost = 0;
-    const messages = session.messages as Array<{ role: string; content?: Array<{ type: string; text?: string }>; usage?: { cost?: { total?: number } } }>;
-    const lastAssistant = [...messages].reverse().find(m => m.role === "assistant");
-    if (lastAssistant?.content && Array.isArray(lastAssistant.content)) {
-      const texts = lastAssistant.content
-        .filter(c => c.type === "text")
-        .map(c => c.text ?? "");
-      output = texts.join("\n");
-      cost = lastAssistant.usage?.cost?.total ?? 0;
+    let turns = 0;
+    let modelId: string | undefined;
+    let stopReason: string | undefined;
+    const rawMessages = session.messages as Array<{
+      role: string;
+      content?: Array<{ type: string; text?: string; name?: string; input?: Record<string, unknown> }>;
+      usage?: { inputTokens?: number; outputTokens?: number; cache_read_input_tokens?: number; cacheCreation?: number; cost?: { total?: number } };
+      model?: string;
+      stopReason?: string;
+    }>;
+
+    for (const msg of rawMessages) {
+      if (msg.role === "assistant") {
+        turns++;
+        const texts: string[] = [];
+        const toolCalls: Array<{ name: string; args: Record<string, unknown> }> = [];
+        for (const p of msg.content ?? []) {
+          if (p.type === "text" && p.text) texts.push(p.text);
+          if (p.type === "tool_use" && p.name) toolCalls.push({ name: p.name, args: p.input ?? {} });
+        }
+        if (texts.length) output = texts.join("\n");
+        const u = msg.usage;
+        const usage = u ? { input: u.inputTokens ?? 0, output: u.outputTokens ?? 0, cacheRead: u.cache_read_input_tokens ?? 0, cacheWrite: u.cacheCreation ?? 0, cost: u.cost?.total ?? 0 } : undefined;
+        if (usage) cost += usage.cost;
+        if (msg.model) modelId = msg.model;
+        if (msg.stopReason) stopReason = msg.stopReason;
+        parsedMessages.push({ role: "assistant", text: texts.join("\n") || undefined, toolCalls: toolCalls.length ? toolCalls : undefined, usage, model: msg.model, stopReason: msg.stopReason });
+      }
+      if (msg.role === "tool" && msg.content?.length) {
+        for (const p of msg.content) {
+          if (p.type === "tool_result" && p.name) {
+            parsedMessages.push({ role: "tool", toolResult: { name: p.name, output: truncate(p.text ?? "", 2048) } });
+          }
+        }
+      }
     }
 
     return {
       agent: agent.name, task, exitCode: 0,
       output: truncate(output, MAX_OUTPUT_BYTES), stderr: "",
       cost, duration: Date.now() - start, sessionId: session.sessionId,
+      messages: parsedMessages, turns, model: modelId, stopReason,
     };
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     return {
-      agent: agent.name, task, exitCode: 1, output: "", stderr: msg, cost: 0, duration: Date.now() - start,
+      agent: agent.name, task, exitCode: 1, output: "", stderr: msg, cost: 0, duration: Date.now() - start, messages: [], turns: 0,
     };
   } finally {
     if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
@@ -529,7 +647,7 @@ function runAgentAsync(
     const avail = agents.map(a => `"${a.name}"`).join(", ") || "none";
     const record: RunRecord = {
       id, agent: name, task, status: "failed", startedAt: Date.now(), sessionPath: sessionDir,
-      result: { agent: name, task, exitCode: 1, output: "", stderr: `Unknown agent "${name}". Available: ${avail}`, cost: 0, duration: 0 },
+      result: { agent: name, task, exitCode: 1, output: "", stderr: `Unknown agent "${name}". Available: ${avail}`, cost: 0, duration: 0, messages: [], turns: 0 },
     };
     runs.set(id, record);
     persistRuns();
@@ -559,6 +677,7 @@ function runAgentAsync(
       agent: name, task, exitCode: code ?? 1,
       output: truncate(session.output, MAX_OUTPUT_BYTES), stderr: truncate(stderr, MAX_OUTPUT_BYTES),
       cost: session.cost, duration: Date.now() - record.startedAt, sessionPath: sessionDir,
+      messages: [], turns: 0,
     };
     record.proc = undefined;
     if (tmpFile) { try { fs.unlinkSync(tmpFile); } catch {} }
@@ -567,7 +686,7 @@ function runAgentAsync(
   proc.on("error", () => {
     record.status = "failed";
     record.result = {
-      agent: name, task, exitCode: 1, output: "", stderr: stderr || "process error", cost: 0,
+      agent: name, task, exitCode: 1, output: "", stderr: stderr || "process error", cost: 0, messages: [], turns: 0,
       duration: Date.now() - record.startedAt, sessionPath: sessionDir,
     };
     record.proc = undefined;
@@ -583,7 +702,7 @@ async function resumeRun(
 ): Promise<RunResult> {
   const sessionFile = findSessionFile(run.sessionPath);
   if (!sessionFile) {
-    return { agent: run.agent, task: message, exitCode: 1, output: "", stderr: `No session file found in ${run.sessionPath}`, cost: 0, duration: 0 };
+    return { agent: run.agent, task: message, exitCode: 1, output: "", stderr: `No session file found in ${run.sessionPath}`, cost: 0, duration: 0, messages: [], turns: 0 };
   }
 
   const { cmd, baseArgs } = getPiCmd();
@@ -603,6 +722,7 @@ async function resumeRun(
     agent: run.agent, task: message, exitCode: raw.exitCode,
     output: truncate(output, MAX_OUTPUT_BYTES), stderr: truncate(raw.stderr, MAX_OUTPUT_BYTES),
     cost, duration: Date.now() - start, sessionPath: run.sessionPath,
+    messages: raw.messages, turns: raw.turns, model: raw.model, stopReason: raw.stopReason,
   };
 }
 
@@ -654,7 +774,7 @@ async function runGate(
 
 async function mapConcurrent<T, R>(items: T[], limit: number, fn: (item: T, i: number) => Promise<R>): Promise<R[]> {
   if (!items.length) return [];
-  const results = new Array<R>(items.length);
+  const results: R[] = Array.from({ length: items.length });
   let next = 0;
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
     while (true) {
@@ -672,7 +792,10 @@ function fmtResult(r: RunResult): string {
   const icon = r.exitCode === 0 ? "✓" : "✗";
   const ms = r.duration < 1000 ? `${r.duration}ms` : `${(r.duration / 1000).toFixed(1)}s`;
   const c = r.cost > 0 ? ` $${r.cost.toFixed(4)}` : "";
-  return `${icon} ${r.agent} (${ms}${c})`;
+  const t = r.turns > 0 ? ` ${r.turns}t` : "";
+  const tc = r.messages.filter(m => m.toolCalls?.length).length;
+  const tcStr = tc > 0 ? ` ${tc}tc` : "";
+  return `${icon} ${r.agent} (${ms}${c}${t}${tcStr})`;
 }
 
 // ── Extension ───────────────────────────────────────────────────────────────
@@ -731,10 +854,13 @@ export default function (pi: ExtensionAPI) {
     }),
 
     async execute(_id, params, signal, _onUpdate, ctx) {
+      // Defensive fallback: ctx.cwd can be undefined in some execution contexts
+      const effectiveCwd = ctx.cwd ?? process.cwd();
+
       // ── Lifecycle actions ──
       if (params.action) {
         if (params.action === "list") {
-          const agents = discoverAgents(ctx.cwd);
+          const agents = discoverAgents(effectiveCwd);
           if (!agents.length) return ok("No agents found. Place .md files in .pi/agents/ (project) or ~/.pi/agents/ (global).");
           const lines = agents.map(a => {
             const model = a.model ? ` [${a.model}]` : "";
@@ -750,7 +876,7 @@ export default function (pi: ExtensionAPI) {
           const match = findRun(params.id);
           if (!match) {
             // Check if they passed an agent name instead of a run ID
-            const agents = discoverAgents(ctx.cwd);
+            const agents = discoverAgents(effectiveCwd);
             const agentMatch = agents.find(a => a.name === params.id);
             if (agentMatch) {
               return err(`"${params.id}" is an agent name, not a run ID. To run an agent, use:\n\n  subagent(agent="${params.id}", task="your task here")\n\nThen use action="status" with the returned run ID.`);
@@ -766,7 +892,7 @@ export default function (pi: ExtensionAPI) {
           const match = findRun(params.id);
           if (!match) {
             // Check if they passed an agent name instead of a run ID
-            const agents = discoverAgents(ctx.cwd);
+            const agents = discoverAgents(effectiveCwd);
             const agentMatch = agents.find(a => a.name === params.id);
             if (agentMatch) {
               return err(`"${params.id}" is an agent name, not a run ID. To run an agent, use:\n\n  subagent(agent="${params.id}", task="your task here")\n\nThen use action="wait" with the returned run ID.`);
@@ -796,7 +922,7 @@ export default function (pi: ExtensionAPI) {
           const match = findRun(params.id);
           if (!match) return err(`Run not found: ${params.id}`);
           if ("ambiguous" in match) return err(`Ambiguous id "${params.id}" — matches ${match.ambiguous.join(", ")}. Provide more characters.`);
-          const cwd = params.cwd ? path.resolve(params.cwd) : ctx.cwd;
+          const cwd = params.cwd ? path.resolve(params.cwd) : effectiveCwd;
           const r = await resumeRun(match, params.task, cwd, signal);
           // Create a new run record for the resumed turn
           const resumeId = genId();
@@ -828,24 +954,29 @@ export default function (pi: ExtensionAPI) {
 
         if (params.action === "create") {
           if (!params.agent) return err("Provide agent name for create action.");
-          if (!params.task) return err("Provide task (description) for create action.");
-          if (!params.prompt) return err("Provide prompt (system prompt) for create action.");
-          const existingAgents = discoverAgents(ctx.cwd);
+          if (!params.task && !params.prompt) return err("Provide task (description) and/or prompt (system prompt) for create action.");
+          // If only prompt given, use agent name as description
+          const description = params.task ?? `${params.agent} agent`;
+          const systemPrompt = params.prompt ?? "";
+          const existingAgents = discoverAgents(effectiveCwd);
           const alreadyExists = existingAgents.find(a => a.name === params.agent);
           if (alreadyExists) {
             return err(`Agent "${params.agent}" already exists (${alreadyExists.source}). You don't need to create it — just run it directly:\n\n  subagent(agent="${params.agent}", task="your task here")\n\naction="create" is for defining NEW agent types. To run an existing agent, use agent+task.`);
           }
-          const agentsDir = path.join(ctx.cwd, ".pi", "agents");
+          const agentsDir = path.join(effectiveCwd, ".pi", "agents");
           fs.mkdirSync(agentsDir, { recursive: true });
           const fp = path.join(agentsDir, `${params.agent}.md`);
+          // Quote YAML values that contain special characters
+          // oxlint-disable-next-line no-useless-escape — \[ IS needed inside character class for literal bracket
+          const yamlQuote = (v: string) => /[:#"'\n{}\[\],&*?|>!%@`]/.test(v) ? `"${v.replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"` : v;
           const fm = [
             "---",
-            `name: ${params.agent}`,
-            `description: ${params.task}`,
-            params.model ? `model: ${params.model}` : "",
+            `name: ${yamlQuote(params.agent)}`,
+            `description: ${yamlQuote(description)}`,
+            params.model ? `model: ${yamlQuote(params.model)}` : "",
             "---",
             "",
-            params.prompt,
+            systemPrompt,
           ].filter(Boolean).join("\n");
           fs.writeFileSync(fp, fm, "utf-8");
           return ok(`Created agent "${params.agent}" at ${fp}`);
@@ -853,7 +984,7 @@ export default function (pi: ExtensionAPI) {
 
         if (params.action === "update") {
           if (!params.agent) return err("Provide agent name for update action.");
-          const existing = findAgentFile(ctx.cwd, params.agent);
+          const existing = findAgentFile(effectiveCwd, params.agent);
           if (!existing) return err(`Agent "${params.agent}" not found.`);
           const raw = fs.readFileSync(existing, "utf-8");
           const { meta, body } = parseFrontmatter(raw);
@@ -867,9 +998,14 @@ export default function (pi: ExtensionAPI) {
 
         if (params.action === "delete") {
           if (!params.agent) return err("Provide agent name for delete action.");
-          const existing = findAgentFile(ctx.cwd, params.agent);
+          const existing = findAgentFile(effectiveCwd, params.agent);
           if (!existing) return err(`Agent "${params.agent}" not found.`);
-          fs.unlinkSync(existing);
+          try {
+            fs.unlinkSync(existing);
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            return err(`Failed to delete "${params.agent}": ${msg}`);
+          }
           return ok(`Deleted agent "${params.agent}" (${existing})`);
         }
 
@@ -882,12 +1018,12 @@ export default function (pi: ExtensionAPI) {
       const hasParallel = Boolean(params.tasks?.length);
       const modeCount = Number(hasSingle) + Number(hasChain) + Number(hasParallel);
       if (modeCount !== 1) {
-        const agents = discoverAgents(ctx.cwd);
+        const agents = discoverAgents(effectiveCwd);
         const avail = agents.map(a => `${a.name}: ${a.description}`).join("\n") || "none";
         return err(`Provide exactly one mode: agent+task, tasks[], or chain[]. Or use an action.\n\nAvailable agents:\n${avail}`);
       }
 
-      const cwd = params.cwd ? path.resolve(params.cwd) : ctx.cwd;
+      const cwd = params.cwd ? path.resolve(params.cwd) : effectiveCwd;
       if (!fs.existsSync(cwd)) return err(`cwd does not exist: ${cwd}`);
 
       const agents = discoverAgents(cwd);
@@ -930,7 +1066,7 @@ export default function (pi: ExtensionAPI) {
             const verifyResults: string[] = [];
             let allPassed = true;
             for (const cmd of params.acceptance.verify) {
-              const { exitCode, stderr } = await runGate(cmd, r.output, cwd, 30_000, signal);
+              const { exitCode } = await runGate(cmd, r.output, cwd, 30_000, signal);
               const passed = exitCode === 0;
               verifyResults.push(`${passed ? "✓" : "✗"} ${cmd}`);
               if (!passed) allPassed = false;
@@ -1027,9 +1163,11 @@ export default function (pi: ExtensionAPI) {
         );
 
         const okCount = results.filter(r => r.exitCode === 0).length;
-        const summary = results.map(r =>
-          `### [${r.agent}] ${r.exitCode === 0 ? "completed" : "failed"}\n${r.exitCode === 0 ? r.output : r.stderr || r.output}`
-        ).join("\n\n---\n\n");
+        const summary = results.map(r => {
+          const raw = r.exitCode === 0 ? r.output : r.stderr || r.output;
+          const output = truncate(raw, PER_TASK_OUTPUT_CAP);
+          return `### [${r.agent}] ${r.exitCode === 0 ? "completed" : "failed"}\n${output}`;
+        }).join("\n\n---\n\n");
         const d = { mode: "parallel", results };
         const text = `Parallel: ${okCount}/${results.length} succeeded\n\n${summary}`;
         return okCount < results.length ? err(text, d) : ok(text, d);
@@ -1053,18 +1191,54 @@ export default function (pi: ExtensionAPI) {
       const d = result.details as { results?: RunResult[] } | undefined;
       const hasErr = d?.results?.some(r => r.exitCode !== 0) ?? false;
       const icon = hasErr ? theme.fg("error", "✗") : theme.fg("success", "✓");
+
+      // Build summary line with usage stats
+      const summaryParts: string[] = [];
+      if (d?.results?.length) {
+        const totalCost = d.results.reduce((s, r) => s + r.cost, 0);
+        const totalTurns = d.results.reduce((s, r) => s + r.turns, 0);
+        if (totalCost > 0) summaryParts.push(`$${totalCost.toFixed(4)}`);
+        if (totalTurns > 0) summaryParts.push(`${totalTurns} turn${totalTurns > 1 ? "s" : ""}`);
+        // Count tool calls across all results
+        const toolCallCount = d.results.reduce((s, r) => s + r.messages.filter(m => m.toolCalls?.length).length, 0);
+        if (toolCallCount > 0) summaryParts.push(`${toolCallCount} tool call${toolCallCount > 1 ? "s" : ""}`);
+      }
+      const summaryLine = summaryParts.length ? ` ${theme.fg("muted", `(${summaryParts.join(", ")})`)}` : "";
+
       if (expanded) {
         const c = new Container();
-        c.addChild(new Text(`${icon} ${theme.fg("toolTitle", theme.bold("subagent"))}`, 0, 0));
+        c.addChild(new Text(`${icon} ${theme.fg("toolTitle", theme.bold("subagent"))}${summaryLine}`, 0, 0));
+
+        // Show tool calls from the first result with messages
+        const firstWithMessages = d?.results?.find(r => r.messages.length > 0);
+        if (firstWithMessages) {
+          const toolCalls = firstWithMessages.messages.filter(m => m.role === "assistant" && m.toolCalls?.length);
+          if (toolCalls.length > 0) {
+            c.addChild(new Spacer(1));
+            c.addChild(new Text(theme.fg("muted", "Tool calls:"), 0, 0));
+            for (const msg of toolCalls.slice(0, 10)) {
+              for (const tc of msg.toolCalls ?? []) {
+                const args = Object.keys(tc.args).length > 0
+                  ? ` ${theme.fg("muted", JSON.stringify(tc.args).slice(0, 120))}`
+                  : "";
+                c.addChild(new Text(`  ${theme.fg("accent", tc.name)}${args}`, 0, 0));
+              }
+            }
+            if (toolCalls.length > 10) c.addChild(new Text(theme.fg("muted", `  ... +${toolCalls.length - 10} more`), 0, 0));
+          }
+        }
+
         c.addChild(new Spacer(1));
         c.addChild(new Text(text, 0, 0));
         return c;
       }
+
+      // Collapsed: show first few lines + summary
       const lines = text.split("\n");
-      const preview = lines.length > 10
-        ? [...lines.slice(0, 10), theme.fg("muted", `... +${lines.length - 10} more (Ctrl+O to expand)`)]
+      const preview = lines.length > 8
+        ? [...lines.slice(0, 8), theme.fg("muted", `... +${lines.length - 8} more (Ctrl+O to expand)`)]
         : lines;
-      return new Text(`${icon} ${preview.join("\n")}`, 0, 0);
+      return new Text(`${icon} ${preview.join("\n")}${summaryLine}`, 0, 0);
     },
   });
 }
