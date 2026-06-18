@@ -445,9 +445,9 @@ function spawnAndParse(
         const texts: string[] = [];
         for (const p of ev.message.content ?? []) {
           if (p.type === "text" && p.text) texts.push(p.text);
-          if (p.type === "tool_use") {
+          if (p.type === "toolCall") {
             const toolName = p.name ?? "tool";
-            const toolArgs = p.input ?? {};
+            const toolArgs = p.arguments ?? p.input ?? {};
             messages.push({ role: "assistant", toolCalls: [{ name: toolName, args: toolArgs }] });
           }
         }
@@ -593,10 +593,13 @@ async function runAgentInLine(
     let stopReason: string | undefined;
     const rawMessages = session.messages as Array<{
       role: string;
-      content?: Array<{ type: string; text?: string; name?: string; input?: Record<string, unknown> }>;
-      usage?: { inputTokens?: number; outputTokens?: number; cache_read_input_tokens?: number; cacheCreation?: number; cost?: { total?: number } };
+      content?: Array<{ type: string; text?: string; name?: string; arguments?: Record<string, unknown> }>;
+      usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cost?: { total?: number } };
       model?: string;
       stopReason?: string;
+      // ToolResultMessage fields
+      toolName?: string;
+      toolCallId?: string;
     }>;
 
     for (const msg of rawMessages) {
@@ -606,22 +609,23 @@ async function runAgentInLine(
         const toolCalls: Array<{ name: string; args: Record<string, unknown> }> = [];
         for (const p of msg.content ?? []) {
           if (p.type === "text" && p.text) texts.push(p.text);
-          if (p.type === "tool_use" && p.name) toolCalls.push({ name: p.name, args: p.input ?? {} });
+          if (p.type === "toolCall" && p.name) toolCalls.push({ name: p.name, args: p.arguments ?? {} });
         }
         if (texts.length) output = texts.join("\n");
         const u = msg.usage;
-        const usage = u ? { input: u.inputTokens ?? 0, output: u.outputTokens ?? 0, cacheRead: u.cache_read_input_tokens ?? 0, cacheWrite: u.cacheCreation ?? 0, cost: u.cost?.total ?? 0 } : undefined;
+        const usage = u ? { input: u.input ?? 0, output: u.output ?? 0, cacheRead: u.cacheRead ?? 0, cacheWrite: u.cacheWrite ?? 0, cost: u.cost?.total ?? 0 } : undefined;
         if (usage) cost += usage.cost;
         if (msg.model) modelId = msg.model;
         if (msg.stopReason) stopReason = msg.stopReason;
         parsedMessages.push({ role: "assistant", text: texts.join("\n") || undefined, toolCalls: toolCalls.length ? toolCalls : undefined, usage, model: msg.model, stopReason: msg.stopReason });
       }
-      if (msg.role === "tool" && msg.content?.length) {
-        for (const p of msg.content) {
-          if (p.type === "tool_result" && p.name) {
-            parsedMessages.push({ role: "tool", toolResult: { name: p.name, output: truncate(p.text ?? "", 2048) } });
-          }
+      if (msg.role === "toolResult") {
+        const toolName = msg.toolName ?? "tool";
+        const texts: string[] = [];
+        for (const p of msg.content ?? []) {
+          if (p.type === "text" && p.text) texts.push(p.text);
         }
+        parsedMessages.push({ role: "tool", toolResult: { name: toolName, output: truncate(texts.join("\n"), 2048) } });
       }
     }
 
