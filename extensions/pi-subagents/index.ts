@@ -309,6 +309,13 @@ function parseSessionFile(sessionPath: string): { output: string; cost: number }
         }
         if (texts.length) output = texts.join("\n");
         cost += ev.message.usage?.cost?.total ?? 0;
+      } else if (ev.type === "message" && ev.message?.role === "assistant") {
+        const texts: string[] = [];
+        for (const p of ev.message.content ?? []) {
+          if (p.type === "text") texts.push(p.text);
+        }
+        if (texts.length) output = texts.join("\n");
+        cost += ev.message.usage?.cost?.total ?? 0;
       }
     }
   } catch {}
