@@ -90,6 +90,7 @@ const MAX_OUTPUT_BYTES = 100 * 1024; // 100KB per agent output
 const MAX_STDERR_BYTES = 1024 * 1024; // 1MB stderr cap during accumulation
 const PER_TASK_OUTPUT_CAP = 50 * 1024; // 50KB per task in parallel mode
 const DEFAULT_GATE_TIMEOUT_MS = 30_000;
+const BACKGROUND_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes for background agents
 const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
 
 // ── State ───────────────────────────────────────────────────────────────────
@@ -119,7 +120,10 @@ function persistRuns(): void {
 }
 
 /** Remove old completed/failed runs from memory and disk. Keeps last 100 entries. */
+let pruneCounter = 0;
 function pruneRuns(): void {
+  // Only run every 10th call to avoid O(n log n) on every persistRuns
+  if (++pruneCounter % 10 !== 0) return;
   const MAX_RUNS = 100;
   const entries = [...runs.values()];
   if (entries.length <= MAX_RUNS) return;
@@ -179,14 +183,15 @@ function reconcileRuns(): void {
       } catch {
         /* file may have been deleted */
       }
-      // Can't know real exit code from session file alone — assume success if we got output
-      r.status = "completed";
+      // Infer exit code from stopReason: "stop" = success, anything else = failure
+      const exitCode = session.stopReason === "stop" ? 0 : 1;
+      r.status = exitCode === 0 ? "completed" : "failed";
       r.result = {
         agent: r.agent,
         task: r.task,
-        exitCode: 0,
+        exitCode,
         output: truncate(session.output, MAX_OUTPUT_BYTES),
-        stderr: "",
+        stderr: exitCode !== 0 ? `Agent stopped: ${session.stopReason ?? "unknown"}` : "",
         cost: session.cost,
         duration: Math.max(0, endTime - r.startedAt),
         sessionPath: r.sessionPath,
@@ -289,9 +294,14 @@ function findSessionFile(sessionDir: string): string | undefined {
   }
 }
 
-function parseSessionFile(sessionPath: string): { output: string; cost: number } {
+function parseSessionFile(sessionPath: string): {
+  output: string;
+  cost: number;
+  stopReason?: string;
+} {
   let output = "",
-    cost = 0;
+    cost = 0,
+    stopReason: string | undefined;
   try {
     const content = fs.readFileSync(sessionPath, "utf-8");
     for (const line of content.split("\n")) {
@@ -309,6 +319,7 @@ function parseSessionFile(sessionPath: string): { output: string; cost: number }
         }
         if (texts.length) output = texts.join("\n");
         cost += ev.message.usage?.cost?.total ?? 0;
+        if (ev.message.stopReason) stopReason = ev.message.stopReason;
       } else if (ev.type === "message" && ev.message?.role === "assistant") {
         const texts: string[] = [];
         for (const p of ev.message.content ?? []) {
@@ -316,13 +327,18 @@ function parseSessionFile(sessionPath: string): { output: string; cost: number }
         }
         if (texts.length) output = texts.join("\n");
         cost += ev.message.usage?.cost?.total ?? 0;
+        if (ev.message.stopReason) stopReason = ev.message.stopReason;
       }
     }
   } catch {}
-  return { output, cost };
+  return { output, cost, stopReason };
 }
 
-function readSessionOutput(sessionDir: string): { output: string; cost: number } {
+function readSessionOutput(sessionDir: string): {
+  output: string;
+  cost: number;
+  stopReason?: string;
+} {
   const file = findSessionFile(sessionDir);
   return file ? parseSessionFile(file) : { output: "", cost: 0 };
 }
@@ -1005,6 +1021,31 @@ function runAgentAsync(
   };
   runs.set(id, record);
   persistRuns();
+
+  // Kill background agents that run too long
+  const timeout = setTimeout(() => {
+    if (record.status !== "running") return;
+    try {
+      proc.kill("SIGTERM");
+    } catch {}
+    record.status = "failed";
+    record.result = {
+      agent: name,
+      task,
+      exitCode: 1,
+      output: "",
+      stderr: `Background agent timed out after ${BACKGROUND_TIMEOUT_MS / 1000}s`,
+      cost: 0,
+      duration: Date.now() - record.startedAt,
+      sessionPath: sessionDir,
+      messages: [],
+      turns: 0,
+    };
+    record.proc = undefined;
+    persistRuns();
+  }, BACKGROUND_TIMEOUT_MS);
+  // Don't let the timer keep the process alive
+  if (timeout.unref) timeout.unref();
 
   let stderr = "";
   proc.stderr.on("data", (d) => {
