@@ -3,7 +3,7 @@
  * Tests functions that aren't directly exported but whose behavior
  * we can verify through the tool's execute() function.
  */
-import { describe, test, expect, beforeEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -50,7 +50,18 @@ async function loadTool() {
   mod.default(api);
   const tool = api.tools.find(t => t.name === "subagent");
   if (!tool) throw new Error("subagent tool not registered");
-  return tool;
+  return {
+    ...tool,
+    /** Call execute and normalize thrown errors into isError results for test ergonomics. */
+    async call(...args: Parameters<typeof tool.execute>) {
+      try {
+        return await tool.execute(...args);
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return { content: [{ type: "text" as const, text: msg }], details: undefined, isError: true };
+      }
+    },
+  };
 }
 
 function makeTempProject(agentName = "test-agent", extra?: Record<string, string>) {
@@ -88,7 +99,7 @@ describe("mapConcurrent (tested via parallel tasks)", () => {
     try {
       // Use a short timeout — we're testing that the code path is reachable
       const result = await Promise.race([
-        tool.execute("call-1", {
+        tool.call("call-1", {
           tasks: [
             { agent: "test-agent", task: "task 1" },
             { agent: "test-agent", task: "task 2" },
@@ -135,7 +146,7 @@ describe("subprocess argument construction", () => {
     const dir = makeTempProject("sub-agent", { execution: "subprocess" });
     try {
       // Subprocess will fail (pi not in PATH during tests) but the code path is exercised
-      const result = await tool.execute("call-1", {
+      const result = await tool.call("call-1", {
         agent: "sub-agent",
         task: "test subprocess",
         execution: "subprocess",
@@ -323,7 +334,7 @@ describe("chain mode", () => {
   test("chain mode validates agents exist before executing", async () => {
     const dir = makeTempProject("real-agent");
     try {
-      const result = await tool.execute("call-1", {
+      const result = await tool.call("call-1", {
         chain: [
           { agent: "real-agent", task: "step 1" },
           { agent: "nonexistent-agent", task: "step 2" },
@@ -343,7 +354,7 @@ describe("chain mode", () => {
     try {
       // Gate + onFail are accepted by the schema. Execution requires real SDK.
       const result = await Promise.race([
-        tool.execute("call-1", {
+        tool.call("call-1", {
           chain: [
             { agent: "test-agent", task: "generate code", gate: "echo ok", onFail: "abort" },
           ],
@@ -362,7 +373,7 @@ describe("chain mode", () => {
     const dir = makeTempProject("test-agent");
     try {
       const result = await Promise.race([
-        tool.execute("call-1", {
+        tool.call("call-1", {
           chain: [
             { agent: "test-agent", task: "step 1", as: "analysis" },
             { agent: "test-agent", task: "based on {outputs.analysis}" },
@@ -393,7 +404,7 @@ describe("acceptance contracts", () => {
     try {
       // Execution requires real SDK — just verify the code path is reachable
       const result = await Promise.race([
-        tool.execute("call-1", {
+        tool.call("call-1", {
           agent: "test-agent",
           task: "write code",
           acceptance: {
@@ -427,7 +438,7 @@ describe("context mode", () => {
     try {
       // Execution requires real SDK
       const result = await Promise.race([
-        tool.execute("call-1", {
+        tool.call("call-1", {
           agent: "test-agent",
           task: "test",
           context: "fresh",
@@ -446,7 +457,7 @@ describe("context mode", () => {
     const dir = makeTempProject("test-agent");
     try {
       const result = await Promise.race([
-        tool.execute("call-1", {
+        tool.call("call-1", {
           agent: "test-agent",
           task: "test",
           context: "fork",
@@ -474,7 +485,7 @@ describe("background mode", () => {
   test("background flag returns immediately with run info", async () => {
     const dir = makeTempProject("test-agent");
     try {
-      const result = await tool.execute("call-1", {
+      const result = await tool.call("call-1", {
         agent: "test-agent",
         task: "background task",
         background: true,
@@ -486,6 +497,41 @@ describe("background mode", () => {
       // Should mention the run ID or background status
       const text = result.content[0].text;
       expect(text).toMatch(/background|run|id/i);
+    } finally {
+      cleanup(dir);
+    }
+  });
+
+  test("status response is serializable (no proc leak)", async () => {
+    // Regression test: status used to return RunRecord with proc (child process),
+    // which caused structured clone to fail with "could not be cloned".
+    const dir = makeTempProject("test-agent");
+    try {
+      // Spawn background agent (will fail quickly in test env — pi binary not found)
+      const bg = await tool.call("call-1", {
+        agent: "test-agent",
+        task: "bg task",
+        background: true,
+      }, undefined, undefined, createMockCtx({ cwd: dir }));
+
+      // Extract run ID from response
+      const text = bg.content[0].text;
+      const idMatch = text.match(/id:\s*(\w+)/);
+      if (!idMatch) return; // skip if background spawn failed differently
+      const runId = idMatch[1];
+
+      // Wait a moment for the process to finish (it will fail quickly)
+      await new Promise(r => setTimeout(r, 200));
+
+      // Call status
+      const status = await tool.call("call-1", {
+        action: "status",
+        id: runId,
+      }, undefined, undefined, createMockCtx({ cwd: dir }));
+
+      // Details must be serializable — this is what failed before the fix
+      expect(status.details).toBeDefined();
+      expect(() => JSON.stringify(status.details)).not.toThrow();
     } finally {
       cleanup(dir);
     }
@@ -503,7 +549,7 @@ describe("run lifecycle actions", () => {
 
   test("status with non-existent ID returns error", async () => {
     const ctx = createMockCtx();
-    const result = await tool.execute("call-1", {
+    const result = await tool.call("call-1", {
       action: "status",
       id: "nonexistent",
     }, undefined, undefined, ctx);
@@ -514,7 +560,7 @@ describe("run lifecycle actions", () => {
 
   test("wait with non-existent ID returns error", async () => {
     const ctx = createMockCtx();
-    const result = await tool.execute("call-1", {
+    const result = await tool.call("call-1", {
       action: "wait",
       id: "nonexistent",
     }, undefined, undefined, ctx);
@@ -525,7 +571,7 @@ describe("run lifecycle actions", () => {
 
   test("resume with non-existent ID returns error", async () => {
     const ctx = createMockCtx();
-    const result = await tool.execute("call-1", {
+    const result = await tool.call("call-1", {
       action: "resume",
       id: "nonexistent",
       task: "continue",
@@ -537,7 +583,7 @@ describe("run lifecycle actions", () => {
 
   test("interrupt with non-existent ID returns error", async () => {
     const ctx = createMockCtx();
-    const result = await tool.execute("call-1", {
+    const result = await tool.call("call-1", {
       action: "interrupt",
       id: "nonexistent",
     }, undefined, undefined, ctx);
@@ -558,7 +604,7 @@ describe("edge cases", () => {
 
   test("handles empty tasks array in parallel mode", async () => {
     const ctx = createMockCtx();
-    const result = await tool.execute("call-1", {
+    const result = await tool.call("call-1", {
       tasks: [],
     }, undefined, undefined, ctx);
 
@@ -571,7 +617,7 @@ describe("edge cases", () => {
     try {
       const ctx = createMockCtx({ cwd: dir });
       const longName = "a".repeat(200);
-      const result = await tool.execute("call-1", {
+      const result = await tool.call("call-1", {
         action: "create",
         agent: longName,
         task: "test",
@@ -589,14 +635,14 @@ describe("edge cases", () => {
     try {
       const ctx = createMockCtx({ cwd: dir });
       // Create
-      await tool.execute("call-1", {
+      await tool.call("call-1", {
         action: "create",
         agent: "race-condition",
         task: "test",
       }, undefined, undefined, ctx);
 
       // Delete immediately
-      const result = await tool.execute("call-1", {
+      const result = await tool.call("call-1", {
         action: "delete",
         agent: "race-condition",
       }, undefined, undefined, ctx);
@@ -611,7 +657,7 @@ describe("edge cases", () => {
     const dir = makeTempProject("test-agent");
     try {
       const ctx = createMockCtx({ cwd: dir });
-      const result = await tool.execute("call-1", {
+      const result = await tool.call("call-1", {
         agent: "test-agent",
         task: "test with model",
         model: "openrouter/anthropic/fable-5",
@@ -622,5 +668,49 @@ describe("edge cases", () => {
     } finally {
       cleanup(dir);
     }
+  });
+});
+
+// ── Persistence validation ─────────────────────────────────────────────────
+
+describe("persistence validation", () => {
+  const runsFile = path.join(os.homedir(), ".pi", "agent", "subagent-runs.json");
+  let savedData: string | undefined;
+
+  beforeEach(() => {
+    // Save existing runs file if present
+    try { savedData = fs.readFileSync(runsFile, "utf-8"); } catch { /* no file */ }
+  });
+
+  afterEach(() => {
+    // Restore original runs file
+    if (savedData !== undefined) {
+      fs.writeFileSync(runsFile, savedData);
+    } else {
+      try { fs.unlinkSync(runsFile); } catch { /* ok */ }
+    }
+  });
+
+  test("loadRuns rejects entries with missing required fields", async () => {
+    // Write corrupted data
+    fs.mkdirSync(path.dirname(runsFile), { recursive: true });
+    fs.writeFileSync(runsFile, JSON.stringify([
+      { id: "valid1", sessionPath: "/tmp/test", status: "completed", startedAt: Date.now() },
+      { id: "no-session" }, // missing sessionPath
+      { sessionPath: "/tmp/test2" }, // missing id
+      { id: "bad-status", sessionPath: "/tmp/test3", status: "invalid", startedAt: Date.now() },
+      { id: "no-started", sessionPath: "/tmp/test4", status: "running" }, // missing startedAt
+    ]));
+
+    // Load extension — it should load only valid entries
+    const tool = await loadTool();
+
+    // The valid entry should be loadable via status
+    const result = await tool.call("call-1", {
+      action: "status",
+      id: "valid1",
+    }, undefined, undefined, createMockCtx());
+    // Should find the valid run (not error with "not found")
+    expect(result.content[0].text).toContain("completed");
   });
 });

@@ -43,14 +43,23 @@ function createMockCtx(overrides: Record<string, any> = {}) {
   };
 }
 
-/** Load the extension and return the registered tool's execute function. */
+/** Load the extension and return a wrapped execute function that catches thrown errors. */
 async function loadTool() {
   const api = createMockExtensionAPI();
   const mod = await import(EXTENSION);
   mod.default(api);
   const tool = api.tools.find(t => t.name === "subagent");
   if (!tool) throw new Error("subagent tool not registered");
-  return tool.execute;
+  const execute = tool.execute;
+  /** Call execute and normalize thrown errors into isError results for test ergonomics. */
+  return async (...args: Parameters<typeof execute>) => {
+    try {
+      return await execute(...args);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return { content: [{ type: "text" as const, text: msg }], details: undefined, isError: true };
+    }
+  };
 }
 
 /** Create a temp dir with an agent .md file for testing. */

@@ -13,7 +13,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
-import { type ExtensionAPI, type ExtensionContext, createAgentSession, type AgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
+import {
+  type ExtensionAPI,
+  type ExtensionContext,
+  createAgentSession,
+  type AgentSession,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
@@ -69,7 +75,10 @@ interface RunRecord {
   proc?: ReturnType<typeof spawn>;
 }
 
-type ToolResult = { content: { type: "text"; text: string }[]; details: unknown; isError?: boolean };
+type ToolResult = {
+  content: { type: "text"; text: string }[];
+  details: unknown;
+};
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -78,6 +87,7 @@ const MAX_PARALLEL = 8;
 const MAX_CONCURRENCY = 4; // limit concurrent subprocess spawns
 const MAX_RETRIES = 3;
 const MAX_OUTPUT_BYTES = 100 * 1024; // 100KB per agent output
+const MAX_STDERR_BYTES = 1024 * 1024; // 1MB stderr cap during accumulation
 const PER_TASK_OUTPUT_CAP = 50 * 1024; // 50KB per task in parallel mode
 const DEFAULT_GATE_TIMEOUT_MS = 30_000;
 const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
@@ -108,12 +118,38 @@ function persistRuns(): void {
   }
 }
 
+/** Remove old completed/failed runs from memory and disk. Keeps last 100 entries. */
+function pruneRuns(): void {
+  const MAX_RUNS = 100;
+  const entries = [...runs.values()];
+  if (entries.length <= MAX_RUNS) return;
+
+  // Sort by startedAt descending, keep newest
+  entries.sort((a, b) => b.startedAt - a.startedAt);
+  const toRemove = entries.slice(MAX_RUNS);
+  for (const r of toRemove) {
+    // Clean up session dir if it still exists
+    if (r.status !== "running" && r.sessionPath) {
+      try {
+        fs.rmSync(r.sessionPath, { recursive: true, force: true });
+      } catch {}
+    }
+    runs.delete(r.id);
+  }
+  persistRuns();
+}
+
 function loadRuns(): void {
   try {
     const data = JSON.parse(fs.readFileSync(runsFilePath(), "utf-8"));
     if (!Array.isArray(data)) return;
     for (const r of data) {
-      if (r.id && r.sessionPath) runs.set(r.id, r as RunRecord);
+      // Validate required fields and types to handle corrupted persistence
+      if (!r.id || !r.sessionPath || typeof r.id !== "string" || typeof r.sessionPath !== "string")
+        continue;
+      if (!r.status || !["running", "completed", "failed"].includes(r.status)) continue;
+      if (typeof r.startedAt !== "number") continue;
+      runs.set(r.id, r as RunRecord);
     }
   } catch (e: unknown) {
     // File not found is expected on first run
@@ -125,6 +161,8 @@ function loadRuns(): void {
 
 /** Reconcile persisted running records: if session file exists with output, mark completed. */
 function reconcileRuns(): void {
+  const now = Date.now();
+  const STALE_MS = 24 * 60 * 60 * 1000; // 24 hours
   let changed = false;
   for (const [id, r] of runs) {
     if (r.status !== "running") continue;
@@ -135,29 +173,90 @@ function reconcileRuns(): void {
     if (session.output) {
       // Use session file mtime for duration (excludes downtime while pi was away)
       const sessionFile = findSessionFile(r.sessionPath);
-      const endTime = sessionFile ? (fs.statSync(sessionFile).mtimeMs || Date.now()) : Date.now();
+      let endTime = now;
+      try {
+        if (sessionFile) endTime = fs.statSync(sessionFile).mtimeMs || now;
+      } catch {
+        /* file may have been deleted */
+      }
+      // Can't know real exit code from session file alone — assume success if we got output
       r.status = "completed";
       r.result = {
-        agent: r.agent, task: r.task, exitCode: 0,
-        output: truncate(session.output, MAX_OUTPUT_BYTES), stderr: "",
-        cost: session.cost, duration: Math.max(0, endTime - r.startedAt), sessionPath: r.sessionPath,
-        messages: [], turns: 0,
+        agent: r.agent,
+        task: r.task,
+        exitCode: 0,
+        output: truncate(session.output, MAX_OUTPUT_BYTES),
+        stderr: "",
+        cost: session.cost,
+        duration: Math.max(0, endTime - r.startedAt),
+        sessionPath: r.sessionPath,
+        messages: [],
+        turns: 0,
       };
       changed = true;
     } else if (!fs.existsSync(r.sessionPath)) {
       // Session dir gone — stale run
       runs.delete(id);
       changed = true;
+    } else if (now - r.startedAt > STALE_MS) {
+      // Running for >24h with no output and session dir still exists — mark failed
+      r.status = "failed";
+      r.result = {
+        agent: r.agent,
+        task: r.task,
+        exitCode: 1,
+        output: "",
+        stderr: "Background agent timed out after 24h with no output.",
+        cost: 0,
+        duration: now - r.startedAt,
+        sessionPath: r.sessionPath,
+        messages: [],
+        turns: 0,
+      };
+      changed = true;
     }
     // else: still running or no output yet, leave as-is
   }
   if (changed) persistRuns();
+
+  // Clean up session dirs for completed/failed runs older than 1 hour
+  // (keep recent ones so resume still works)
+  const RESUME_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+  for (const [, r] of runs) {
+    if (r.status === "running") continue;
+    if (r.sessionPath && r.result && now - r.startedAt > RESUME_WINDOW_MS) {
+      try {
+        fs.rmSync(r.sessionPath, { recursive: true, force: true });
+      } catch {}
+    }
+  }
+  pruneRuns();
+}
+
+/** Clean up session dir for a completed/failed run if result is stored. */
+function cleanupRunSession(r: RunRecord): void {
+  if (r.status === "running") return;
+  if (!r.sessionPath || !r.result) return;
+  try {
+    fs.rmSync(r.sessionPath, { recursive: true, force: true });
+  } catch {}
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-const ok = (text: string, details?: unknown): ToolResult => ({ content: [{ type: "text", text }], details });
-const err = (text: string, details?: unknown): ToolResult => ({ content: [{ type: "text", text }], details, isError: true });
+const ok = (text: string, details?: unknown): ToolResult => ({
+  content: [{ type: "text", text }],
+  details,
+});
+
+/**
+ * Signal a tool error by throwing. Per pi SDK docs:
+ * "Returning a value never sets the error flag regardless of what properties you include.
+ *  To mark a tool execution as failed, throw an error from execute."
+ */
+function toolError(message: string): never {
+  throw new Error(message);
+}
 
 function genId(): string {
   return crypto.randomBytes(4).toString("hex");
@@ -175,7 +274,8 @@ function childEnv(depth: number): NodeJS.ProcessEnv {
 function truncate(s: string, maxBytes: number): string {
   if (Buffer.byteLength(s, "utf-8") <= maxBytes) return s;
   // Binary search for the right cutoff point — O(n log n) vs O(n²) char-by-char
-  let lo = 0, hi = s.length;
+  let lo = 0,
+    hi = s.length;
   while (lo < hi) {
     const mid = (lo + hi + 1) >>> 1;
     if (Buffer.byteLength(s.slice(0, mid), "utf-8") <= maxBytes) lo = mid;
@@ -187,9 +287,10 @@ function truncate(s: string, maxBytes: number): string {
 /** Find newest session JSONL file by modification time. */
 function findSessionFile(sessionDir: string): string | undefined {
   try {
-    const files = fs.readdirSync(sessionDir)
-      .filter(f => f.endsWith(".jsonl"))
-      .map(f => ({ name: f, mtime: fs.statSync(path.join(sessionDir, f)).mtimeMs }))
+    const files = fs
+      .readdirSync(sessionDir)
+      .filter((f) => f.endsWith(".jsonl"))
+      .map((f) => ({ name: f, mtime: fs.statSync(path.join(sessionDir, f)).mtimeMs }))
       .sort((a, b) => b.mtime - a.mtime);
     return files.length ? path.join(sessionDir, files[0]!.name) : undefined;
   } catch {
@@ -198,16 +299,23 @@ function findSessionFile(sessionDir: string): string | undefined {
 }
 
 function parseSessionFile(sessionPath: string): { output: string; cost: number } {
-  let output = "", cost = 0;
+  let output = "",
+    cost = 0;
   try {
     const content = fs.readFileSync(sessionPath, "utf-8");
     for (const line of content.split("\n")) {
       if (!line.trim()) continue;
       let ev: any;
-      try { ev = JSON.parse(line); } catch { continue; }
+      try {
+        ev = JSON.parse(line);
+      } catch {
+        continue;
+      }
       if (ev.type === "message_end" && ev.message?.role === "assistant") {
         const texts: string[] = [];
-        for (const p of ev.message.content ?? []) { if (p.type === "text") texts.push(p.text); }
+        for (const p of ev.message.content ?? []) {
+          if (p.type === "text") texts.push(p.text);
+        }
         if (texts.length) output = texts.join("\n");
         cost += ev.message.usage?.cost?.total ?? 0;
       }
@@ -221,6 +329,12 @@ function readSessionOutput(sessionDir: string): { output: string; cost: number }
   return file ? parseSessionFile(file) : { output: "", cost: 0 };
 }
 
+/** Strip non-serializable proc before returning RunRecord to pi (structured clone can't handle functions). */
+function safeRecord(r: RunRecord): Omit<RunRecord, "proc"> {
+  const { proc: _, ...rest } = r;
+  return rest;
+}
+
 function fmtRunStatus(r: RunRecord): string {
   const elapsed = Date.now() - r.startedAt;
   const ms = elapsed < 1000 ? `${elapsed}ms` : `${(elapsed / 1000).toFixed(1)}s`;
@@ -232,10 +346,10 @@ function fmtRunStatus(r: RunRecord): string {
 function findRun(id: string): RunRecord | { ambiguous: string[] } | undefined {
   const exact = runs.get(id);
   if (exact) return exact;
-  const matches = Array.from(runs.values()).filter(r => r.id.startsWith(id));
+  const matches = Array.from(runs.values()).filter((r) => r.id.startsWith(id));
   if (matches.length === 0) return undefined;
   if (matches.length === 1) return matches[0]!;
-  return { ambiguous: matches.map(r => r.id) };
+  return { ambiguous: matches.map((r) => r.id) };
 }
 
 /** Kill a process group (not just the direct child). */
@@ -246,7 +360,9 @@ function killProc(proc: ReturnType<typeof spawn>, signal: NodeJS.Signals): void 
       process.kill(-proc.pid, signal);
     }
   } catch {
-    try { proc.kill(signal); } catch {}
+    try {
+      proc.kill(signal);
+    } catch {}
   }
 }
 
@@ -262,7 +378,8 @@ function parseFrontmatter(content: string): { meta: Record<string, string>; body
     const m = line.match(/^([\w-]+):\s*(.*)$/);
     if (m) {
       let v = m[2]!.trim();
-      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")))
+        v = v.slice(1, -1);
       meta[m[1]!] = v;
     }
   }
@@ -276,27 +393,38 @@ function loadAgents(dir: string, source: "bundled" | "user" | "project"): AgentC
     if (!e.name.endsWith(".md") || !e.isFile()) continue;
     const fp = path.join(dir, e.name);
     let raw: string;
-    try { raw = fs.readFileSync(fp, "utf-8"); } catch { continue; }
+    try {
+      raw = fs.readFileSync(fp, "utf-8");
+    } catch {
+      continue;
+    }
     const { meta, body } = parseFrontmatter(raw);
     if (!meta.name || !meta.description) continue;
-    const tools = meta.tools?.split(",").map(t => t.trim()).filter(Boolean);
+    const tools = meta.tools
+      ?.split(",")
+      .map((t) => t.trim())
+      .filter(Boolean);
     const execution = meta.execution as "inline" | "subprocess" | undefined;
     agents.push({
-      name: meta.name, description: meta.description,
+      name: meta.name,
+      description: meta.description,
       model: meta.model || undefined,
       execution: execution === "subprocess" ? "subprocess" : undefined, // default inline, only store if subprocess
       tools: tools?.length ? tools : undefined,
-      systemPrompt: body, source,
+      systemPrompt: body,
+      source,
     });
   }
   return agents;
 }
 
 function isProjectRoot(dir: string): boolean {
-  return fs.existsSync(path.join(dir, ".git"))
-    || fs.existsSync(path.join(dir, "package.json"))
-    || fs.existsSync(path.join(dir, "Cargo.toml"))
-    || fs.existsSync(path.join(dir, "go.mod"));
+  return (
+    fs.existsSync(path.join(dir, ".git")) ||
+    fs.existsSync(path.join(dir, "package.json")) ||
+    fs.existsSync(path.join(dir, "Cargo.toml")) ||
+    fs.existsSync(path.join(dir, "go.mod"))
+  );
 }
 
 function discoverAgents(cwd: string): AgentConfig[] {
@@ -386,7 +514,11 @@ function findModel(modelStr: string | undefined, ctx?: ExtensionContext): unknow
 }
 
 function buildArgs(
-  agent: AgentConfig, task: string, sessionDir: string, overrideModel?: string, opts?: { context?: "fresh" | "fork"; parentSessionFile?: string },
+  agent: AgentConfig,
+  task: string,
+  sessionDir: string,
+  overrideModel?: string,
+  opts?: { context?: "fresh" | "fork"; parentSessionFile?: string },
 ): { args: string[]; tmpFile?: string; cmd: string; baseArgs: string[] } {
   const { cmd, baseArgs } = getPiCmd();
   const args = [...baseArgs, "--mode", "json", "-p"];
@@ -411,28 +543,59 @@ function buildArgs(
 
 /** Shared spawn + parse logic for foreground runs. */
 function spawnAndParse(
-  cmd: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv; signal?: AbortSignal; parseStdout?: boolean; onMessage?: (msg: AgentMessage) => void },
-): Promise<{ exitCode: number; output: string; stderr: string; cost: number; messages: AgentMessage[]; turns: number; model?: string; stopReason?: string }> {
+  cmd: string,
+  args: string[],
+  opts: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    signal?: AbortSignal;
+    parseStdout?: boolean;
+    onMessage?: (msg: AgentMessage) => void;
+  },
+): Promise<{
+  exitCode: number;
+  output: string;
+  stderr: string;
+  cost: number;
+  messages: AgentMessage[];
+  turns: number;
+  model?: string;
+  stopReason?: string;
+}> {
   const { cwd, env, signal, parseStdout = true, onMessage } = opts;
-  return new Promise(resolve => {
-    let output = "", stderr = "", cost = 0, turns = 0, model: string | undefined, stopReason: string | undefined;
+  return new Promise((resolve) => {
+    let output = "",
+      stderr = "",
+      cost = 0,
+      turns = 0,
+      model: string | undefined,
+      stopReason: string | undefined;
     const messages: AgentMessage[] = [];
     let closed = false;
     let killTimeout: ReturnType<typeof setTimeout> | undefined;
-    const stdio: ["ignore", "pipe" | "ignore", "pipe"] = parseStdout ? ["ignore", "pipe", "pipe"] : ["ignore", "ignore", "pipe"];
+    const stdio: ["ignore", "pipe" | "ignore", "pipe"] = parseStdout
+      ? ["ignore", "pipe", "pipe"]
+      : ["ignore", "ignore", "pipe"];
     const proc = spawn(cmd, args, { cwd, shell: false, stdio, env });
 
     let buf = "";
     const processLine = (line: string) => {
       if (!line.trim()) return;
       let ev: any;
-      try { ev = JSON.parse(line); } catch { return; }
+      try {
+        ev = JSON.parse(line);
+      } catch {
+        return;
+      }
 
       // Capture tool calls from tool_use events (sub-agent invocations, file ops, etc.)
       if (ev.type === "tool_use" || ev.type === "tool_use_start") {
         const toolName = ev.name ?? ev.tool?.name ?? "unknown";
         const toolArgs = ev.input ?? ev.args ?? {};
-        const msg: AgentMessage = { role: "assistant", toolCalls: [{ name: toolName, args: toolArgs }] };
+        const msg: AgentMessage = {
+          role: "assistant",
+          toolCalls: [{ name: toolName, args: toolArgs }],
+        };
         messages.push(msg);
         onMessage?.(msg);
       }
@@ -444,7 +607,10 @@ function spawnAndParse(
         if (typeof ev.result === "string") toolOutput = ev.result;
         else if (ev.result?.text) toolOutput = ev.result.text;
         else if (ev.content?.text) toolOutput = ev.content.text;
-        const msg: AgentMessage = { role: "tool", toolResult: { name: toolName, output: truncate(toolOutput, 2048) } };
+        const msg: AgentMessage = {
+          role: "tool",
+          toolResult: { name: toolName, output: truncate(toolOutput, 2048) },
+        };
         messages.push(msg);
         onMessage?.(msg);
       }
@@ -463,43 +629,68 @@ function spawnAndParse(
         }
         if (texts.length) output = texts.join("\n");
         const u = ev.message.usage;
-        const usage = u ? { input: u.input ?? 0, output: u.output ?? 0, cacheRead: u.cacheRead ?? 0, cacheWrite: u.cacheWrite ?? 0, cost: u.cost?.total ?? 0 } : undefined;
+        const usage = u
+          ? {
+              input: u.input ?? 0,
+              output: u.output ?? 0,
+              cacheRead: u.cacheRead ?? 0,
+              cacheWrite: u.cacheWrite ?? 0,
+              cost: u.cost?.total ?? 0,
+            }
+          : undefined;
         if (usage) cost += usage.cost;
         if (ev.message.model) model = ev.message.model;
         if (ev.message.stopReason) stopReason = ev.message.stopReason;
-        const msg: AgentMessage = { role: "assistant", text: output, usage, model: ev.message.model, stopReason: ev.message.stopReason };
+        const msg: AgentMessage = {
+          role: "assistant",
+          text: output,
+          usage,
+          model: ev.message.model,
+          stopReason: ev.message.stopReason,
+        };
         messages.push(msg);
         onMessage?.(msg);
       }
 
       // Capture error messages
       if (ev.type === "error") {
-        const msg: AgentMessage = { role: "assistant", errorMessage: ev.message ?? ev.error ?? "Unknown error" };
+        const msg: AgentMessage = {
+          role: "assistant",
+          errorMessage: ev.message ?? ev.error ?? "Unknown error",
+        };
         messages.push(msg);
         onMessage?.(msg);
       }
     };
 
     if (parseStdout && proc.stdout) {
-      proc.stdout.on("data", d => {
+      proc.stdout.on("data", (d) => {
         buf += d.toString();
-        const lines = buf.split("\n"); buf = lines.pop() ?? "";
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
         for (const l of lines) processLine(l);
       });
     }
-    proc.stderr?.on("data", d => { stderr += d.toString(); });
-    proc.on("close", c => {
+    proc.stderr?.on("data", (d) => {
+      if (Buffer.byteLength(stderr, "utf-8") < MAX_STDERR_BYTES) stderr += d.toString();
+    });
+    proc.on("close", (c) => {
       closed = true;
       if (killTimeout) clearTimeout(killTimeout);
       if (buf.trim()) processLine(buf);
       resolve({ exitCode: c ?? 0, output, stderr, cost, messages, turns, model, stopReason });
     });
-    proc.on("error", () => { if (!closed) resolve({ exitCode: 1, output, stderr, cost, messages, turns, model, stopReason }); });
+    proc.on("error", () => {
+      if (!closed)
+        resolve({ exitCode: 1, output, stderr, cost, messages, turns, model, stopReason });
+    });
 
     if (signal) {
       const kill = () => {
         killProc(proc, "SIGTERM");
-        killTimeout = setTimeout(() => { if (!closed) killProc(proc, "SIGKILL"); }, 5000);
+        killTimeout = setTimeout(() => {
+          if (!closed) killProc(proc, "SIGKILL");
+        }, 5000);
       };
       if (signal.aborted) kill();
       else signal.addEventListener("abort", kill, { once: true });
@@ -509,12 +700,31 @@ function spawnAndParse(
 
 /** Foreground run — blocks until the subprocess exits. */
 async function runAgentSync(
-  agents: AgentConfig[], name: string, task: string, cwd: string, depth: number, signal?: AbortSignal, overrideModel?: string, contextOpts?: { context?: "fresh" | "fork"; parentSessionFile?: string }, ctx?: ExtensionContext, overrideExecution?: "inline" | "subprocess",
+  agents: AgentConfig[],
+  name: string,
+  task: string,
+  cwd: string,
+  depth: number,
+  signal?: AbortSignal,
+  overrideModel?: string,
+  contextOpts?: { context?: "fresh" | "fork"; parentSessionFile?: string },
+  ctx?: ExtensionContext,
+  overrideExecution?: "inline" | "subprocess",
 ): Promise<RunResult> {
-  const agent = agents.find(a => a.name === name);
+  const agent = agents.find((a) => a.name === name);
   if (!agent) {
-    const avail = agents.map(a => `"${a.name}"`).join(", ") || "none";
-    return { agent: name, task, exitCode: 1, output: "", stderr: `Unknown agent "${name}". Available: ${avail}`, cost: 0, duration: 0, messages: [], turns: 0 };
+    const avail = agents.map((a) => `"${a.name}"`).join(", ") || "none";
+    return {
+      agent: name,
+      task,
+      exitCode: 1,
+      output: "",
+      stderr: `Unknown agent "${name}". Available: ${avail}`,
+      cost: 0,
+      duration: 0,
+      messages: [],
+      turns: 0,
+    };
   }
 
   // Execution routing: param override > agent config > default (inline)
@@ -528,7 +738,12 @@ async function runAgentSync(
   const start = Date.now();
 
   try {
-    const raw = await spawnAndParse(cmd, args, { cwd, env: childEnv(depth), signal, parseStdout: true });
+    const raw = await spawnAndParse(cmd, args, {
+      cwd,
+      env: childEnv(depth),
+      signal,
+      parseStdout: true,
+    });
     let { output, cost } = raw;
     // Fallback: read from session file if stdout parsing missed output
     if (!output || cost === 0) {
@@ -537,20 +752,39 @@ async function runAgentSync(
       if (cost === 0 && session.cost > 0) cost = session.cost;
     }
     return {
-      agent: name, task, exitCode: raw.exitCode,
-      output: truncate(output, MAX_OUTPUT_BYTES), stderr: truncate(raw.stderr, MAX_OUTPUT_BYTES),
-      cost, duration: Date.now() - start, sessionPath: sessionDir,
-      messages: raw.messages, turns: raw.turns, model: raw.model, stopReason: raw.stopReason,
+      agent: name,
+      task,
+      exitCode: raw.exitCode,
+      output: truncate(output, MAX_OUTPUT_BYTES),
+      stderr: truncate(raw.stderr, MAX_OUTPUT_BYTES),
+      cost,
+      duration: Date.now() - start,
+      sessionPath: sessionDir,
+      messages: raw.messages,
+      turns: raw.turns,
+      model: raw.model,
+      stopReason: raw.stopReason,
     };
   } finally {
-    if (tmpFile) { try { fs.unlinkSync(tmpFile); } catch {} }
-    try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch {}
+    if (tmpFile) {
+      try {
+        fs.unlinkSync(tmpFile);
+      } catch {}
+    }
+    try {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    } catch {}
   }
 }
 
 /** In-process run — uses createAgentSession() SDK API. Shared memory, no subprocess overhead. */
 async function runAgentInLine(
-  agent: AgentConfig, task: string, cwd: string, overrideModel?: string, signal?: AbortSignal, ctx?: ExtensionContext,
+  agent: AgentConfig,
+  task: string,
+  cwd: string,
+  overrideModel?: string,
+  signal?: AbortSignal,
+  ctx?: ExtensionContext,
 ): Promise<RunResult> {
   const start = Date.now();
   let session: AgentSession | undefined;
@@ -565,9 +799,15 @@ async function runAgentInLine(
       if (!model) {
         // Model configured but not in registry — return a clear error
         return {
-          agent: agent.name, task, exitCode: 1, output: "",
+          agent: agent.name,
+          task,
+          exitCode: 1,
+          output: "",
           stderr: `Model "${modelStr}" not found in registry. Check that the provider/model ID is correct and the API key is configured. Run 'pi models' to see available models.`,
-          cost: 0, duration: Date.now() - start, messages: [], turns: 0,
+          cost: 0,
+          duration: Date.now() - start,
+          messages: [],
+          turns: 0,
         };
       }
     }
@@ -588,7 +828,9 @@ async function runAgentInLine(
 
     // Handle abort signal — store reference for cleanup
     if (signal) {
-      abortHandler = () => { session?.abort(); };
+      abortHandler = () => {
+        session?.abort();
+      };
       signal.addEventListener("abort", abortHandler, { once: true });
     }
 
@@ -604,8 +846,19 @@ async function runAgentInLine(
     let stopReason: string | undefined;
     const rawMessages = session.messages as Array<{
       role: string;
-      content?: Array<{ type: string; text?: string; name?: string; arguments?: Record<string, unknown> }>;
-      usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cost?: { total?: number } };
+      content?: Array<{
+        type: string;
+        text?: string;
+        name?: string;
+        arguments?: Record<string, unknown>;
+      }>;
+      usage?: {
+        input?: number;
+        output?: number;
+        cacheRead?: number;
+        cacheWrite?: number;
+        cost?: { total?: number };
+      };
       model?: string;
       stopReason?: string;
       // ToolResultMessage fields
@@ -620,15 +873,31 @@ async function runAgentInLine(
         const toolCalls: Array<{ name: string; args: Record<string, unknown> }> = [];
         for (const p of msg.content ?? []) {
           if (p.type === "text" && p.text) texts.push(p.text);
-          if (p.type === "toolCall" && p.name) toolCalls.push({ name: p.name, args: p.arguments ?? {} });
+          if (p.type === "toolCall" && p.name)
+            toolCalls.push({ name: p.name, args: p.arguments ?? {} });
         }
         if (texts.length) output = texts.join("\n");
         const u = msg.usage;
-        const usage = u ? { input: u.input ?? 0, output: u.output ?? 0, cacheRead: u.cacheRead ?? 0, cacheWrite: u.cacheWrite ?? 0, cost: u.cost?.total ?? 0 } : undefined;
+        const usage = u
+          ? {
+              input: u.input ?? 0,
+              output: u.output ?? 0,
+              cacheRead: u.cacheRead ?? 0,
+              cacheWrite: u.cacheWrite ?? 0,
+              cost: u.cost?.total ?? 0,
+            }
+          : undefined;
         if (usage) cost += usage.cost;
         if (msg.model) modelId = msg.model;
         if (msg.stopReason) stopReason = msg.stopReason;
-        parsedMessages.push({ role: "assistant", text: texts.join("\n") || undefined, toolCalls: toolCalls.length ? toolCalls : undefined, usage, model: msg.model, stopReason: msg.stopReason });
+        parsedMessages.push({
+          role: "assistant",
+          text: texts.join("\n") || undefined,
+          toolCalls: toolCalls.length ? toolCalls : undefined,
+          usage,
+          model: msg.model,
+          stopReason: msg.stopReason,
+        });
       }
       if (msg.role === "toolResult") {
         const toolName = msg.toolName ?? "tool";
@@ -636,20 +905,39 @@ async function runAgentInLine(
         for (const p of msg.content ?? []) {
           if (p.type === "text" && p.text) texts.push(p.text);
         }
-        parsedMessages.push({ role: "tool", toolResult: { name: toolName, output: truncate(texts.join("\n"), 2048) } });
+        parsedMessages.push({
+          role: "tool",
+          toolResult: { name: toolName, output: truncate(texts.join("\n"), 2048) },
+        });
       }
     }
 
     return {
-      agent: agent.name, task, exitCode: 0,
-      output: truncate(output, MAX_OUTPUT_BYTES), stderr: "",
-      cost, duration: Date.now() - start, sessionId: session.sessionId,
-      messages: parsedMessages, turns, model: modelId, stopReason,
+      agent: agent.name,
+      task,
+      exitCode: 0,
+      output: truncate(output, MAX_OUTPUT_BYTES),
+      stderr: "",
+      cost,
+      duration: Date.now() - start,
+      sessionId: session.sessionId,
+      messages: parsedMessages,
+      turns,
+      model: modelId,
+      stopReason,
     };
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     return {
-      agent: agent.name, task, exitCode: 1, output: "", stderr: msg, cost: 0, duration: Date.now() - start, messages: [], turns: 0,
+      agent: agent.name,
+      task,
+      exitCode: 1,
+      output: "",
+      stderr: msg,
+      cost: 0,
+      duration: Date.now() - start,
+      messages: [],
+      turns: 0,
     };
   } finally {
     if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
@@ -659,17 +947,38 @@ async function runAgentInLine(
 
 /** Background run — spawns detached, returns immediately. stdout ignored (read from session files). */
 function runAgentAsync(
-  agents: AgentConfig[], name: string, task: string, cwd: string, depth: number, overrideModel?: string, contextOpts?: { context?: "fresh" | "fork"; parentSessionFile?: string },
+  agents: AgentConfig[],
+  name: string,
+  task: string,
+  cwd: string,
+  depth: number,
+  overrideModel?: string,
+  contextOpts?: { context?: "fresh" | "fork"; parentSessionFile?: string },
 ): RunRecord {
-  const agent = agents.find(a => a.name === name);
+  const agent = agents.find((a) => a.name === name);
   const id = genId();
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
 
   if (!agent) {
-    const avail = agents.map(a => `"${a.name}"`).join(", ") || "none";
+    const avail = agents.map((a) => `"${a.name}"`).join(", ") || "none";
     const record: RunRecord = {
-      id, agent: name, task, status: "failed", startedAt: Date.now(), sessionPath: sessionDir,
-      result: { agent: name, task, exitCode: 1, output: "", stderr: `Unknown agent "${name}". Available: ${avail}`, cost: 0, duration: 0, messages: [], turns: 0 },
+      id,
+      agent: name,
+      task,
+      status: "failed",
+      startedAt: Date.now(),
+      sessionPath: sessionDir,
+      result: {
+        agent: name,
+        task,
+        exitCode: 1,
+        output: "",
+        stderr: `Unknown agent "${name}". Available: ${avail}`,
+        cost: 0,
+        duration: 0,
+        messages: [],
+        turns: 0,
+      },
     };
     runs.set(id, record);
     persistRuns();
@@ -679,41 +988,84 @@ function runAgentAsync(
   const { args, tmpFile, cmd } = buildArgs(agent, task, sessionDir, overrideModel, contextOpts);
   // stdout ignored — we read from session files. This prevents pipe buffer hangs.
   const proc = spawn(cmd, args, {
-    cwd, shell: false, stdio: ["ignore", "ignore", "pipe"],
-    env: childEnv(depth), detached: true,
+    cwd,
+    shell: false,
+    stdio: ["ignore", "ignore", "pipe"],
+    env: childEnv(depth),
+    detached: true,
   });
   proc.unref();
 
   const record: RunRecord = {
-    id, agent: name, task, status: "running", startedAt: Date.now(), sessionPath: sessionDir, proc,
+    id,
+    agent: name,
+    task,
+    status: "running",
+    startedAt: Date.now(),
+    sessionPath: sessionDir,
+    proc,
   };
   runs.set(id, record);
   persistRuns();
 
   let stderr = "";
-  proc.stderr.on("data", d => { stderr += d.toString(); });
-  proc.on("close", code => {
+  proc.stderr.on("data", (d) => {
+    if (Buffer.byteLength(stderr, "utf-8") < MAX_STDERR_BYTES) stderr += d.toString();
+  });
+  proc.on("close", (code) => {
     const session = readSessionOutput(sessionDir);
     record.status = code === 0 ? "completed" : "failed";
     record.result = {
-      agent: name, task, exitCode: code ?? 1,
-      output: truncate(session.output, MAX_OUTPUT_BYTES), stderr: truncate(stderr, MAX_OUTPUT_BYTES),
-      cost: session.cost, duration: Date.now() - record.startedAt, sessionPath: sessionDir,
-      messages: [], turns: 0,
+      agent: name,
+      task,
+      exitCode: code ?? 1,
+      output: truncate(session.output, MAX_OUTPUT_BYTES),
+      stderr: truncate(stderr, MAX_OUTPUT_BYTES),
+      cost: session.cost,
+      duration: Date.now() - record.startedAt,
+      sessionPath: sessionDir,
+      messages: [],
+      turns: 0,
     };
     record.proc = undefined;
-    if (tmpFile) { try { fs.unlinkSync(tmpFile); } catch {} }
+    if (tmpFile) {
+      try {
+        fs.unlinkSync(tmpFile);
+      } catch {}
+    }
+    // Clean up session dir — result is already stored in record
+    try {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    } catch {}
     persistRuns();
+    pruneRuns();
   });
   proc.on("error", () => {
     record.status = "failed";
     record.result = {
-      agent: name, task, exitCode: 1, output: "", stderr: stderr || "process error", cost: 0, messages: [], turns: 0,
-      duration: Date.now() - record.startedAt, sessionPath: sessionDir,
+      agent: name,
+      task,
+      exitCode: 1,
+      output: "",
+      stderr: stderr || "process error",
+      cost: 0,
+      messages: [],
+      turns: 0,
+      duration: Date.now() - record.startedAt,
+      sessionPath: sessionDir,
     };
     record.proc = undefined;
-    if (tmpFile) { try { fs.unlinkSync(tmpFile); } catch {} }
+    if (tmpFile) {
+      try {
+        fs.unlinkSync(tmpFile);
+      } catch {}
+    }
+    // Clean up session dir — result is already stored in record
+    try {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    } catch {}
     persistRuns();
+    pruneRuns();
   });
 
   return record;
@@ -721,18 +1073,36 @@ function runAgentAsync(
 
 /** Resume a completed or failed run with a follow-up message. */
 async function resumeRun(
-  run: RunRecord, message: string, cwd: string, signal?: AbortSignal,
+  run: RunRecord,
+  message: string,
+  cwd: string,
+  signal?: AbortSignal,
 ): Promise<RunResult> {
   const sessionFile = findSessionFile(run.sessionPath);
   if (!sessionFile) {
-    return { agent: run.agent, task: message, exitCode: 1, output: "", stderr: `No session file found in ${run.sessionPath}`, cost: 0, duration: 0, messages: [], turns: 0 };
+    return {
+      agent: run.agent,
+      task: message,
+      exitCode: 1,
+      output: "",
+      stderr: `No session file found in ${run.sessionPath}`,
+      cost: 0,
+      duration: 0,
+      messages: [],
+      turns: 0,
+    };
   }
 
   const { cmd, baseArgs } = getPiCmd();
   const args = [...baseArgs, "--mode", "json", "-p", "--session", sessionFile, message];
   const start = Date.now();
 
-  const raw = await spawnAndParse(cmd, args, { cwd, env: childEnv(getDepth()), signal, parseStdout: true });
+  const raw = await spawnAndParse(cmd, args, {
+    cwd,
+    env: childEnv(getDepth()),
+    signal,
+    parseStdout: true,
+  });
   let { output, cost } = raw;
   // Fallback: read from session file
   if (!output || cost === 0) {
@@ -742,51 +1112,75 @@ async function resumeRun(
   }
 
   return {
-    agent: run.agent, task: message, exitCode: raw.exitCode,
-    output: truncate(output, MAX_OUTPUT_BYTES), stderr: truncate(raw.stderr, MAX_OUTPUT_BYTES),
-    cost, duration: Date.now() - start, sessionPath: run.sessionPath,
-    messages: raw.messages, turns: raw.turns, model: raw.model, stopReason: raw.stopReason,
+    agent: run.agent,
+    task: message,
+    exitCode: raw.exitCode,
+    output: truncate(output, MAX_OUTPUT_BYTES),
+    stderr: truncate(raw.stderr, MAX_OUTPUT_BYTES),
+    cost,
+    duration: Date.now() - start,
+    sessionPath: run.sessionPath,
+    messages: raw.messages,
+    turns: raw.turns,
+    model: raw.model,
+    stopReason: raw.stopReason,
   };
 }
 
 // ── Gate Execution ──────────────────────────────────────────────────────────
 
 async function runGate(
-  gateCmd: string, stepOutput: string, cwd: string, timeoutMs: number, signal?: AbortSignal,
+  gateCmd: string,
+  stepOutput: string,
+  cwd: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<{ exitCode: number; stderr: string }> {
   if (signal?.aborted) return { exitCode: 1, stderr: "aborted" };
-  return new Promise(resolve => {
+  return new Promise((resolve) => {
     let stderr = "";
     let closed = false;
     let gateTimeout: ReturnType<typeof setTimeout> | undefined;
     let killTimeout: ReturnType<typeof setTimeout> | undefined;
     const proc = spawn("sh", ["-c", gateCmd], {
-      cwd, stdio: ["ignore", "ignore", "pipe"],
+      cwd,
+      stdio: ["ignore", "ignore", "pipe"],
       env: { ...process.env, SUBAGENT_OUTPUT: stepOutput },
     });
     const cleanup = () => {
       if (gateTimeout) clearTimeout(gateTimeout);
       if (killTimeout) clearTimeout(killTimeout);
     };
-    proc.stderr.on("data", d => { stderr += d.toString(); });
-    proc.on("close", c => {
+    proc.stderr.on("data", (d) => {
+      if (Buffer.byteLength(stderr, "utf-8") < MAX_STDERR_BYTES) stderr += d.toString();
+    });
+    proc.on("close", (c) => {
       closed = true;
       cleanup();
       resolve({ exitCode: c ?? 1, stderr: truncate(stderr, 1024) });
     });
-    proc.on("error", () => { if (!closed) { cleanup(); resolve({ exitCode: 1, stderr: "gate process error" }); } });
+    proc.on("error", () => {
+      if (!closed) {
+        cleanup();
+        resolve({ exitCode: 1, stderr: "gate process error" });
+      }
+    });
     // Configurable timeout
     gateTimeout = setTimeout(() => {
       if (closed) return;
       killProc(proc, "SIGTERM");
-      killTimeout = setTimeout(() => { if (!closed) killProc(proc, "SIGKILL"); }, 5000);
+      killTimeout = setTimeout(() => {
+        if (!closed) killProc(proc, "SIGKILL");
+      }, 5000);
     }, timeoutMs);
     // Signal
     if (signal && !signal.aborted) {
       const onAbort = () => {
         if (closed) return;
         killProc(proc, "SIGTERM");
-        killTimeout = setTimeout(() => { if (!closed) killProc(proc, "SIGKILL"); }, 5000);
+        killTimeout = setTimeout(() => {
+          if (!closed) killProc(proc, "SIGKILL");
+        }, 5000);
       };
       signal.addEventListener("abort", onAbort, { once: true });
     }
@@ -795,19 +1189,25 @@ async function runGate(
 
 // ── Concurrency ─────────────────────────────────────────────────────────────
 
-async function mapConcurrent<T, R>(items: T[], limit: number, fn: (item: T, i: number) => Promise<R>): Promise<R[]> {
+async function mapConcurrent<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, i: number) => Promise<R>,
+): Promise<R[]> {
   if (!items.length) return [];
   const results: R[] = Array.from({ length: items.length });
   let next = 0;
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (true) {
-      const i = next++;
-      if (i >= items.length) return;
-      const item = items[i];
-      if (item === undefined) return;
-      results[i] = await fn(item, i);
-    }
-  }));
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (true) {
+        const i = next++;
+        if (i >= items.length) return;
+        const item = items[i];
+        if (item === undefined) return;
+        results[i] = await fn(item, i);
+      }
+    }),
+  );
   return results;
 }
 
@@ -844,36 +1244,149 @@ export default function (pi: ExtensionAPI) {
     ].join("\n"),
 
     parameters: Type.Object({
-      action: Type.Optional(Type.String({ enum: ["list", "status", "wait", "resume", "interrupt", "create", "update", "delete"], description: "Lifecycle action. interrupt: cancel running agent. create/update/delete: manage agent DEFINITIONS (.md files) — NOT for running agents. To run an agent, use agent+task directly." })),
+      action: Type.Optional(
+        Type.String({
+          enum: ["list", "status", "wait", "resume", "interrupt", "create", "update", "delete"],
+          description:
+            "Lifecycle action. interrupt: cancel running agent. create/update/delete: manage agent DEFINITIONS (.md files) — NOT for running agents. To run an agent, use agent+task directly.",
+        }),
+      ),
       id: Type.Optional(Type.String({ description: "Run id for status/wait/resume actions" })),
-      background: Type.Optional(Type.Boolean({ description: "Run in background (single mode only). Returns immediately." })),
+      background: Type.Optional(
+        Type.Boolean({ description: "Run in background (single mode only). Returns immediately." }),
+      ),
       agent: Type.Optional(Type.String({ description: "Agent name for single mode" })),
-      task: Type.Optional(Type.String({ description: "Task for single mode, {task} template source for chain mode, or follow-up message for resume" })),
-      model: Type.Optional(Type.String({ description: "Override agent's default model (provider/model-id format, e.g. 'openrouter/anthropic/fable-5')" })),
-      execution: Type.Optional(Type.String({ enum: ["inline", "subprocess"], description: "Execution mode. 'inline' (default): in-process, shared memory, EventBus access. 'subprocess': isolated, 230MB per agent, crash-safe." })),
-      tasks: Type.Optional(Type.Array(Type.Object({
-        agent: Type.String({ description: "Agent name. Use action=list to see available agents." }),
-        task: Type.String({ description: "Task description for this agent." }),
-        cwd: Type.Optional(Type.String({ description: "Working directory for this agent (absolute path). Defaults to top-level cwd." })),
-      }), { description: "Parallel mode: array of agent+task pairs. Max 8 tasks, all run concurrently by default." })),
-      concurrency: Type.Optional(Type.Integer({ description: "Max concurrent agents in parallel mode. Default: 8 (inline agents are cheap)." })),
-      chain: Type.Optional(Type.Array(Type.Object({
-        agent: Type.String({ description: "Agent name. Use action=list to see available agents." }),
-        task: Type.String({ description: "Task template. {task} = original request, {previous} = prior step output (empty on first step)." }),
-        cwd: Type.Optional(Type.String({ description: "Working directory for this step (absolute path). Defaults to top-level cwd." })),
-        gate: Type.Optional(Type.String({ description: "Shell command to validate step output. Exit 0 = pass. Step output in $SUBAGENT_OUTPUT env var." })),
-        gateTimeout: Type.Optional(Type.Integer({ description: "Gate timeout in ms. Default: 30000." })),
-        onFail: Type.Optional(Type.String({ enum: ["retry", "skip", "abort"], description: "Action on gate failure. retry: re-run step (max 3). skip: continue chain. abort: stop. Default: abort." })),
-        as: Type.Optional(Type.String({ description: "Named output. Available as {outputs.name} in later chain steps." })),
-      }), { description: "Chain mode: sequential steps with optional quality gates between them." })),
-      context: Type.Optional(Type.String({ enum: ["fresh", "fork"], description: "Context mode. 'fresh' (default): child gets only the task. 'fork': child inherits parent's session history." })),
-      cwd: Type.Optional(Type.String({ description: "Working directory for the run (absolute path). Defaults to the current project directory." })),
-      acceptance: Type.Optional(Type.Object({
-        criteria: Type.Optional(Type.Array(Type.String(), { description: "Describes what 'done' looks like. Reported in output for parent to evaluate." })),
-        verify: Type.Optional(Type.Array(Type.String(), { description: "Shell commands to validate output. All must exit 0 for acceptance to pass." })),
-        maxAttempts: Type.Optional(Type.Integer({ description: "Max retry attempts on acceptance failure. Default: 1 (no retries)." })),
-      }, { description: "Acceptance contract. Defines success criteria and verification for the agent's output." })),
-      prompt: Type.Optional(Type.String({ description: "System prompt for create/update actions. The agent's instructions." })),
+      task: Type.Optional(
+        Type.String({
+          description:
+            "Task for single mode, {task} template source for chain mode, or follow-up message for resume",
+        }),
+      ),
+      model: Type.Optional(
+        Type.String({
+          description:
+            "Override agent's default model (provider/model-id format, e.g. 'openrouter/anthropic/fable-5')",
+        }),
+      ),
+      execution: Type.Optional(
+        Type.String({
+          enum: ["inline", "subprocess"],
+          description:
+            "Execution mode. 'inline' (default): in-process, shared memory, EventBus access. 'subprocess': isolated, 230MB per agent, crash-safe.",
+        }),
+      ),
+      tasks: Type.Optional(
+        Type.Array(
+          Type.Object({
+            agent: Type.String({
+              description: "Agent name. Use action=list to see available agents.",
+            }),
+            task: Type.String({ description: "Task description for this agent." }),
+            cwd: Type.Optional(
+              Type.String({
+                description:
+                  "Working directory for this agent (absolute path). Defaults to top-level cwd.",
+              }),
+            ),
+          }),
+          {
+            description:
+              "Parallel mode: array of agent+task pairs. Max 8 tasks, all run concurrently by default.",
+          },
+        ),
+      ),
+      concurrency: Type.Optional(
+        Type.Integer({
+          description:
+            "Max concurrent agents in parallel mode. Default: 8 (inline agents are cheap).",
+        }),
+      ),
+      chain: Type.Optional(
+        Type.Array(
+          Type.Object({
+            agent: Type.String({
+              description: "Agent name. Use action=list to see available agents.",
+            }),
+            task: Type.String({
+              description:
+                "Task template. {task} = original request, {previous} = prior step output (empty on first step).",
+            }),
+            cwd: Type.Optional(
+              Type.String({
+                description:
+                  "Working directory for this step (absolute path). Defaults to top-level cwd.",
+              }),
+            ),
+            gate: Type.Optional(
+              Type.String({
+                description:
+                  "Shell command to validate step output. Exit 0 = pass. Step output in $SUBAGENT_OUTPUT env var.",
+              }),
+            ),
+            gateTimeout: Type.Optional(
+              Type.Integer({ description: "Gate timeout in ms. Default: 30000." }),
+            ),
+            onFail: Type.Optional(
+              Type.String({
+                enum: ["retry", "skip", "abort"],
+                description:
+                  "Action on gate failure. retry: re-run step (max 3). skip: continue chain. abort: stop. Default: abort.",
+              }),
+            ),
+            as: Type.Optional(
+              Type.String({
+                description: "Named output. Available as {outputs.name} in later chain steps.",
+              }),
+            ),
+          }),
+          { description: "Chain mode: sequential steps with optional quality gates between them." },
+        ),
+      ),
+      context: Type.Optional(
+        Type.String({
+          enum: ["fresh", "fork"],
+          description:
+            "Context mode. 'fresh' (default): child gets only the task. 'fork': child inherits parent's session history.",
+        }),
+      ),
+      cwd: Type.Optional(
+        Type.String({
+          description:
+            "Working directory for the run (absolute path). Defaults to the current project directory.",
+        }),
+      ),
+      acceptance: Type.Optional(
+        Type.Object(
+          {
+            criteria: Type.Optional(
+              Type.Array(Type.String(), {
+                description:
+                  "Describes what 'done' looks like. Reported in output for parent to evaluate.",
+              }),
+            ),
+            verify: Type.Optional(
+              Type.Array(Type.String(), {
+                description:
+                  "Shell commands to validate output. All must exit 0 for acceptance to pass.",
+              }),
+            ),
+            maxAttempts: Type.Optional(
+              Type.Integer({
+                description: "Max retry attempts on acceptance failure. Default: 1 (no retries).",
+              }),
+            ),
+          },
+          {
+            description:
+              "Acceptance contract. Defines success criteria and verification for the agent's output.",
+          },
+        ),
+      ),
+      prompt: Type.Optional(
+        Type.String({
+          description: "System prompt for create/update actions. The agent's instructions.",
+        }),
+      ),
     }),
 
     async execute(_id, params, signal, _onUpdate, ctx) {
@@ -884,8 +1397,11 @@ export default function (pi: ExtensionAPI) {
       if (params.action) {
         if (params.action === "list") {
           const agents = discoverAgents(effectiveCwd);
-          if (!agents.length) return ok("No agents found. Place .md files in .pi/agents/ (project) or ~/.pi/agents/ (global).");
-          const lines = agents.map(a => {
+          if (!agents.length)
+            return ok(
+              "No agents found. Place .md files in .pi/agents/ (project) or ~/.pi/agents/ (global).",
+            );
+          const lines = agents.map((a) => {
             const model = a.model ? ` [${a.model}]` : "";
             const exec = a.execution === "subprocess" ? " subprocess" : "";
             const tools = a.tools?.length ? ` tools:${a.tools.join(",")}` : "";
@@ -895,103 +1411,165 @@ export default function (pi: ExtensionAPI) {
         }
 
         if (params.action === "status") {
-          if (!params.id) return err("Provide id for status action.");
+          if (!params.id) return toolError("Provide id for status action.");
           const match = findRun(params.id);
           if (!match) {
             // Check if they passed an agent name instead of a run ID
             const agents = discoverAgents(effectiveCwd);
-            const agentMatch = agents.find(a => a.name === params.id);
+            const agentMatch = agents.find((a) => a.name === params.id);
             if (agentMatch) {
-              return err(`"${params.id}" is an agent name, not a run ID. To run an agent, use:\n\n  subagent(agent="${params.id}", task="your task here")\n\nThen use action="status" with the returned run ID.`);
+              return toolError(
+                `"${params.id}" is an agent name, not a run ID. To run an agent, use:\n\n  subagent(agent="${params.id}", task="your task here")\n\nThen use action="status" with the returned run ID.`,
+              );
             }
-            return err(`Run not found: ${params.id}`);
+            return toolError(`Run not found: ${params.id}`);
           }
-          if ("ambiguous" in match) return err(`Ambiguous id "${params.id}" — matches ${match.ambiguous.join(", ")}. Provide more characters.`);
-          return ok(fmtRunStatus(match), { run: match });
+          if ("ambiguous" in match)
+            return toolError(
+              `Ambiguous id "${params.id}" — matches ${match.ambiguous.join(", ")}. Provide more characters.`,
+            );
+          cleanupRunSession(match);
+          return ok(fmtRunStatus(match), { run: safeRecord(match) });
         }
 
         if (params.action === "wait") {
-          if (!params.id) return err("Provide id for wait action.");
+          if (!params.id) return toolError("Provide id for wait action.");
           const match = findRun(params.id);
           if (!match) {
             // Check if they passed an agent name instead of a run ID
             const agents = discoverAgents(effectiveCwd);
-            const agentMatch = agents.find(a => a.name === params.id);
+            const agentMatch = agents.find((a) => a.name === params.id);
             if (agentMatch) {
-              return err(`"${params.id}" is an agent name, not a run ID. To run an agent, use:\n\n  subagent(agent="${params.id}", task="your task here")\n\nThen use action="wait" with the returned run ID.`);
+              return toolError(
+                `"${params.id}" is an agent name, not a run ID. To run an agent, use:\n\n  subagent(agent="${params.id}", task="your task here")\n\nThen use action="wait" with the returned run ID.`,
+              );
             }
-            return err(`Run not found: ${params.id}`);
+            return toolError(`Run not found: ${params.id}`);
           }
-          if ("ambiguous" in match) return err(`Ambiguous id "${params.id}" — matches ${match.ambiguous.join(", ")}. Provide more characters.`);
+          if ("ambiguous" in match)
+            return toolError(
+              `Ambiguous id "${params.id}" — matches ${match.ambiguous.join(", ")}. Provide more characters.`,
+            );
           if (match.status !== "running") {
-            const r = match.result!;
+            if (!match.result)
+              return toolError(
+                `Run ${match.id} is ${match.status} but has no result. Data may be corrupted.`,
+              );
+            const r = match.result;
+            cleanupRunSession(match);
             const d = { mode: "background", results: [r] };
-            return r.exitCode === 0 ? ok(r.output, d) : err(`Agent failed: ${r.stderr || r.output}`, d);
+            return r.exitCode === 0
+              ? ok(r.output, d)
+              : toolError(`Agent failed: ${r.stderr || r.output}`, d);
           }
-          await new Promise<void>(resolve => {
+          await new Promise<void>((resolve) => {
             if (match.status !== "running") return resolve();
-            const poll = setInterval(() => { if (match.status !== "running") { clearInterval(poll); resolve(); } }, 500);
-            signal?.addEventListener("abort", () => { clearInterval(poll); resolve(); }, { once: true });
+            const poll = setInterval(() => {
+              if (match.status !== "running") {
+                clearInterval(poll);
+                resolve();
+              }
+            }, 500);
+            signal?.addEventListener(
+              "abort",
+              () => {
+                clearInterval(poll);
+                resolve();
+              },
+              { once: true },
+            );
           });
-          if (signal?.aborted) return err("Wait aborted.");
-          const r = match.result!;
+          if (signal?.aborted) return toolError("Wait aborted.");
+          if (!match.result)
+            return toolError(`Run ${match.id} completed but has no result. Data may be corrupted.`);
+          const r = match.result;
+          cleanupRunSession(match);
           const d = { mode: "background", results: [r] };
-          return r.exitCode === 0 ? ok(r.output, d) : err(`Agent failed: ${r.stderr || r.output}`, d);
+          return r.exitCode === 0
+            ? ok(r.output, d)
+            : toolError(`Agent failed: ${r.stderr || r.output}`, d);
         }
 
         if (params.action === "resume") {
-          if (!params.id) return err("Provide id for resume action.");
-          if (!params.task) return err("Provide task (follow-up message) for resume action.");
+          if (!params.id) return toolError("Provide id for resume action.");
+          if (!params.task) return toolError("Provide task (follow-up message) for resume action.");
           const match = findRun(params.id);
-          if (!match) return err(`Run not found: ${params.id}`);
-          if ("ambiguous" in match) return err(`Ambiguous id "${params.id}" — matches ${match.ambiguous.join(", ")}. Provide more characters.`);
+          if (!match) return toolError(`Run not found: ${params.id}`);
+          if ("ambiguous" in match)
+            return toolError(
+              `Ambiguous id "${params.id}" — matches ${match.ambiguous.join(", ")}. Provide more characters.`,
+            );
           const cwd = params.cwd ? path.resolve(params.cwd) : effectiveCwd;
           const r = await resumeRun(match, params.task, cwd, signal);
           // Create a new run record for the resumed turn
           const resumeId = genId();
           const resumeRecord: RunRecord = {
-            id: resumeId, agent: r.agent, task: r.task, status: r.exitCode === 0 ? "completed" : "failed",
-            startedAt: Date.now() - r.duration, sessionPath: r.sessionPath ?? match.sessionPath, result: r,
+            id: resumeId,
+            agent: r.agent,
+            task: r.task,
+            status: r.exitCode === 0 ? "completed" : "failed",
+            startedAt: Date.now() - r.duration,
+            sessionPath: r.sessionPath ?? match.sessionPath,
+            result: r,
           };
           runs.set(resumeId, resumeRecord);
           persistRuns();
           const d = { mode: "resume", results: [r], originalRunId: match.id, resumeId };
-          return r.exitCode === 0 ? ok(r.output, d) : err(`Resume failed: ${r.stderr || r.output}`, d);
+          return r.exitCode === 0
+            ? ok(r.output, d)
+            : toolError(`Resume failed: ${r.stderr || r.output}`, d);
         }
 
         if (params.action === "interrupt") {
-          if (!params.id) return err("Provide id for interrupt action.");
+          if (!params.id) return toolError("Provide id for interrupt action.");
           const match = findRun(params.id);
-          if (!match) return err(`Run not found: ${params.id}`);
-          if ("ambiguous" in match) return err(`Ambiguous id "${params.id}" — matches ${match.ambiguous.join(", ")}. Provide more characters.`);
-          if (match.status !== "running") return err(`Run ${match.id} is ${match.status}, not running. Cannot interrupt.`);
-          if (!match.proc) return err(`Run ${match.id} has no process handle. It may have been started in a different session.`);
+          if (!match) return toolError(`Run not found: ${params.id}`);
+          if ("ambiguous" in match)
+            return toolError(
+              `Ambiguous id "${params.id}" — matches ${match.ambiguous.join(", ")}. Provide more characters.`,
+            );
+          if (match.status !== "running")
+            return toolError(`Run ${match.id} is ${match.status}, not running. Cannot interrupt.`);
+          if (!match.proc)
+            return toolError(
+              `Run ${match.id} has no process handle. It may have been started in a different session.`,
+            );
           try {
             killProc(match.proc, "SIGTERM");
-            return ok(`Sent SIGTERM to ${match.agent} (${match.id}). It may take a few seconds to stop.`);
+            return ok(
+              `Sent SIGTERM to ${match.agent} (${match.id}). It may take a few seconds to stop.`,
+            );
           } catch (e: unknown) {
             const msg = e instanceof Error ? e.message : String(e);
-            return err(`Failed to interrupt ${match.id}: ${msg}`);
+            return toolError(`Failed to interrupt ${match.id}: ${msg}`);
           }
         }
 
         if (params.action === "create") {
-          if (!params.agent) return err("Provide agent name for create action.");
-          if (!params.task && !params.prompt) return err("Provide task (description) and/or prompt (system prompt) for create action.");
+          if (!params.agent) return toolError("Provide agent name for create action.");
+          if (!params.task && !params.prompt)
+            return toolError(
+              "Provide task (description) and/or prompt (system prompt) for create action.",
+            );
           // If only prompt given, use agent name as description
           const description = params.task ?? `${params.agent} agent`;
           const systemPrompt = params.prompt ?? "";
           const existingAgents = discoverAgents(effectiveCwd);
-          const alreadyExists = existingAgents.find(a => a.name === params.agent);
+          const alreadyExists = existingAgents.find((a) => a.name === params.agent);
           if (alreadyExists) {
-            return err(`Agent "${params.agent}" already exists (${alreadyExists.source}). You don't need to create it — just run it directly:\n\n  subagent(agent="${params.agent}", task="your task here")\n\naction="create" is for defining NEW agent types. To run an existing agent, use agent+task.`);
+            return toolError(
+              `Agent "${params.agent}" already exists (${alreadyExists.source}). You don't need to create it — just run it directly:\n\n  subagent(agent="${params.agent}", task="your task here")\n\naction="create" is for defining NEW agent types. To run an existing agent, use agent+task.`,
+            );
           }
           const agentsDir = path.join(effectiveCwd, ".pi", "agents");
           fs.mkdirSync(agentsDir, { recursive: true });
           const fp = path.join(agentsDir, `${params.agent}.md`);
           // Quote YAML values that contain special characters
           // oxlint-disable-next-line no-useless-escape — \[ IS needed inside character class for literal bracket
-          const yamlQuote = (v: string) => /[:#"'\n{}\[\],&*?|>!%@`]/.test(v) ? `"${v.replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"` : v;
+          const yamlQuote = (v: string) =>
+            /[:#"'\n{}\[\],&*?|>!%@`]/.test(v)
+              ? `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
+              : v;
           const fm = [
             "---",
             `name: ${yamlQuote(params.agent)}`,
@@ -1000,39 +1578,47 @@ export default function (pi: ExtensionAPI) {
             "---",
             "",
             systemPrompt,
-          ].filter(Boolean).join("\n");
+          ]
+            .filter(Boolean)
+            .join("\n");
           fs.writeFileSync(fp, fm, "utf-8");
           return ok(`Created agent "${params.agent}" at ${fp}`);
         }
 
         if (params.action === "update") {
-          if (!params.agent) return err("Provide agent name for update action.");
+          if (!params.agent) return toolError("Provide agent name for update action.");
           const existing = findAgentFile(effectiveCwd, params.agent);
-          if (!existing) return err(`Agent "${params.agent}" not found.`);
+          if (!existing) return toolError(`Agent "${params.agent}" not found.`);
           const raw = fs.readFileSync(existing, "utf-8");
           const { meta, body } = parseFrontmatter(raw);
           if (params.task) meta.description = params.task;
           if (params.model) meta.model = params.model;
           const prompt = params.prompt || body;
-          const fm = ["---", ...Object.entries(meta).map(([k, v]) => `${k}: ${v}`), "---", "", prompt].join("\n");
+          const fm = [
+            "---",
+            ...Object.entries(meta).map(([k, v]) => `${k}: ${v}`),
+            "---",
+            "",
+            prompt,
+          ].join("\n");
           fs.writeFileSync(existing, fm, "utf-8");
           return ok(`Updated agent "${params.agent}" at ${existing}`);
         }
 
         if (params.action === "delete") {
-          if (!params.agent) return err("Provide agent name for delete action.");
+          if (!params.agent) return toolError("Provide agent name for delete action.");
           const existing = findAgentFile(effectiveCwd, params.agent);
-          if (!existing) return err(`Agent "${params.agent}" not found.`);
+          if (!existing) return toolError(`Agent "${params.agent}" not found.`);
           try {
             fs.unlinkSync(existing);
           } catch (e: unknown) {
             const msg = e instanceof Error ? e.message : String(e);
-            return err(`Failed to delete "${params.agent}": ${msg}`);
+            return toolError(`Failed to delete "${params.agent}": ${msg}`);
           }
           return ok(`Deleted agent "${params.agent}" (${existing})`);
         }
 
-        return err(`Unknown action: ${params.action}`);
+        return toolError(`Unknown action: ${params.action}`);
       }
 
       // ── Validate: exactly one execution mode ──
@@ -1042,28 +1628,43 @@ export default function (pi: ExtensionAPI) {
       const modeCount = Number(hasSingle) + Number(hasChain) + Number(hasParallel);
       if (modeCount !== 1) {
         const agents = discoverAgents(effectiveCwd);
-        const avail = agents.map(a => `${a.name}: ${a.description}`).join("\n") || "none";
-        return err(`Provide exactly one mode: agent+task, tasks[], or chain[]. Or use an action.\n\nAvailable agents:\n${avail}`);
+        const avail = agents.map((a) => `${a.name}: ${a.description}`).join("\n") || "none";
+        return toolError(
+          `Provide exactly one mode: agent+task, tasks[], or chain[]. Or use an action.\n\nAvailable agents:\n${avail}`,
+        );
       }
 
       const cwd = params.cwd ? path.resolve(params.cwd) : effectiveCwd;
-      if (!fs.existsSync(cwd)) return err(`cwd does not exist: ${cwd}`);
+      if (!fs.existsSync(cwd)) return toolError(`cwd does not exist: ${cwd}`);
 
       const agents = discoverAgents(cwd);
       const depth = getDepth();
-      if (depth >= MAX_DEPTH) return err(`Max depth (${MAX_DEPTH}) reached. Cannot spawn deeper.`);
+      if (depth >= MAX_DEPTH)
+        return toolError(`Max depth (${MAX_DEPTH}) reached. Cannot spawn deeper.`);
 
       // Build context options for fork mode
-      const contextOpts = params.context === "fork"
-        ? { context: "fork" as const, parentSessionFile: ctx.sessionManager?.getSessionFile?.() ?? undefined }
-        : undefined;
+      const contextOpts =
+        params.context === "fork"
+          ? {
+              context: "fork" as const,
+              parentSessionFile: ctx.sessionManager?.getSessionFile?.() ?? undefined,
+            }
+          : undefined;
       if (params.context === "fork" && !contextOpts?.parentSessionFile) {
-        return err("Cannot use context: 'fork' — no parent session file available.");
+        return toolError("Cannot use context: 'fork' — no parent session file available.");
       }
 
       // ── Background single ──
       if (hasSingle && params.background) {
-        const record = runAgentAsync(agents, params.agent!, params.task!, cwd, depth + 1, params.model, contextOpts);
+        const record = runAgentAsync(
+          agents,
+          params.agent!,
+          params.task!,
+          cwd,
+          depth + 1,
+          params.model,
+          contextOpts,
+        );
         return ok(
           `Background run started: ${record.id}\nAgent: ${record.agent}\nSession: ${record.sessionPath}\n\nUse action: 'wait', id: '${record.id}' to get the result.`,
           { mode: "background", runId: record.id, sessionPath: record.sessionPath },
@@ -1076,12 +1677,23 @@ export default function (pi: ExtensionAPI) {
         let lastResult: RunResult | undefined;
 
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-          const r = await runAgentSync(agents, params.agent!, params.task!, cwd, depth + 1, signal, params.model, contextOpts, ctx, params.execution as "inline" | "subprocess" | undefined);
+          const r = await runAgentSync(
+            agents,
+            params.agent!,
+            params.task!,
+            cwd,
+            depth + 1,
+            signal,
+            params.model,
+            contextOpts,
+            ctx,
+            params.execution as "inline" | "subprocess" | undefined,
+          );
           lastResult = r;
 
           if (r.exitCode !== 0) {
             const d = { mode: "single" as const, results: [r] };
-            return err(`Agent failed: ${r.stderr || r.output}`, d);
+            return toolError(`Agent failed: ${r.stderr || r.output}`, d);
           }
 
           // Run acceptance verification if specified
@@ -1097,12 +1709,19 @@ export default function (pi: ExtensionAPI) {
 
             if (allPassed) {
               const criteria = params.acceptance.criteria?.length
-                ? `\nCriteria: ${params.acceptance.criteria.join(", ")}` : "";
-              return ok(`${r.output}\n\nAcceptance: all checks passed${criteria}\n${verifyResults.join("\n")}`, { mode: "single", results: [r], accepted: true });
+                ? `\nCriteria: ${params.acceptance.criteria.join(", ")}`
+                : "";
+              return ok(
+                `${r.output}\n\nAcceptance: all checks passed${criteria}\n${verifyResults.join("\n")}`,
+                { mode: "single", results: [r], accepted: true },
+              );
             }
 
             if (attempt < maxAttempts) continue; // retry
-            return err(`Acceptance failed after ${attempt} attempt(s):\n${verifyResults.join("\n")}`, { mode: "single", results: [r], accepted: false });
+            return toolError(
+              `Acceptance failed after ${attempt} attempt(s):\n${verifyResults.join("\n")}`,
+              { mode: "single", results: [r], accepted: false },
+            );
           }
 
           // No acceptance — return directly
@@ -1112,7 +1731,7 @@ export default function (pi: ExtensionAPI) {
 
         // Should not reach here, but safety fallback
         const d = { mode: "single" as const, results: lastResult ? [lastResult] : [] };
-        return err("Agent did not produce a result.", d);
+        return toolError("Agent did not produce a result.", d);
       }
 
       // ── Chain with quality gates ──
@@ -1120,8 +1739,11 @@ export default function (pi: ExtensionAPI) {
         // Validate all chain agents exist before executing any
         for (let si = 0; si < params.chain!.length; si++) {
           const step = params.chain![si]!;
-          const cfg = agents.find(a => a.name === step.agent);
-          if (!cfg) return err(`Chain step ${si + 1}: unknown agent "${step.agent}". Use action="list" to see available agents.`);
+          const cfg = agents.find((a) => a.name === step.agent);
+          if (!cfg)
+            return toolError(
+              `Chain step ${si + 1}: unknown agent "${step.agent}". Use action="list" to see available agents.`,
+            );
         }
 
         const results: RunResult[] = [];
@@ -1135,12 +1757,31 @@ export default function (pi: ExtensionAPI) {
           let task = step.task.replace(/\{previous\}/g, previous);
           task = task.replace(/\{task\}/g, params.task ?? "");
           // Replace {outputs.name} with stored named outputs
-          task = task.replace(/\{outputs\.([^}]+)\}/g, (_: string, key: string) => outputs[key] ?? "");
-          const r = await runAgentSync(agents, step.agent, task, step.cwd ? path.resolve(step.cwd) : cwd, depth + 1, signal, undefined, contextOpts, ctx);
+          task = task.replace(
+            /\{outputs\.([^}]+)\}/g,
+            (_: string, key: string) => outputs[key] ?? "",
+          );
+          const r = await runAgentSync(
+            agents,
+            step.agent,
+            task,
+            step.cwd ? path.resolve(step.cwd) : cwd,
+            depth + 1,
+            signal,
+            undefined,
+            contextOpts,
+            ctx,
+          );
           results.push(r);
 
           if (r.exitCode !== 0) {
-            return err(`Chain failed at step ${i + 1} (${step.agent}): ${r.stderr || r.output}`, { mode: "chain", results });
+            return toolError(
+              `Chain failed at step ${i + 1} (${step.agent}): ${r.stderr || r.output}`,
+              {
+                mode: "chain",
+                results,
+              },
+            );
           }
 
           // Store named output if step defines 'as'
@@ -1148,7 +1789,13 @@ export default function (pi: ExtensionAPI) {
 
           if (step.gate) {
             const timeout = step.gateTimeout ?? DEFAULT_GATE_TIMEOUT_MS;
-            const { exitCode: gateExit, stderr: gateStderr } = await runGate(step.gate, r.output, step.cwd ? path.resolve(step.cwd) : cwd, timeout, signal);
+            const { exitCode: gateExit, stderr: gateStderr } = await runGate(
+              step.gate,
+              r.output,
+              step.cwd ? path.resolve(step.cwd) : cwd,
+              timeout,
+              signal,
+            );
 
             if (gateExit !== 0) {
               const onFail = step.onFail ?? "abort";
@@ -1163,7 +1810,10 @@ export default function (pi: ExtensionAPI) {
                 retries = 0;
                 continue;
               }
-              return err(`Gate failed at step ${i + 1} (${step.agent}): ${gateStderr || `exit ${gateExit}`}`, { mode: "chain", results });
+              return toolError(
+                `Gate failed at step ${i + 1} (${step.agent}): ${gateStderr || `exit ${gateExit}`}`,
+                { mode: "chain", results },
+              );
             }
           }
 
@@ -1173,46 +1823,73 @@ export default function (pi: ExtensionAPI) {
         }
 
         const summary = results.map(fmtResult).join("\n");
-        return ok(`${summary}\n\n${results[results.length - 1]?.output ?? ""}`, { mode: "chain", results });
+        return ok(`${summary}\n\n${results[results.length - 1]?.output ?? ""}`, {
+          mode: "chain",
+          results,
+        });
       }
 
       // ── Parallel ──
       if (hasParallel) {
-        if (params.tasks!.length > MAX_PARALLEL) return err(`Too many tasks (${params.tasks!.length}). Max: ${MAX_PARALLEL}.`);
+        if (params.tasks!.length > MAX_PARALLEL)
+          return toolError(`Too many tasks (${params.tasks!.length}). Max: ${MAX_PARALLEL}.`);
 
-        const concurrency = Math.max(1, Math.min(params.concurrency ?? MAX_CONCURRENCY, MAX_PARALLEL));
+        const concurrency = Math.max(
+          1,
+          Math.min(params.concurrency ?? MAX_CONCURRENCY, MAX_PARALLEL),
+        );
         const results = await mapConcurrent(params.tasks!, concurrency, (t) =>
-          runAgentSync(agents, t.agent, t.task, t.cwd ? path.resolve(t.cwd) : cwd, depth + 1, signal, undefined, contextOpts, ctx, params.execution as "inline" | "subprocess" | undefined)
+          runAgentSync(
+            agents,
+            t.agent,
+            t.task,
+            t.cwd ? path.resolve(t.cwd) : cwd,
+            depth + 1,
+            signal,
+            undefined,
+            contextOpts,
+            ctx,
+            params.execution as "inline" | "subprocess" | undefined,
+          ),
         );
 
-        const okCount = results.filter(r => r.exitCode === 0).length;
-        const summary = results.map(r => {
-          const raw = r.exitCode === 0 ? r.output : r.stderr || r.output;
-          const output = truncate(raw, PER_TASK_OUTPUT_CAP);
-          return `### [${r.agent}] ${r.exitCode === 0 ? "completed" : "failed"}\n${output}`;
-        }).join("\n\n---\n\n");
+        const okCount = results.filter((r) => r.exitCode === 0).length;
+        const summary = results
+          .map((r) => {
+            const raw = r.exitCode === 0 ? r.output : r.stderr || r.output;
+            const output = truncate(raw, PER_TASK_OUTPUT_CAP);
+            return `### [${r.agent}] ${r.exitCode === 0 ? "completed" : "failed"}\n${output}`;
+          })
+          .join("\n\n---\n\n");
         const d = { mode: "parallel", results };
         const text = `Parallel: ${okCount}/${results.length} succeeded\n\n${summary}`;
-        return okCount < results.length ? err(text, d) : ok(text, d);
+        return okCount < results.length ? toolError(text, d) : ok(text, d);
       }
 
-      return err("Internal error: no mode matched");
+      return toolError("Internal error: no mode matched");
     },
 
     renderCall(args, theme) {
       const label = args.action
         ? args.action + (args.id ? ` ${args.id}` : "")
-        : args.chain?.length ? `chain (${args.chain.length})`
-        : args.tasks?.length ? `parallel (${args.tasks.length})`
-        : args.background ? `bg ${args.agent ?? "?"}`
-        : args.agent ?? "?";
-      return new Text(`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", label)}`, 0, 0);
+        : args.chain?.length
+          ? `chain (${args.chain.length})`
+          : args.tasks?.length
+            ? `parallel (${args.tasks.length})`
+            : args.background
+              ? `bg ${args.agent ?? "?"}`
+              : (args.agent ?? "?");
+      return new Text(
+        `${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", label)}`,
+        0,
+        0,
+      );
     },
 
     renderResult(result, { expanded }, theme) {
       const text = result.content[0]?.type === "text" ? result.content[0].text : "(no output)";
       const d = result.details as { results?: RunResult[] } | undefined;
-      const hasErr = d?.results?.some(r => r.exitCode !== 0) ?? false;
+      const hasErr = d?.results?.some((r) => r.exitCode !== 0) ?? false;
       const icon = hasErr ? theme.fg("error", "✗") : theme.fg("success", "✓");
 
       // Build summary line with usage stats
@@ -1223,31 +1900,43 @@ export default function (pi: ExtensionAPI) {
         if (totalCost > 0) summaryParts.push(`$${totalCost.toFixed(4)}`);
         if (totalTurns > 0) summaryParts.push(`${totalTurns} turn${totalTurns > 1 ? "s" : ""}`);
         // Count tool calls across all results
-        const toolCallCount = d.results.reduce((s, r) => s + r.messages.reduce((ms, m) => ms + (m.toolCalls?.length ?? 0), 0), 0);
-        if (toolCallCount > 0) summaryParts.push(`${toolCallCount} tool call${toolCallCount > 1 ? "s" : ""}`);
+        const toolCallCount = d.results.reduce(
+          (s, r) => s + r.messages.reduce((ms, m) => ms + (m.toolCalls?.length ?? 0), 0),
+          0,
+        );
+        if (toolCallCount > 0)
+          summaryParts.push(`${toolCallCount} tool call${toolCallCount > 1 ? "s" : ""}`);
       }
-      const summaryLine = summaryParts.length ? ` ${theme.fg("muted", `(${summaryParts.join(", ")})`)}` : "";
+      const summaryLine = summaryParts.length
+        ? ` ${theme.fg("muted", `(${summaryParts.join(", ")})`)}`
+        : "";
 
       if (expanded) {
         const c = new Container();
-        c.addChild(new Text(`${icon} ${theme.fg("toolTitle", theme.bold("subagent"))}${summaryLine}`, 0, 0));
+        c.addChild(
+          new Text(`${icon} ${theme.fg("toolTitle", theme.bold("subagent"))}${summaryLine}`, 0, 0),
+        );
 
         // Show tool calls from the first result with messages
-        const firstWithMessages = d?.results?.find(r => r.messages.length > 0);
+        const firstWithMessages = d?.results?.find((r) => r.messages.length > 0);
         if (firstWithMessages) {
-          const toolCalls = firstWithMessages.messages.filter(m => m.role === "assistant" && m.toolCalls?.length);
+          const toolCalls = firstWithMessages.messages.filter(
+            (m) => m.role === "assistant" && m.toolCalls?.length,
+          );
           if (toolCalls.length > 0) {
             c.addChild(new Spacer(1));
             c.addChild(new Text(theme.fg("muted", "Tool calls:"), 0, 0));
             for (const msg of toolCalls.slice(0, 10)) {
               for (const tc of msg.toolCalls ?? []) {
-                const args = Object.keys(tc.args).length > 0
-                  ? ` ${theme.fg("muted", JSON.stringify(tc.args).slice(0, 120))}`
-                  : "";
+                const args =
+                  Object.keys(tc.args).length > 0
+                    ? ` ${theme.fg("muted", JSON.stringify(tc.args).slice(0, 120))}`
+                    : "";
                 c.addChild(new Text(`  ${theme.fg("accent", tc.name)}${args}`, 0, 0));
               }
             }
-            if (toolCalls.length > 10) c.addChild(new Text(theme.fg("muted", `  ... +${toolCalls.length - 10} more`), 0, 0));
+            if (toolCalls.length > 10)
+              c.addChild(new Text(theme.fg("muted", `  ... +${toolCalls.length - 10} more`), 0, 0));
           }
         }
 
@@ -1258,9 +1947,13 @@ export default function (pi: ExtensionAPI) {
 
       // Collapsed: show first few lines + summary
       const lines = text.split("\n");
-      const preview = lines.length > 8
-        ? [...lines.slice(0, 8), theme.fg("muted", `... +${lines.length - 8} more (Ctrl+O to expand)`)]
-        : lines;
+      const preview =
+        lines.length > 8
+          ? [
+              ...lines.slice(0, 8),
+              theme.fg("muted", `... +${lines.length - 8} more (Ctrl+O to expand)`),
+            ]
+          : lines;
       return new Text(`${icon} ${preview.join("\n")}${summaryLine}`, 0, 0);
     },
   });
