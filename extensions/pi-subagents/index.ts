@@ -233,15 +233,6 @@ function reconcileRuns(): void {
   pruneRuns();
 }
 
-/** Clean up session dir for a completed/failed run if result is stored. */
-function cleanupRunSession(r: RunRecord): void {
-  if (r.status === "running") return;
-  if (!r.sessionPath || !r.result) return;
-  try {
-    fs.rmSync(r.sessionPath, { recursive: true, force: true });
-  } catch {}
-}
-
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 const ok = (text: string, details?: unknown): ToolResult => ({
@@ -1033,12 +1024,7 @@ function runAgentAsync(
         fs.unlinkSync(tmpFile);
       } catch {}
     }
-    // Clean up session dir — result is already stored in record
-    try {
-      fs.rmSync(sessionDir, { recursive: true, force: true });
-    } catch {}
     persistRuns();
-    pruneRuns();
   });
   proc.on("error", () => {
     record.status = "failed";
@@ -1060,10 +1046,6 @@ function runAgentAsync(
         fs.unlinkSync(tmpFile);
       } catch {}
     }
-    // Clean up session dir — result is already stored in record
-    try {
-      fs.rmSync(sessionDir, { recursive: true, force: true });
-    } catch {}
     persistRuns();
     pruneRuns();
   });
@@ -1428,7 +1410,6 @@ export default function (pi: ExtensionAPI) {
             return toolError(
               `Ambiguous id "${params.id}" — matches ${match.ambiguous.join(", ")}. Provide more characters.`,
             );
-          cleanupRunSession(match);
           return ok(fmtRunStatus(match), { run: safeRecord(match) });
         }
 
@@ -1456,7 +1437,6 @@ export default function (pi: ExtensionAPI) {
                 `Run ${match.id} is ${match.status} but has no result. Data may be corrupted.`,
               );
             const r = match.result;
-            cleanupRunSession(match);
             const d = { mode: "background", results: [r] };
             return r.exitCode === 0
               ? ok(r.output, d)
@@ -1483,7 +1463,6 @@ export default function (pi: ExtensionAPI) {
           if (!match.result)
             return toolError(`Run ${match.id} completed but has no result. Data may be corrupted.`);
           const r = match.result;
-          cleanupRunSession(match);
           const d = { mode: "background", results: [r] };
           return r.exitCode === 0
             ? ok(r.output, d)
