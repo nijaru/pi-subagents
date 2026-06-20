@@ -1328,7 +1328,7 @@ export default function (pi: ExtensionAPI) {
       concurrency: Type.Optional(
         Type.Integer({
           description:
-            "Max concurrent agents in parallel mode. Default: 8 (inline agents are cheap).",
+            "Max concurrent agents in parallel mode. Default: 4. Increase for subprocess agents or providers with high concurrency limits.",
         }),
       ),
       chain: Type.Optional(
