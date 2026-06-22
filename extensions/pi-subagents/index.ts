@@ -1083,31 +1083,36 @@ function runAgentAsync(
   runs.set(id, record);
   persistRuns();
 
-  // Kill background agents that run too long
-  const timeout = setTimeout(() => {
+  // Inactivity watchdog for background agents — monitors session file mtime
+  const killBg = (reason: string) => {
     if (record.status !== "running") return;
-    try {
-      proc.kill("SIGTERM");
-    } catch {}
+    try { proc.kill("SIGTERM"); } catch {}
     record.status = "failed";
     record.result = {
-      agent: name,
-      task,
-      exitCode: 1,
-      output: "",
-      stderr: `Background agent timed out after ${BACKGROUND_TIMEOUT_MS / 1000}s`,
-      cost: 0,
-      duration: Date.now() - record.startedAt,
-      sessionPath: sessionDir,
-      messages: [],
-      turns: 0,
+      agent: name, task, exitCode: 1, output: "",
+      stderr: reason, cost: 0, duration: Date.now() - record.startedAt,
+      sessionPath: sessionDir, messages: [], turns: 0,
     };
     record.proc = undefined;
     if (tmpFile) { try { fs.unlinkSync(tmpFile); } catch {} }
     persistRuns();
-  }, BACKGROUND_TIMEOUT_MS);
-  // Don't let the timer keep the process alive
-  if (timeout.unref) timeout.unref();
+  };
+
+  // Hard safety net
+  const hardTimeout = setTimeout(() => killBg(`Background agent timed out after ${BACKGROUND_TIMEOUT_MS / 1000}s`), BACKGROUND_TIMEOUT_MS);
+  if (hardTimeout.unref) hardTimeout.unref();
+
+  // Inactivity check — look at session file mtime
+  const inactivityCheck = setInterval(() => {
+    if (record.status !== "running") { clearInterval(inactivityCheck); return; }
+    const sessionFile = findSessionFile(sessionDir);
+    const lastMod = sessionFile ? fs.statSync(sessionFile).mtimeMs : record.startedAt;
+    if (Date.now() - lastMod > INACTIVITY_TIMEOUT_MS) {
+      clearInterval(inactivityCheck);
+      killBg(`Background agent killed: no session activity for ${INACTIVITY_TIMEOUT_MS / 1000}s`);
+    }
+  }, Math.min(INACTIVITY_TIMEOUT_MS / 2, 15_000));
+  if (inactivityCheck.unref) inactivityCheck.unref();
 
   let stderr = "";
   proc.stderr.on("data", (d) => {
