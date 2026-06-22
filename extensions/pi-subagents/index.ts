@@ -778,7 +778,7 @@ async function runAgentSync(
     });
     let { output, cost } = raw;
     // Fallback: read from session file if stdout parsing missed output
-    if (!output || cost == 0) {
+    if (!output || cost === 0) {
       const session = readSessionOutput(sessionDir);
       if (!output && session.output) output = session.output;
       if (cost === 0 && session.cost > 0) cost = session.cost;
