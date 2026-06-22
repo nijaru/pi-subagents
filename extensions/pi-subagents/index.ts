@@ -91,6 +91,7 @@ const MAX_OUTPUT_BYTES = 100 * 1024; // 100KB per agent output
 const MAX_STDERR_BYTES = 1024 * 1024; // 1MB stderr cap during accumulation
 const PER_TASK_OUTPUT_CAP = 50 * 1024; // 50KB per task in parallel mode
 const INACTIVITY_TIMEOUT_MS = 60_000; // kill if no activity for 60s (subprocess: stdout/stderr, inline: session events)
+const PROGRESS_INTERVAL_MS = 10_000; // emit elapsed time every 10s
 const DEFAULT_GATE_TIMEOUT_MS = 30_000;
 const BACKGROUND_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes for background agents
 const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
@@ -1506,7 +1507,7 @@ export default function (pi: ExtensionAPI) {
       const progressTimer = setInterval(() => {
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
         onUpdate?.({ content: [{ type: "text", text: `Running... ${elapsed}s` }], details: undefined });
-      }, 10_000);
+      }, PROGRESS_INTERVAL_MS);
       const clearProgress = () => clearInterval(progressTimer);
 
       try {
