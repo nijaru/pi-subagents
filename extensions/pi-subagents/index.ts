@@ -20,6 +20,7 @@ import {
   type AgentSession,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
+import type { Model } from "@earendil-works/pi-ai";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
@@ -425,10 +426,19 @@ function loadAgents(dir: string, source: "bundled" | "user" | "project"): AgentC
       .map((t) => t.trim())
       .filter(Boolean);
     const execution = meta.execution as "inline" | "subprocess" | undefined;
+    const model = meta.model || undefined;
+    // Validate model format at load time (warn, don't reject — models may be added later)
+    if (model) {
+      const [provider, ...rest] = model.split("/");
+      const modelId = rest.join("/");
+      if (!provider || !modelId) {
+        console.warn(`[pi-subagents] Agent "${meta.name}": invalid model format "${model}". Expected "provider/model-id" (e.g. "openrouter/anthropic/fable-5").`);
+      }
+    }
     agents.push({
       name: meta.name,
       description: meta.description,
-      model: meta.model || undefined,
+      model,
       execution: execution === "subprocess" ? "subprocess" : undefined, // default inline, only store if subprocess
       tools: tools?.length ? tools : undefined,
       systemPrompt: body,
@@ -520,17 +530,17 @@ function getPiCmd(): { cmd: string; baseArgs: string[] } {
   return { cmd: process.execPath, baseArgs: [] };
 }
 
-function resolveModel(agent: AgentConfig, overrideModel?: string): string | undefined {
-  return overrideModel ?? agent.model;
+function resolveModel(agent: AgentConfig, overrideModel?: string, parentModel?: Model<any>): string | undefined {
+  return overrideModel ?? agent.model ?? (parentModel ? `${parentModel.provider}/${parentModel.id}` : undefined);
 }
 
 /** Resolve model string to a Model object via the registry. */
-function findModel(modelStr: string | undefined, ctx?: ExtensionContext): unknown {
+function findModel(modelStr: string | undefined, ctx?: ExtensionContext): Model<any> | undefined {
   if (!modelStr || !ctx?.modelRegistry) return undefined;
   const [provider, ...rest] = modelStr.split("/");
   const modelId = rest.join("/");
   if (!provider || !modelId) return undefined;
-  return ctx.modelRegistry.find(provider, modelId);
+  return ctx.modelRegistry.find(provider, modelId) as Model<any> | undefined;
 }
 
 function buildArgs(
@@ -539,6 +549,7 @@ function buildArgs(
   sessionDir: string,
   overrideModel?: string,
   opts?: { context?: "fresh" | "fork"; parentSessionFile?: string },
+  parentModel?: Model<any>,
 ): { args: string[]; tmpFile?: string; cmd: string; baseArgs: string[] } {
   const { cmd, baseArgs } = getPiCmd();
   const args = [...baseArgs, "--mode", "json", "-p"];
@@ -548,7 +559,7 @@ function buildArgs(
   } else {
     args.push("--session-dir", sessionDir);
   }
-  const model = resolveModel(agent, overrideModel);
+  const model = resolveModel(agent, overrideModel, parentModel);
   if (model) args.push("--model", model);
   if (agent.tools?.length) args.push("--tools", agent.tools.join(","));
   let tmpFile: string | undefined;
@@ -730,6 +741,7 @@ async function runAgentSync(
   contextOpts?: { context?: "fresh" | "fork"; parentSessionFile?: string },
   ctx?: ExtensionContext,
   overrideExecution?: "inline" | "subprocess",
+  parentModel?: Model<any>,
 ): Promise<RunResult> {
   const agent = agents.find((a) => a.name === name);
   if (!agent) {
@@ -750,11 +762,11 @@ async function runAgentSync(
   // Execution routing: param override > agent config > default (inline)
   const execution = overrideExecution ?? agent.execution;
   if (execution !== "subprocess") {
-    return runAgentInLine(agent, task, cwd, overrideModel, signal, ctx); // contextOpts not applicable — inline shares parent memory
+    return runAgentInLine(agent, task, cwd, overrideModel, signal, ctx, parentModel); // contextOpts not applicable — inline shares parent memory
   }
 
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
-  const { args, tmpFile, cmd } = buildArgs(agent, task, sessionDir, overrideModel, contextOpts);
+  const { args, tmpFile, cmd } = buildArgs(agent, task, sessionDir, overrideModel, contextOpts, parentModel);
   const start = Date.now();
 
   try {
@@ -766,7 +778,7 @@ async function runAgentSync(
     });
     let { output, cost } = raw;
     // Fallback: read from session file if stdout parsing missed output
-    if (!output || cost === 0) {
+    if (!output || cost == 0) {
       const session = readSessionOutput(sessionDir);
       if (!output && session.output) output = session.output;
       if (cost === 0 && session.cost > 0) cost = session.cost;
@@ -805,15 +817,16 @@ async function runAgentInLine(
   overrideModel?: string,
   signal?: AbortSignal,
   ctx?: ExtensionContext,
+  parentModel?: Model<any>,
 ): Promise<RunResult> {
   const start = Date.now();
   let session: AgentSession | undefined;
   let abortHandler: (() => void) | undefined;
 
   try {
-    // Resolve model: override > agent.model > inherit parent
-    const modelStr = resolveModel(agent, overrideModel);
-    let model: unknown = undefined;
+    // Resolve model: override > agent.model > parent model > pi default
+    const modelStr = resolveModel(agent, overrideModel, parentModel);
+    let model: Model<any> | undefined = undefined;
     if (modelStr) {
       model = findModel(modelStr, ctx);
       if (!model) {
@@ -974,6 +987,7 @@ function runAgentAsync(
   depth: number,
   overrideModel?: string,
   contextOpts?: { context?: "fresh" | "fork"; parentSessionFile?: string },
+  parentModel?: Model<any>,
 ): RunRecord {
   const agent = agents.find((a) => a.name === name);
   const id = genId();
@@ -1005,7 +1019,7 @@ function runAgentAsync(
     return record;
   }
 
-  const { args, tmpFile, cmd } = buildArgs(agent, task, sessionDir, overrideModel, contextOpts);
+  const { args, tmpFile, cmd } = buildArgs(agent, task, sessionDir, overrideModel, contextOpts, parentModel);
   // stdout ignored — we read from session files. This prevents pipe buffer hangs.
   const proc = spawn(cmd, args, {
     cwd,
@@ -1446,8 +1460,10 @@ export default function (pi: ExtensionAPI) {
             return ok(
               "No agents found. Place .md files in .pi/agents/ (project) or ~/.pi/agents/ (global).",
             );
+          const parentModel = ctx?.model;
           const lines = agents.map((a) => {
-            const model = a.model ? ` [${a.model}]` : "";
+            const resolvedModel = a.model ?? (parentModel ? `${parentModel.provider}/${parentModel.id}` : undefined);
+            const model = resolvedModel ? ` [${resolvedModel}${a.model ? "" : " (inherit)"}]` : "";
             const exec = a.execution === "subprocess" ? " subprocess" : "";
             const tools = a.tools?.length ? ` tools:${a.tools.join(",")}` : "";
             return `${a.name}: ${a.description}${model}${exec}${tools} (${a.source})`;
@@ -1728,6 +1744,7 @@ export default function (pi: ExtensionAPI) {
           depth + 1,
           params.model,
           contextOpts,
+          ctx?.model,
         );
         return ok(
           `Background run started: ${record.id}\nAgent: ${record.agent}\nSession: ${record.sessionPath}\n\nUse action: 'wait', id: '${record.id}' to get the result.`,
@@ -1751,6 +1768,7 @@ export default function (pi: ExtensionAPI) {
             contextOpts,
             ctx,
             params.execution as "inline" | "subprocess" | undefined,
+            ctx?.model,
           );
           if (r.exitCode !== 0) {
             return toolError(`Agent failed: ${r.stderr || r.output}`);
@@ -1829,6 +1847,8 @@ export default function (pi: ExtensionAPI) {
             undefined,
             contextOpts,
             ctx,
+            undefined,
+            ctx?.model,
           );
           results.push(r);
 
@@ -1903,6 +1923,7 @@ export default function (pi: ExtensionAPI) {
             contextOpts,
             ctx,
             params.execution as "inline" | "subprocess" | undefined,
+            ctx?.model,
           ),
         );
 
