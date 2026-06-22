@@ -1105,8 +1105,11 @@ function runAgentAsync(
   // Inactivity check — look at session file mtime
   const inactivityCheck = setInterval(() => {
     if (record.status !== "running") { clearInterval(inactivityCheck); return; }
-    const sessionFile = findSessionFile(sessionDir);
-    const lastMod = sessionFile ? fs.statSync(sessionFile).mtimeMs : record.startedAt;
+    let lastMod = record.startedAt;
+    try {
+      const sessionFile = findSessionFile(sessionDir);
+      if (sessionFile) lastMod = fs.statSync(sessionFile).mtimeMs;
+    } catch { /* dir or file deleted — use startedAt */ }
     if (Date.now() - lastMod > INACTIVITY_TIMEOUT_MS) {
       clearInterval(inactivityCheck);
       killBg(`Background agent killed: no session activity for ${INACTIVITY_TIMEOUT_MS / 1000}s`);
