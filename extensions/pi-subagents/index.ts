@@ -90,8 +90,7 @@ const MAX_RETRIES = 3;
 const MAX_OUTPUT_BYTES = 100 * 1024; // 100KB per agent output
 const MAX_STDERR_BYTES = 1024 * 1024; // 1MB stderr cap during accumulation
 const PER_TASK_OUTPUT_CAP = 50 * 1024; // 50KB per task in parallel mode
-const INACTIVITY_TIMEOUT_MS = 60_000; // kill subprocess if no stdout/stderr for 60s
-const INLINE_TIMEOUT_MS = 120_000; // hard timeout for inline runs (2 min)
+const INACTIVITY_TIMEOUT_MS = 60_000; // kill if no activity for 60s (subprocess: stdout/stderr, inline: session events)
 const DEFAULT_GATE_TIMEOUT_MS = 30_000;
 const BACKGROUND_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes for background agents
 const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
@@ -890,18 +889,26 @@ async function runAgentInLine(
       signal.addEventListener("abort", abortHandler, { once: true });
     }
 
-    // Run the agent with inactivity timeout
+    // Run the agent with inactivity timeout — reset on any session event
+    let lastActivity = Date.now();
     let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+    const unsubscribe = session.subscribe(() => { lastActivity = Date.now(); });
     const timeoutPromise = new Promise<never>((_, reject) => {
-      timeoutTimer = setTimeout(() => {
-        session?.abort();
-        reject(new Error(`Inline agent timed out after ${INLINE_TIMEOUT_MS / 1000}s`));
-      }, INLINE_TIMEOUT_MS);
+      const check = () => {
+        if (Date.now() - lastActivity > INACTIVITY_TIMEOUT_MS) {
+          session?.abort();
+          reject(new Error(`Inline agent timed out: no activity for ${INACTIVITY_TIMEOUT_MS / 1000}s`));
+        } else {
+          timeoutTimer = setTimeout(check, Math.min(INACTIVITY_TIMEOUT_MS / 2, 15_000));
+        }
+      };
+      timeoutTimer = setTimeout(check, INACTIVITY_TIMEOUT_MS);
     });
     try {
       await Promise.race([session.prompt(fullTask), timeoutPromise]);
     } finally {
       if (timeoutTimer) clearTimeout(timeoutTimer);
+      unsubscribe();
     }
 
     // Extract messages with tool calls, usage, and text
@@ -1482,9 +1489,19 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
 
-    async execute(_id, params, signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, onUpdate, ctx) {
       // Defensive fallback: ctx.cwd can be undefined in some execution contexts
       const effectiveCwd = ctx.cwd ?? process.cwd();
+
+      // Elapsed time progress indicator
+      const startTime = Date.now();
+      const progressTimer = setInterval(() => {
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
+        onUpdate?.({ content: [{ type: "text", text: `Running... ${elapsed}s` }], details: undefined });
+      }, 10_000);
+      const clearProgress = () => clearInterval(progressTimer);
+
+      try {
 
       // ── Lifecycle actions ──
       if (params.action) {
@@ -1975,6 +1992,10 @@ export default function (pi: ExtensionAPI) {
       }
 
       return toolError("Internal error: no mode matched");
+
+      } finally {
+        clearProgress();
+      }
     },
 
     renderCall(args, theme) {
