@@ -67,7 +67,7 @@ All agents inherit the parent session's model by default. Override per-agent via
 | Single + acceptance | `{ agent, task, acceptance: {...} }` | Verify output with shell commands, retry on failure |
 | Chain | `{ chain: [...] }` | Sequential with `{previous}`, `{task}`, `{outputs.name}` placeholders |
 | Parallel | `{ tasks: [...] }` | Concurrent execution (max 8) |
-| Parallel + concurrency | `{ tasks: [...], concurrency: N }` | Limit concurrent agents (default 8) |
+| Parallel + concurrency | `{ tasks: [...], concurrency: N }` | Limit concurrent agents (default 4) |
 
 ### Execution Modes
 

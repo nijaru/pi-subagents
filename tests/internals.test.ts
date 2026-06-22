@@ -15,6 +15,7 @@ const EXTENSION = path.join(import.meta.dir, "..", "extensions", "pi-subagents",
 interface RegisteredTool {
   name: string;
   execute: (...args: any[]) => Promise<any>;
+  call: (...args: any[]) => Promise<any>;
   renderCall?: (...args: any[]) => any;
   renderResult?: (...args: any[]) => any;
 }
@@ -23,7 +24,7 @@ function createMockExtensionAPI() {
   const tools: RegisteredTool[] = [];
   return {
     registerTool(def: any) {
-      tools.push({ name: def.name, execute: def.execute, renderCall: def.renderCall, renderResult: def.renderResult });
+      tools.push({ name: def.name, execute: def.execute, call: async () => ({ content: [{ type: "text", text: "" }], details: undefined }), renderCall: def.renderCall, renderResult: def.renderResult });
     },
     on() {},
     tools,

@@ -240,6 +240,12 @@ function reconcileRuns(): void {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+/** Quote a YAML value if it contains characters that would break unquoted parsing. */
+const yamlQuote = (v: string) =>
+  /[:#"'\n{}\[\],&*?|>!%@`]/.test(v)  // oxlint-disable-line no-useless-escape
+    ? `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
+    : v;
+
 const ok = (text: string, details?: unknown): ToolResult => ({
   content: [{ type: "text", text }],
   details,
@@ -444,13 +450,13 @@ function isProjectRoot(dir: string): boolean {
 function discoverAgents(cwd: string): AgentConfig[] {
   const map = new Map<string, AgentConfig>();
   // 1. Bundled agents (lowest priority) — ships with the extension
-  // import.meta.dir may be undefined in pi's extension loader
-  const extensionDir = import.meta.dir ?? __dirname;
+  const extensionDir = import.meta.dir ?? (typeof __dirname !== "undefined" ? __dirname : undefined);
+  if (!extensionDir) return [];
   let bundledDir: string;
   try {
     bundledDir = path.resolve(extensionDir, "..", "..", "agents");
   } catch {
-    return []; // can't resolve bundled dir — skip
+    return [];
   }
   for (const a of loadAgents(bundledDir, "bundled")) map.set(a.name, a);
   // 2. User-level agents (override bundled)
@@ -1042,6 +1048,7 @@ function runAgentAsync(
       turns: 0,
     };
     record.proc = undefined;
+    if (tmpFile) { try { fs.unlinkSync(tmpFile); } catch {} }
     persistRuns();
   }, BACKGROUND_TIMEOUT_MS);
   // Don't let the timer keep the process alive
@@ -1052,6 +1059,10 @@ function runAgentAsync(
     if (Buffer.byteLength(stderr, "utf-8") < MAX_STDERR_BYTES) stderr += d.toString();
   });
   proc.on("close", (code) => {
+    if (record.status !== "running") {
+      if (tmpFile) { try { fs.unlinkSync(tmpFile); } catch {} }
+      return;
+    }
     const session = readSessionOutput(sessionDir);
     record.status = code === 0 ? "completed" : "failed";
     record.result = {
@@ -1075,6 +1086,10 @@ function runAgentAsync(
     persistRuns();
   });
   proc.on("error", () => {
+    if (record.status !== "running") {
+      if (tmpFile) { try { fs.unlinkSync(tmpFile); } catch {} }
+      return;
+    }
     record.status = "failed";
     record.result = {
       agent: name,
@@ -1321,7 +1336,7 @@ export default function (pi: ExtensionAPI) {
           }),
           {
             description:
-              "Parallel mode: array of agent+task pairs. Max 8 tasks, all run concurrently by default.",
+              "Parallel mode: array of agent+task pairs. Max 8 tasks, run concurrently up to concurrency limit (default 4).",
           },
         ),
       ),
@@ -1479,6 +1494,30 @@ export default function (pi: ExtensionAPI) {
             return toolError(
               `Ambiguous id "${params.id}" — matches ${match.ambiguous.join(", ")}. Provide more characters.`,
             );
+          // Quick reconcile: if no live proc (e.g. after restart), check session file for output
+          if (match.status === "running" && !match.proc) {
+            const session = readSessionOutput(match.sessionPath);
+            if (session.output) {
+              const exitCode = session.stopReason === "stop" ? 0 : 1;
+              match.status = exitCode === 0 ? "completed" : "failed";
+              match.result = {
+                agent: match.agent, task: match.task, exitCode,
+                output: truncate(session.output, MAX_OUTPUT_BYTES), stderr: "",
+                cost: session.cost, duration: Date.now() - match.startedAt,
+                sessionPath: match.sessionPath, messages: [], turns: 0,
+              };
+              persistRuns();
+            } else if (!fs.existsSync(match.sessionPath)) {
+              match.status = "failed";
+              match.result = {
+                agent: match.agent, task: match.task, exitCode: 1,
+                output: "", stderr: "Background agent session not found.",
+                cost: 0, duration: 0,
+                sessionPath: match.sessionPath, messages: [], turns: 0,
+              };
+              persistRuns();
+            }
+          }
           if (match.status !== "running") {
             if (!match.result)
               return toolError(
@@ -1488,7 +1527,7 @@ export default function (pi: ExtensionAPI) {
             const d = { mode: "background", results: [r] };
             return r.exitCode === 0
               ? ok(r.output, d)
-              : toolError(`Agent failed: ${r.stderr || r.output}`, d);
+              : toolError(`Agent failed: ${r.stderr || r.output}`);
           }
           await new Promise<void>((resolve) => {
             if (match.status !== "running") return resolve();
@@ -1514,7 +1553,7 @@ export default function (pi: ExtensionAPI) {
           const d = { mode: "background", results: [r] };
           return r.exitCode === 0
             ? ok(r.output, d)
-            : toolError(`Agent failed: ${r.stderr || r.output}`, d);
+            : toolError(`Agent failed: ${r.stderr || r.output}`);
         }
 
         if (params.action === "resume") {
@@ -1544,7 +1583,7 @@ export default function (pi: ExtensionAPI) {
           const d = { mode: "resume", results: [r], originalRunId: match.id, resumeId };
           return r.exitCode === 0
             ? ok(r.output, d)
-            : toolError(`Resume failed: ${r.stderr || r.output}`, d);
+            : toolError(`Resume failed: ${r.stderr || r.output}`);
         }
 
         if (params.action === "interrupt") {
@@ -1591,10 +1630,8 @@ export default function (pi: ExtensionAPI) {
           const agentsDir = path.join(effectiveCwd, ".pi", "agents");
           fs.mkdirSync(agentsDir, { recursive: true });
           const fp = path.join(agentsDir, `${params.agent}.md`);
-          // Quote YAML values that contain special characters
-          // oxlint-disable-next-line no-useless-escape — \[ IS needed inside character class for literal bracket
           const yamlQuote = (v: string) =>
-            /[:#"'\n{}\[\],&*?|>!%@`]/.test(v)
+            /[:#"'\n{}\[\],&*?|>!%@`]/.test(v)  // oxlint-disable-line no-useless-escape
               ? `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
               : v;
           const fm = [
@@ -1618,8 +1655,8 @@ export default function (pi: ExtensionAPI) {
           if (!existing) return toolError(`Agent "${params.agent}" not found.`);
           const raw = fs.readFileSync(existing, "utf-8");
           const { meta, body } = parseFrontmatter(raw);
-          if (params.task) meta.description = params.task;
-          if (params.model) meta.model = params.model;
+          if (params.task) meta.description = yamlQuote(params.task);
+          if (params.model) meta.model = yamlQuote(params.model);
           const prompt = params.prompt || body;
           const fm = [
             "---",
@@ -1701,7 +1738,6 @@ export default function (pi: ExtensionAPI) {
       // ── Foreground single ──
       if (hasSingle) {
         const maxAttempts = params.acceptance?.maxAttempts ?? 1;
-        let lastResult: RunResult | undefined;
 
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           const r = await runAgentSync(
@@ -1716,11 +1752,8 @@ export default function (pi: ExtensionAPI) {
             ctx,
             params.execution as "inline" | "subprocess" | undefined,
           );
-          lastResult = r;
-
           if (r.exitCode !== 0) {
-            const d = { mode: "single" as const, results: [r] };
-            return toolError(`Agent failed: ${r.stderr || r.output}`, d);
+            return toolError(`Agent failed: ${r.stderr || r.output}`);
           }
 
           // Run acceptance verification if specified
@@ -1747,7 +1780,6 @@ export default function (pi: ExtensionAPI) {
             if (attempt < maxAttempts) continue; // retry
             return toolError(
               `Acceptance failed after ${attempt} attempt(s):\n${verifyResults.join("\n")}`,
-              { mode: "single", results: [r], accepted: false },
             );
           }
 
@@ -1757,8 +1789,7 @@ export default function (pi: ExtensionAPI) {
         }
 
         // Should not reach here, but safety fallback
-        const d = { mode: "single" as const, results: lastResult ? [lastResult] : [] };
-        return toolError("Agent did not produce a result.", d);
+        return toolError("Agent did not produce a result.");
       }
 
       // ── Chain with quality gates ──
@@ -1804,10 +1835,6 @@ export default function (pi: ExtensionAPI) {
           if (r.exitCode !== 0) {
             return toolError(
               `Chain failed at step ${i + 1} (${step.agent}): ${r.stderr || r.output}`,
-              {
-                mode: "chain",
-                results,
-              },
             );
           }
 
@@ -1839,7 +1866,6 @@ export default function (pi: ExtensionAPI) {
               }
               return toolError(
                 `Gate failed at step ${i + 1} (${step.agent}): ${gateStderr || `exit ${gateExit}`}`,
-                { mode: "chain", results },
               );
             }
           }
@@ -1890,7 +1916,7 @@ export default function (pi: ExtensionAPI) {
           .join("\n\n---\n\n");
         const d = { mode: "parallel", results };
         const text = `Parallel: ${okCount}/${results.length} succeeded\n\n${summary}`;
-        return okCount < results.length ? toolError(text, d) : ok(text, d);
+        return okCount < results.length ? toolError(text) : ok(text, d);
       }
 
       return toolError("Internal error: no mode matched");
