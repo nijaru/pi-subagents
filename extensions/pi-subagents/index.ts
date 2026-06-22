@@ -90,6 +90,8 @@ const MAX_RETRIES = 3;
 const MAX_OUTPUT_BYTES = 100 * 1024; // 100KB per agent output
 const MAX_STDERR_BYTES = 1024 * 1024; // 1MB stderr cap during accumulation
 const PER_TASK_OUTPUT_CAP = 50 * 1024; // 50KB per task in parallel mode
+const INACTIVITY_TIMEOUT_MS = 60_000; // kill subprocess if no stdout/stderr for 60s
+const INLINE_TIMEOUT_MS = 120_000; // hard timeout for inline runs (2 min)
 const DEFAULT_GATE_TIMEOUT_MS = 30_000;
 const BACKGROUND_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes for background agents
 const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
@@ -604,10 +606,25 @@ function spawnAndParse(
     const messages: AgentMessage[] = [];
     let closed = false;
     let killTimeout: ReturnType<typeof setTimeout> | undefined;
+    let lastActivity = Date.now();
+    let inactivityTimer: ReturnType<typeof setInterval> | undefined;
     const stdio: ["ignore", "pipe" | "ignore", "pipe"] = parseStdout
       ? ["ignore", "pipe", "pipe"]
       : ["ignore", "ignore", "pipe"];
     const proc = spawn(cmd, args, { cwd, shell: false, stdio, env });
+
+    // Inactivity watchdog — kill if no stdout/stderr for INACTIVITY_TIMEOUT_MS
+    const resetActivity = () => { lastActivity = Date.now(); };
+    inactivityTimer = setInterval(() => {
+      if (closed) return;
+      if (Date.now() - lastActivity > INACTIVITY_TIMEOUT_MS) {
+        stderr += `\n[pi-subagents] Killed: no activity for ${INACTIVITY_TIMEOUT_MS / 1000}s`;
+        killProc(proc, "SIGTERM");
+        killTimeout = setTimeout(() => {
+          if (!closed) killProc(proc, "SIGKILL");
+        }, 5000);
+      }
+    }, Math.min(INACTIVITY_TIMEOUT_MS / 2, 15_000));
 
     let buf = "";
     const processLine = (line: string) => {
@@ -696,6 +713,7 @@ function spawnAndParse(
 
     if (parseStdout && proc.stdout) {
       proc.stdout.on("data", (d) => {
+        resetActivity();
         buf += d.toString();
         const lines = buf.split("\n");
         buf = lines.pop() ?? "";
@@ -703,17 +721,22 @@ function spawnAndParse(
       });
     }
     proc.stderr?.on("data", (d) => {
+      resetActivity();
       if (Buffer.byteLength(stderr, "utf-8") < MAX_STDERR_BYTES) stderr += d.toString();
     });
     proc.on("close", (c) => {
       closed = true;
+      if (inactivityTimer) clearInterval(inactivityTimer);
       if (killTimeout) clearTimeout(killTimeout);
       if (buf.trim()) processLine(buf);
       resolve({ exitCode: c ?? 0, output, stderr, cost, messages, turns, model, stopReason });
     });
     proc.on("error", () => {
-      if (!closed)
+      if (!closed) {
+        closed = true;
+        if (inactivityTimer) clearInterval(inactivityTimer);
         resolve({ exitCode: 1, output, stderr, cost, messages, turns, model, stopReason });
+      }
     });
 
     if (signal) {
@@ -867,8 +890,19 @@ async function runAgentInLine(
       signal.addEventListener("abort", abortHandler, { once: true });
     }
 
-    // Run the agent
-    await session.prompt(fullTask);
+    // Run the agent with inactivity timeout
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutTimer = setTimeout(() => {
+        session?.abort();
+        reject(new Error(`Inline agent timed out after ${INLINE_TIMEOUT_MS / 1000}s`));
+      }, INLINE_TIMEOUT_MS);
+    });
+    try {
+      await Promise.race([session.prompt(fullTask), timeoutPromise]);
+    } finally {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+    }
 
     // Extract messages with tool calls, usage, and text
     const parsedMessages: AgentMessage[] = [];
