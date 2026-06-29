@@ -1327,7 +1327,8 @@ function fmtResult(r: RunResult): string {
   const t = r.turns > 0 ? ` ${r.turns} turn${r.turns > 1 ? "s" : ""}` : "";
   const tc = r.messages.reduce((s, m) => s + (m.toolCalls?.length ?? 0), 0);
   const tcStr = tc > 0 ? ` ${tc} tool call${tc > 1 ? "s" : ""}` : "";
-  return `${icon} ${r.agent} (${ms}${c}${t}${tcStr})`;
+  const model = r.model ? ` [${r.model}]` : "";
+  return `${icon} ${r.agent}${model} (${ms}${c}${t}${tcStr})`;
 }
 
 // ── Extension ───────────────────────────────────────────────────────────────
@@ -1502,11 +1503,12 @@ export default function (pi: ExtensionAPI) {
       // Defensive fallback: ctx.cwd can be undefined in some execution contexts
       const effectiveCwd = ctx.cwd ?? process.cwd();
 
-      // Elapsed time progress indicator
+      // Elapsed time progress indicator — label updated per mode below
       const startTime = Date.now();
+      let progressLabel = "Running...";
       const progressTimer = setInterval(() => {
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
-        onUpdate?.({ content: [{ type: "text", text: `Running... ${elapsed}s` }], details: undefined });
+        onUpdate?.({ content: [{ type: "text", text: `${progressLabel} ${elapsed}s` }], details: undefined });
       }, PROGRESS_INTERVAL_MS);
       const clearProgress = () => clearInterval(progressTimer);
 
@@ -1806,8 +1808,11 @@ export default function (pi: ExtensionAPI) {
           contextOpts,
           ctx?.model,
         );
+        const agentCfg = agents.find(a => a.name === params.agent!);
+        const agentModel = agentCfg ? resolveModel(agentCfg, params.model, ctx?.model) : undefined;
+        const modelNote = agentModel ? ` [${agentModel}]` : "";
         return ok(
-          `Background run started: ${record.id}\nAgent: ${record.agent}\nSession: ${record.sessionPath}\n\nUse action: 'wait', id: '${record.id}' to get the result.`,
+          `Background run started: ${record.id}\nAgent: ${record.agent}${modelNote}\nSession: ${record.sessionPath}\n\nUse action: 'wait', id: '${record.id}' to get the result.`,
           { mode: "background", runId: record.id, sessionPath: record.sessionPath },
         );
       }
@@ -1815,6 +1820,9 @@ export default function (pi: ExtensionAPI) {
       // ── Foreground single ──
       if (hasSingle) {
         const maxAttempts = params.acceptance?.maxAttempts ?? 1;
+        const agentCfg = agents.find(a => a.name === params.agent!);
+        const agentModel = agentCfg ? resolveModel(agentCfg, params.model, ctx?.model) : undefined;
+        progressLabel = `${params.agent!}${agentModel ? ` [${agentModel}]` : ""} running...`;
 
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           const r = await runAgentSync(
@@ -1890,6 +1898,9 @@ export default function (pi: ExtensionAPI) {
 
         while (i < params.chain!.length) {
           const step = params.chain![i]!;
+          const stepAgentCfg = agents.find(a => a.name === step.agent);
+          const stepModel = resolveModel(stepAgentCfg!, undefined, ctx?.model);
+          progressLabel = `chain ${i + 1}/${params.chain!.length} [${step.agent}${stepModel ? ` (${stepModel})` : ""}] running...`;
           let task = step.task.replace(/\{previous\}/g, previous);
           task = task.replace(/\{task\}/g, params.task ?? "");
           // Replace {outputs.name} with stored named outputs
@@ -1964,6 +1975,7 @@ export default function (pi: ExtensionAPI) {
 
       // ── Parallel ──
       if (hasParallel) {
+        progressLabel = `${params.tasks!.length} tasks running...`;
         if (params.tasks!.length > MAX_PARALLEL)
           return toolError(`Too many tasks (${params.tasks!.length}). Max: ${MAX_PARALLEL}.`);
 
@@ -2015,8 +2027,8 @@ export default function (pi: ExtensionAPI) {
           : args.tasks?.length
             ? `parallel (${args.tasks.length})`
             : args.background
-              ? `bg ${args.agent ?? "?"}`
-              : (args.agent ?? "?");
+              ? `bg ${args.agent ?? "?"}${args.model ? ` [${args.model}]` : ""}`
+              : `${args.agent ?? "?"}${args.model ? ` [${args.model}]` : ""}`;
       return new Text(
         `${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", label)}`,
         0,
@@ -2033,6 +2045,11 @@ export default function (pi: ExtensionAPI) {
       // Build summary line with usage stats
       const summaryParts: string[] = [];
       if (d?.results?.length) {
+        const totalDuration = d.results.reduce((s, r) => s + r.duration, 0);
+        if (totalDuration >= 1000) {
+          const secs = (totalDuration / 1000).toFixed(1);
+          summaryParts.push(`${secs}s`);
+        }
         const totalCost = d.results.reduce((s, r) => s + r.cost, 0);
         const totalTurns = d.results.reduce((s, r) => s + r.turns, 0);
         if (totalCost > 0) summaryParts.push(`$${totalCost.toFixed(4)}`);
@@ -2045,9 +2062,10 @@ export default function (pi: ExtensionAPI) {
         if (toolCallCount > 0)
           summaryParts.push(`${toolCallCount} tool call${toolCallCount > 1 ? "s" : ""}`);
       }
-      const summaryLine = summaryParts.length
-        ? ` ${theme.fg("muted", `(${summaryParts.join(", ")})`)}`
-        : "";
+      const firstModel = d?.results?.find(r => r.model)?.model;
+      const modelStr = firstModel ? ` [${firstModel}]` : "";
+      const inner = `${modelStr}${summaryParts.length ? ` (${summaryParts.join(", ")})` : ""}`;
+      const summaryLine = inner ? ` ${theme.fg("muted", inner)}` : "";
 
       if (expanded) {
         const c = new Container();
