@@ -131,7 +131,10 @@ describe("tool contract", () => {
     const root = tempDir();
     const result = await call(tool, { action: "list" }, ctx(root));
     expect(result.content[0].text).toContain("reviewer");
+    expect(result.details.action).toBe("list");
     expect(result.details.results).toEqual([]);
+    const rendered = tool.renderResult(result, { expanded: false }, { fg: (_color: string, text: string) => text, bold: (text: string) => text } as any, {});
+    expect(rendered.render(120).join("\n")).toBe("");
   });
 
   test("does not list project prompts headlessly", async () => {

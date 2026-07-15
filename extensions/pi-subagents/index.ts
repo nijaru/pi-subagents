@@ -127,6 +127,8 @@ export interface AgentResult {
 }
 
 export interface SubagentDetails {
+  /** Identifies a successful metadata-only action with no user-facing body. */
+  action?: "list";
   mode: "single" | "parallel" | "chain";
   agentScope: AgentScope;
   projectAgentsDir: string | null;
@@ -1576,7 +1578,8 @@ export default function (pi: ExtensionAPI) {
       // child. This avoids approving one project and executing in another.
       const discovery = discoverAgents(rootCwd ?? effectiveCwd, agentScope);
       const projectRoot = findNearestProjectRoot(rootCwd ?? effectiveCwd) ?? (rootCwd ?? effectiveCwd);
-      const baseDetails = (mode: SubagentDetails["mode"], results: AgentResult[]): SubagentDetails => boundDetails({
+      const baseDetails = (mode: SubagentDetails["mode"], results: AgentResult[], action?: SubagentDetails["action"]): SubagentDetails => boundDetails({
+        action,
         mode,
         agentScope,
         projectAgentsDir: discovery.projectAgentsDir,
@@ -1616,7 +1619,7 @@ export default function (pi: ExtensionAPI) {
           const configuredModel = agent.model ? ` [${agent.model}]` : " [parent model]";
           return `${agent.name}: ${agent.description}${configuredModel} (${agent.source})`;
         });
-        return toolResult(lines.length ? `Available agents:\n${lines.join("\n")}` : "No agents found.", baseDetails("single", []));
+        return toolResult(lines.length ? `Available agents:\n${lines.join("\n")}` : "No agents found.", baseDetails("single", [], "list"));
       }
 
       if (Number(hasSingle) + Number(hasParallel) + Number(hasChain) !== 1) {
@@ -1887,6 +1890,10 @@ export default function (pi: ExtensionAPI) {
 
     renderResult(result, { expanded }, theme) {
       const details = result.details as SubagentDetails | undefined;
+      // Agent discovery is metadata for the model, not a transcript to repeat
+      // in the user's TUI. The tool content remains intact for the next model
+      // turn; an empty component intentionally suppresses only the UI slot.
+      if (details?.action === "list") return new Container();
       const fallback = result.content[0]?.type === "text" && typeof result.content[0].text === "string"
         ? stripTerminalControls(truncateOutput(result.content[0].text, MAX_OUTPUT_BYTES))
         : "(no output)";

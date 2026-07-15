@@ -81,6 +81,8 @@ A top-level `model` override applies to every mode. A task/chain item may also s
 
 The model-visible final result and each partial update use one deterministic 50 KiB output cap per tool call. Final assistant output is kept separately from bounded 16 KiB diagnostic message records; cumulative JSON message updates are counted by logical growth rather than repeatedly charged in full, with an independent raw stream cap. Stream input, stderr, diagnostics, stored messages, and rendering are bounded separately and malformed result details render safely. Thrown tool errors retain pi-agent-core error semantics; pi itself may discard custom `Error` fields, so callers must not depend on structured details surviving an error boundary.
 
+`action: "list"` returns the complete agent metadata to the model, while its successful result intentionally renders no body in the interactive TUI to avoid polluting the transcript.
+
 The package targets the current pi CLI/API used by its `@earendil-works/pi-*` 0.80.x development dependencies. It does not add compatibility shims for older pi versions.
 
 ## Relationship to pi-workflows

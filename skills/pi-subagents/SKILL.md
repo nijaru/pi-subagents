@@ -21,7 +21,7 @@ The tool accepts exactly one mode:
 
 Use the top-level `model` to override any mode. Resolution is top-level/item override → agent definition → parent pi model. `cwd` defaults to the current project directory. A chain stops at its first failed step.
 
-`action: "list"` is the only action and cannot be combined with a delegation mode.
+`action: "list"` is the only action and cannot be combined with a delegation mode. Its successful metadata result is available to the model but intentionally renders no body in the interactive TUI.
 
 ## Agent policy
 
