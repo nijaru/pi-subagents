@@ -1,7 +1,7 @@
 ---
 name: researcher
 description: External knowledge specialist — searches docs, code examples, and web, synthesizes findings into actionable guidance.
-execution: inline
+capability: write
 tools: read, write, bash, web_search, fetch_content, mcp:context7, mcp:exa
 ---
 

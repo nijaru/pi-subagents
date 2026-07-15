@@ -1,2116 +1,1955 @@
-/**
- * pi-subagents — Clean declarative agent delegation for pi.
- *
- * Three patterns: single spawn, sequential chain, parallel fan-out.
- * Quality gates between chain steps.
- * Agent definitions: markdown files with YAML frontmatter.
- * Context isolation by default. Bounded depth (default 3).
- * Background execution with status/wait/resume. Run persistence across restarts.
- */
-
-import { spawn } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import * as crypto from "node:crypto";
+import { randomUUID } from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
+import type { Message, Model, StopReason, Usage } from "@earendil-works/pi-ai";
+import { StringEnum } from "@earendil-works/pi-ai";
 import {
+  CONFIG_DIR_NAME,
+  type AgentToolResult,
   type ExtensionAPI,
   type ExtensionContext,
-  createAgentSession,
-  type AgentSession,
-  SessionManager,
+  getAgentDir,
+  getMarkdownTheme,
 } from "@earendil-works/pi-coding-agent";
-import type { Model } from "@earendil-works/pi-ai";
-import { Container, Spacer, Text } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
+import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import { Type, type Static } from "typebox";
+import {
+  type AgentConfig,
+  type AgentScope,
+  discoverAgents,
+  findNearestProjectRoot,
+} from "./agents.ts";
 
-// ── Types ───────────────────────────────────────────────────────────────────
+export type { AgentCapability, AgentConfig, AgentDiscoveryResult, AgentScope } from "./agents.ts";
+export { discoverAgents, findNearestProjectAgentsDir, findNearestProjectRoot, getBundledAgentsDir, loadAgentsFromDir } from "./agents.ts";
 
-interface AgentConfig {
-  name: string;
-  description: string;
-  model?: string;
-  execution?: "inline" | "subprocess";
-  tools?: string[];
-  systemPrompt: string;
-  source: "bundled" | "user" | "project";
+export const MAX_DEPTH = 3;
+const MAX_PARALLEL_TASKS = 8;
+/** Maximum live pi subprocesses across an entire recursive delegation tree. */
+export const MAX_CONCURRENCY = 4;
+/** Total child processes a root delegation may ever create. */
+export const MAX_DESCENDANTS = 32;
+const MAX_OUTPUT_BYTES = 50 * 1024;
+const MAX_DIAGNOSTIC_BYTES = 8 * 1024;
+const MAX_MESSAGE_BYTES = 16 * 1024;
+const MAX_MESSAGES_PER_AGENT = 128;
+const MAX_STDERR_BYTES = 50 * 1024;
+const MAX_STREAM_BYTES = 5 * 1024 * 1024;
+/** Independent protocol cap; logical accounting avoids false positives on cumulative updates. */
+const MAX_RAW_STREAM_BYTES = 64 * 1024 * 1024;
+const DEFAULT_PROCESS_TIMEOUT_MS = 30 * 60 * 1000;
+const MAX_PROCESS_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+const MAX_TASK_BYTES = 100 * 1024;
+const MAX_CHAIN_STEPS = 32;
+const MAX_CHAIN_CONTEXT_BYTES = 50 * 1024;
+const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
+const RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
+const PARENT_ID_ENV = "PI_SUBAGENT_PARENT_ID";
+const ROOT_ID_ENV = "PI_SUBAGENT_ROOT_ID";
+const CONTROL_ENV = "PI_SUBAGENT_CONTROL_FILE";
+const DEADLINE_ENV = "PI_SUBAGENT_DEADLINE_MS";
+const BUDGET_ENV = "PI_SUBAGENT_BUDGET_REMAINING";
+const TIMEOUT_ENV = "PI_SUBAGENT_TIMEOUT_MS";
+const PASSTHROUGH_ENV = "PI_SUBAGENT_PASSTHROUGH_ENV";
+const SUBAGENT_BIN_ENV = "PI_SUBAGENT_BIN";
+const PI_BIN_ENV = "PI_BIN";
+const CONTROL_VERSION = 1;
+
+// Keep the child useful for configured providers without copying arbitrary
+// shell/session state (SSH sockets, cloud metadata, and unrelated secrets).
+const SAFE_ENV_KEYS = new Set([
+  "HOME", "PATH", "USER", "LOGNAME", "SHELL", "TMPDIR", "TEMP", "TMP",
+  "PWD", "OLDPWD", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM",
+  "NO_COLOR", "TZ", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "BUN_INSTALL",
+  "PI_OFFLINE", "PI_SKIP_VERSION_CHECK", "PI_TELEMETRY", "PI_CODING_AGENT_DIR", "PI_PACKAGE_DIR",
+  TIMEOUT_ENV, PASSTHROUGH_ENV, SUBAGENT_BIN_ENV, PI_BIN_ENV,
+  "ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "OPENAI_ORG_ID", "OPENROUTER_BASE_URL",
+  "AZURE_OPENAI_ENDPOINT", "GOOGLE_APPLICATION_CREDENTIALS", "AWS_PROFILE",
+  "AWS_REGION", "AWS_DEFAULT_REGION",
+]);
+
+const activeChildren = new Set<ChildProcess>();
+
+interface ControlState {
+  version: number;
+  rootRunId: string;
+  remaining: number;
+  active: number;
+  maxConcurrent: number;
+  deadlineMs: number;
 }
 
-/** Parsed message from pi's JSON event stream. */
-interface AgentMessage {
-  role: "assistant" | "user" | "tool";
-  text?: string;
-  toolCalls?: Array<{ name: string; args: Record<string, unknown> }>;
-  toolResult?: { name: string; output: string };
-  usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
+interface ControlContext {
+  statePath: string;
+  rootRunId: string;
+  deadlineMs: number;
+  ownerDirectory?: string;
+}
+
+interface ChildReservation {
+  budgetRemaining: number;
+}
+
+interface ExecutionContext {
+  runId: string;
+  parentRunId?: string;
+  rootRunId: string;
+  depth: number;
+  deadlineMs: number;
+  control: ControlContext;
+}
+
+export interface UsageSummary extends Usage {
+  turns: number;
+}
+
+export interface AgentResult {
+  agent: string;
+  agentSource: AgentConfig["source"] | "unknown";
+  task: string;
+  /** Final assistant text, kept separately from bounded diagnostic messages. */
+  output?: string;
+  runId: string;
+  parentRunId?: string;
+  rootRunId: string;
+  depth: number;
+  step?: number;
+  exitCode: number;
+  stopReason?: StopReason;
+  errorMessage?: string;
+  stderr: string;
+  messages: Message[];
+  usage: UsageSummary;
   model?: string;
-  stopReason?: string;
+}
+
+export interface SubagentDetails {
+  mode: "single" | "parallel" | "chain";
+  agentScope: AgentScope;
+  projectAgentsDir: string | null;
+  runId: string;
+  parentRunId?: string;
+  rootRunId: string;
+  depth: number;
+  deadlineMs: number;
+  results: AgentResult[];
+}
+
+export type SubagentParams = Static<typeof SubagentParamsSchema>;
+
+function emptyUsage(): UsageSummary {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    turns: 0,
+  };
+}
+
+function addUsage(target: UsageSummary, usage: Usage): void {
+  target.input += usage.input || 0;
+  target.output += usage.output || 0;
+  target.cacheRead += usage.cacheRead || 0;
+  target.cacheWrite += usage.cacheWrite || 0;
+  target.totalTokens += usage.totalTokens || 0;
+  target.cost.input += usage.cost?.input || 0;
+  target.cost.output += usage.cost?.output || 0;
+  target.cost.cacheRead += usage.cost?.cacheRead || 0;
+  target.cost.cacheWrite += usage.cost?.cacheWrite || 0;
+  target.cost.total += usage.cost?.total || 0;
+  if (usage.cacheWrite1h !== undefined) target.cacheWrite1h = (target.cacheWrite1h || 0) + usage.cacheWrite1h;
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isUsage(value: unknown): value is Usage {
+  if (!value || typeof value !== "object") return false;
+  const usage = value as Record<string, unknown>;
+  const numericKeys = ["input", "output", "cacheRead", "cacheWrite", "totalTokens"];
+  if (!numericKeys.every((key) => isFiniteNumber(usage[key]))) return false;
+  const cost = usage.cost;
+  if (!cost || typeof cost !== "object") return false;
+  return ["input", "output", "cacheRead", "cacheWrite", "total"].every((key) => isFiniteNumber((cost as Record<string, unknown>)[key]))
+    && (usage.cacheWrite1h === undefined || isFiniteNumber(usage.cacheWrite1h));
+}
+
+function isContentPart(value: unknown): value is { type: string; text?: unknown } {
+  if (!value || typeof value !== "object") return false;
+  const part = value as Record<string, unknown>;
+  if (part.type === "text") return typeof part.text === "string";
+  if (part.type === "thinking") return typeof part.thinking === "string";
+  if (part.type === "image") return typeof part.data === "string" && typeof part.mimeType === "string";
+  if (part.type === "toolCall") return typeof part.id === "string" && typeof part.name === "string" && !!part.arguments && typeof part.arguments === "object" && !Array.isArray(part.arguments);
+  return false;
+}
+
+function isMessage(value: unknown): value is Message {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.role === "toolResult") {
+    const content = candidate.content;
+    const validContent = Array.isArray(content) && content.every((part) => {
+      if (!part || typeof part !== "object") return false;
+      const item = part as Record<string, unknown>;
+      return (item.type === "text" && typeof item.text === "string")
+        || (item.type === "image" && typeof item.data === "string" && typeof item.mimeType === "string");
+    });
+    return validContent
+      && typeof candidate.toolCallId === "string"
+      && typeof candidate.toolName === "string"
+      && typeof candidate.isError === "boolean";
+  }
+  const validContent = typeof candidate.content === "string"
+    || (Array.isArray(candidate.content) && candidate.content.every(isContentPart));
+  if (!validContent || (candidate.role !== "user" && candidate.role !== "assistant")) return false;
+  return candidate.role !== "assistant" || candidate.usage === undefined || isUsage(candidate.usage);
+}
+
+function isStopReason(value: unknown): value is StopReason {
+  return value === "stop" || value === "length" || value === "toolUse" || value === "error" || value === "aborted";
+}
+
+function isFinalMessage(value: unknown): value is Message {
+  if (!isMessage(value)) return false;
+  if (value.role !== "assistant") return true;
+  return typeof value.model === "string" && isStopReason(value.stopReason) && isUsage(value.usage);
+}
+
+function textFromMessage(message: Message): string {
+  if (typeof message.content === "string") return message.content;
+  return message.content
+    .filter((part): part is { type: "text"; text: string } => isContentPart(part) && part.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("\n");
+}
+
+export function getFinalOutput(messages: Message[]): string {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    if (message?.role === "assistant") {
+      const text = textFromMessage(message);
+      if (text) return text;
+    }
+  }
+  return "";
+}
+
+/** Return a UTF-8 prefix without splitting a code point. */
+function utf8Prefix(value: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  let low = 0;
+  let high = value.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(value.slice(0, middle), "utf8") <= maxBytes) low = middle;
+    else high = middle - 1;
+  }
+  // A UTF-16 binary-search boundary can land between a surrogate pair even
+  // though Buffer.byteLength reports a valid replacement sequence.
+  if (low > 0 && low < value.length) {
+    const last = value.charCodeAt(low - 1);
+    if (last >= 0xd800 && last <= 0xdbff) low--;
+  }
+  return value.slice(0, low);
+}
+
+/**
+ * Truncate output by bytes with a stable, bounded marker. This is deliberately
+ * head truncation: the beginning of a subagent report contains its useful context.
+ */
+export function truncateOutput(value: string, maxBytes = MAX_OUTPUT_BYTES): string {
+  const totalBytes = Buffer.byteLength(value, "utf8");
+  if (totalBytes <= maxBytes) return value;
+  if (maxBytes <= 0) return "";
+
+  const markerFor = (keptBytes: number) =>
+    `\n\n[Output truncated: kept ${keptBytes} of ${totalBytes} bytes.]`;
+  const minimalMarker = "[Output truncated]";
+  if (Buffer.byteLength(minimalMarker, "utf8") > maxBytes) return utf8Prefix(value, maxBytes);
+
+  let keptBytes = Math.min(totalBytes, maxBytes);
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const marker = markerFor(keptBytes);
+    const budget = Math.max(0, maxBytes - Buffer.byteLength(marker, "utf8"));
+    const prefix = utf8Prefix(value, budget);
+    const nextKept = Buffer.byteLength(prefix, "utf8");
+    const finalMarker = markerFor(nextKept);
+    if (nextKept === keptBytes && Buffer.byteLength(finalMarker, "utf8") <= maxBytes) return prefix + finalMarker;
+    keptBytes = nextKept;
+  }
+  const marker = markerFor(0);
+  if (Buffer.byteLength(marker, "utf8") <= maxBytes) {
+    return utf8Prefix(value, maxBytes - Buffer.byteLength(marker, "utf8")) + marker;
+  }
+  if (Buffer.byteLength(minimalMarker, "utf8") <= maxBytes) return minimalMarker;
+  return utf8Prefix(value, maxBytes);
+}
+
+/** Replace chain placeholders without materializing an unbounded expansion. */
+export function interpolatePrevious(task: string, previous: string, maxBytes = MAX_TASK_BYTES): string {
+  const marker = "{previous}";
+  const chunks: string[] = [];
+  let bytes = 0;
+  let cursor = 0;
+  while (cursor <= task.length && bytes < maxBytes) {
+    const markerIndex = task.indexOf(marker, cursor);
+    const literalEnd = markerIndex < 0 ? task.length : markerIndex;
+    const literal = task.slice(cursor, literalEnd);
+    const literalPrefix = utf8Prefix(literal, maxBytes - bytes);
+    chunks.push(literalPrefix);
+    bytes += Buffer.byteLength(literalPrefix, "utf8");
+    if (literalPrefix.length < literal.length || markerIndex < 0 || bytes >= maxBytes) break;
+
+    const previousPrefix = utf8Prefix(previous, maxBytes - bytes);
+    chunks.push(previousPrefix);
+    bytes += Buffer.byteLength(previousPrefix, "utf8");
+    if (previousPrefix.length < previous.length || bytes >= maxBytes) break;
+    cursor = markerIndex + marker.length;
+  }
+  return chunks.join("");
+}
+
+function capStderr(current: string, next: string): string {
+  const remaining = MAX_STDERR_BYTES - Buffer.byteLength(current, "utf8");
+  return remaining > 0 ? current + utf8Prefix(next, remaining) : current;
+}
+
+function boundedDiagnostic(value: string | undefined, maxBytes = MAX_DIAGNOSTIC_BYTES): string | undefined {
+  return value === undefined ? undefined : truncateOutput(value, maxBytes);
+}
+
+function jsonBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+/** Keep typed pi messages while bounding the data copied into tool details. */
+function boundMessage(message: Message, maxBytes = MAX_MESSAGE_BYTES): Message {
+  if (jsonBytes(message) <= maxBytes) return message;
+  const copy = JSON.parse(JSON.stringify(message)) as Record<string, any>;
+  if (typeof copy.content === "string") {
+    copy.content = truncateOutput(copy.content, Math.max(0, maxBytes - 512));
+  } else if (Array.isArray(copy.content)) {
+    copy.content = copy.content.map((part: Record<string, any>) => {
+      if (part.type === "text") return { ...part, text: truncateOutput(typeof part.text === "string" ? part.text : "", Math.max(0, maxBytes - 512)) };
+      if (part.type === "thinking") return { ...part, thinking: truncateOutput(typeof part.thinking === "string" ? part.thinking : "", Math.max(0, maxBytes - 512)) };
+      if (part.type === "image") return { ...part, data: truncateOutput(typeof part.data === "string" ? part.data : "", Math.max(0, maxBytes - 512)) };
+      if (part.type === "toolCall") return { ...part, arguments: {} };
+      return part;
+    });
+  }
+  if (typeof copy.errorMessage === "string") copy.errorMessage = boundedDiagnostic(copy.errorMessage, 1024);
+  if (jsonBytes(copy) <= maxBytes) return copy as Message;
+  // Preserve a valid, small message shape when metadata (for example a large
+  // provider field) is itself unexpectedly large.
+  if (copy.role === "toolResult") {
+    return { ...copy, content: [{ type: "text", text: "[tool result truncated]" }], toolCallId: String(copy.toolCallId ?? ""), toolName: String(copy.toolName ?? "tool"), isError: Boolean(copy.isError) } as Message;
+  }
+  return { ...copy, content: truncateOutput(textFromMessage(copy as Message), Math.max(0, maxBytes - 512)) } as Message;
+}
+
+function boundMessages(messages: Message[], maxBytes = MAX_OUTPUT_BYTES): Message[] {
+  const bounded = messages.slice(-MAX_MESSAGES_PER_AGENT).map((message) => boundMessage(message));
+  while (bounded.length > 0 && jsonBytes(bounded) > maxBytes) bounded.shift();
+  if (bounded.length === 1 && jsonBytes(bounded) > maxBytes) return [boundMessage(bounded[0]!, Math.max(512, maxBytes - 32))];
+  return bounded;
+}
+
+function minimalAgentResult(result: AgentResult): AgentResult {
+  return {
+    agent: truncateOutput(result.agent, 256),
+    agentSource: result.agentSource,
+    task: "",
+    runId: result.runId,
+    parentRunId: result.parentRunId,
+    rootRunId: result.rootRunId,
+    depth: result.depth,
+    step: result.step,
+    exitCode: result.exitCode,
+    stopReason: result.stopReason,
+    errorMessage: boundedDiagnostic(result.errorMessage, 512),
+    stderr: "",
+    messages: [],
+    usage: result.usage,
+    model: boundedDiagnostic(result.model, 256),
+  };
+}
+
+function boundAgentResult(result: AgentResult, maxBytes: number): AgentResult {
+  let bounded = minimalAgentResult(result);
+  if (jsonBytes(bounded) >= maxBytes) return bounded;
+  const candidates: Array<[keyof AgentResult, unknown]> = [
+    ["output", result.output ? truncateOutput(result.output, Math.min(MAX_OUTPUT_BYTES, maxBytes)) : undefined],
+    ["task", truncateOutput(result.task, Math.min(MAX_DIAGNOSTIC_BYTES, maxBytes))],
+    ["stderr", truncateOutput(result.stderr, Math.min(MAX_DIAGNOSTIC_BYTES, maxBytes))],
+    ["messages", boundMessages(result.messages, Math.min(MAX_MESSAGE_BYTES * 2, maxBytes))],
+  ];
+  for (const [key, value] of candidates) {
+    const next = { ...bounded, [key]: value } as AgentResult;
+    if (jsonBytes(next) <= maxBytes) bounded = next;
+  }
+  return bounded;
+}
+
+function boundDetails(details: SubagentDetails, maxBytes = MAX_OUTPUT_BYTES): SubagentDetails {
+  const minimalResults = details.results.map(minimalAgentResult);
+  const bounded: SubagentDetails = { ...details, results: minimalResults };
+  const baseBytes = jsonBytes(bounded);
+  if (baseBytes >= maxBytes || minimalResults.length === 0) return bounded;
+  const perResult = Math.max(1, Math.floor((maxBytes - baseBytes) / minimalResults.length));
+  bounded.results = details.results.map((result) => boundAgentResult(result, jsonBytes(minimalAgentResult(result)) + perResult));
+  // The allocation above is deterministic. A final minimal fallback keeps
+  // the aggregate bounded even if JSON overhead differs across runtimes.
+  while (jsonBytes(bounded) > maxBytes && bounded.results.some((result, index) => jsonBytes(result) > jsonBytes(minimalResults[index]!))) {
+    const index = bounded.results.findIndex((result, itemIndex) => jsonBytes(result) > jsonBytes(minimalResults[itemIndex]!));
+    if (index < 0) break;
+    bounded.results[index] = minimalResults[index]!;
+  }
+  return bounded;
+}
+
+function modelName(model: Model<any> | undefined): string | undefined {
+  return model ? `${model.provider}/${model.id}` : undefined;
+}
+
+function resolveModel(agent: AgentConfig, override: string | undefined, parentModel: Model<any> | undefined): string | undefined {
+  return override ?? agent.model ?? modelName(parentModel);
+}
+
+function effectiveTools(agent: AgentConfig): string[] {
+  // An omitted allowlist is intentionally empty. In particular, it must not
+  // fall through to pi's default all-tools behavior.
+  const tools = [...(agent.tools ?? [])].filter((tool) => tool !== "subagent");
+  if (agent.delegation) tools.push("subagent");
+  return [...new Set(tools)];
+}
+
+function potentiallyMutating(agent: AgentConfig | undefined): boolean {
+  // Missing metadata is conservative: a task may mutate the worktree.
+  return agent?.capability !== "read";
+}
+
+export interface PiInvocation {
+  command: string;
+  args: string[];
+}
+
+function executable(pathname: string): boolean {
+  try {
+    fs.accessSync(pathname, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function findOnPath(name: string): string | undefined {
+  const pathValue = process.env.PATH ?? "";
+  for (const directory of pathValue.split(path.delimiter)) {
+    if (!directory) continue;
+    const candidate = path.resolve(directory, name);
+    if (executable(candidate)) return fs.realpathSync.native(candidate);
+  }
+  return undefined;
+}
+
+/**
+ * Invoke the same pi CLI as the parent process. All returned commands are
+ * absolute, avoiding cwd/PATH changes inside a delegated task.
+ */
+export function getPiInvocation(args: string[]): PiInvocation {
+  const configured = process.env.PI_SUBAGENT_BIN ?? process.env.PI_BIN;
+  if (configured) {
+    const absolute = path.resolve(configured);
+    if (executable(absolute)) return { command: fs.realpathSync.native(absolute), args };
+  }
+
+  const runtime = path.basename(process.execPath).toLowerCase();
+  const genericRuntime = /^(node|bun|deno)(\.exe)?$/.test(runtime);
+  const currentScript = process.argv[1] ? path.resolve(process.argv[1]) : undefined;
+
+  if (!genericRuntime && executable(process.execPath)) {
+    return { command: fs.realpathSync.native(process.execPath), args };
+  }
+  if (currentScript && fs.existsSync(currentScript) && /\.(?:mjs|cjs|js|ts)$/.test(currentScript)) {
+    return { command: fs.realpathSync.native(process.execPath), args: [currentScript, ...args] };
+  }
+
+  const piPath = findOnPath("pi");
+  if (piPath) return { command: piPath, args };
+  throw new Error("Unable to resolve an absolute pi executable for subagent delegation.");
+}
+
+function configuredTimeoutMs(): number {
+  const configured = Number(process.env[TIMEOUT_ENV]);
+  return Number.isSafeInteger(configured) && configured > 0 && configured <= MAX_PROCESS_TIMEOUT_MS
+    ? configured
+    : DEFAULT_PROCESS_TIMEOUT_MS;
+}
+
+function processTimeoutMs(deadlineMs?: number): number {
+  const configured = configuredTimeoutMs();
+  if (deadlineMs === undefined) return configured;
+  return Math.max(1, Math.min(configured, deadlineMs - Date.now()));
+}
+
+function isControlId(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+}
+
+function isControlState(value: unknown): value is ControlState {
+  if (!value || typeof value !== "object") return false;
+  const state = value as Record<string, unknown>;
+  return state.version === CONTROL_VERSION
+    && isControlId(state.rootRunId)
+    && Number.isSafeInteger(state.remaining) && (state.remaining as number) >= 0 && (state.remaining as number) <= MAX_DESCENDANTS
+    && Number.isSafeInteger(state.active) && (state.active as number) >= 0
+    && Number.isSafeInteger(state.maxConcurrent) && (state.maxConcurrent as number) > 0 && (state.maxConcurrent as number) <= MAX_CONCURRENCY
+    && (state.active as number) <= (state.maxConcurrent as number)
+    && Number.isSafeInteger(state.deadlineMs) && (state.deadlineMs as number) > 0;
+}
+
+async function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) throw new Error("Subagent aborted.");
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      if (error) reject(error);
+      else resolve();
+    };
+    const abort = () => finish(new Error("Subagent aborted."));
+    const timer = setTimeout(() => finish(), ms);
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
+async function acquireControlLock(control: ControlContext, signal?: AbortSignal): Promise<string> {
+  const lockPath = `${control.statePath}.lock`;
+  const started = Date.now();
+  while (true) {
+    if (signal?.aborted) throw new Error("Subagent aborted.");
+    try {
+      await fs.promises.mkdir(lockPath, { mode: 0o700 });
+      return lockPath;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") throw error;
+      try {
+        const stat = await fs.promises.stat(lockPath);
+        if (Date.now() - stat.mtimeMs > 5_000) await fs.promises.rm(lockPath, { recursive: true, force: true });
+      } catch {
+        // The owner may have released the lock between stat and cleanup.
+      }
+      if (Date.now() - started > 10_000) throw new Error("Timed out acquiring subagent control state lock.");
+      await delay(25, signal);
+    }
+  }
+}
+
+async function withControlState<T>(control: ControlContext, update: (state: ControlState) => Promise<T> | T, signal?: AbortSignal): Promise<T> {
+  const lockPath = await acquireControlLock(control, signal);
+  try {
+    const raw = await fs.promises.readFile(control.statePath, "utf8");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error("Subagent control state is not valid JSON.");
+    }
+    if (!isControlState(parsed) || parsed.rootRunId !== control.rootRunId) {
+      throw new Error("Subagent control state is malformed or belongs to another root run.");
+    }
+    const result = await update(parsed);
+    await fs.promises.writeFile(control.statePath, JSON.stringify(parsed), { encoding: "utf8", mode: 0o600 });
+    return result;
+  } finally {
+    await fs.promises.rm(lockPath, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function createControlState(rootRunId: string): Promise<ControlContext> {
+  const ownerDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagents-control-"));
+  const statePath = path.join(ownerDirectory, "state.json");
+  const deadlineMs = Date.now() + configuredTimeoutMs();
+  const state: ControlState = {
+    version: CONTROL_VERSION,
+    rootRunId,
+    remaining: MAX_DESCENDANTS,
+    active: 0,
+    maxConcurrent: MAX_CONCURRENCY,
+    deadlineMs,
+  };
+  await fs.promises.writeFile(statePath, JSON.stringify(state), { encoding: "utf8", mode: 0o600 });
+  return { statePath, rootRunId, deadlineMs, ownerDirectory };
+}
+
+async function inheritedControlState(depth: DepthStatus, rootRunId: string): Promise<ControlContext | undefined> {
+  const controlPath = process.env[CONTROL_ENV];
+  const related = [process.env[RUN_ID_ENV], process.env[ROOT_ID_ENV], process.env[PARENT_ID_ENV], process.env[BUDGET_ENV], process.env[DEADLINE_ENV]];
+  if (!controlPath) {
+    if (depth.depth > 0 || related.some((value) => value !== undefined)) {
+      throw new Error("Nested subagent controls are incomplete; refusing to spawn.");
+    }
+    return undefined;
+  }
+  if (!path.isAbsolute(controlPath) || !isControlId(process.env[ROOT_ID_ENV]) || !isControlId(process.env[RUN_ID_ENV]) || depth.depth === 0 && process.env[PARENT_ID_ENV] !== undefined && !isControlId(process.env[PARENT_ID_ENV])) {
+    throw new Error("Nested subagent control environment is malformed.");
+  }
+  if (depth.depth > 0 && !isControlId(process.env[PARENT_ID_ENV])) {
+    throw new Error("Nested subagent parent id is missing.");
+  }
+  if (process.env[BUDGET_ENV] !== undefined && !/^(?:0|[1-9]\d*)$/.test(process.env[BUDGET_ENV])) {
+    throw new Error("Nested subagent budget is malformed.");
+  }
+  const stat = await fs.promises.lstat(controlPath);
+  if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) {
+    throw new Error("Nested subagent control state must be a private regular file.");
+  }
+  const raw = await fs.promises.readFile(controlPath, "utf8");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("Nested subagent control state is not valid JSON.");
+  }
+  if (!isControlState(parsed) || parsed.rootRunId !== process.env[ROOT_ID_ENV]) {
+    throw new Error("Nested subagent control state is malformed.");
+  }
+  if (process.env[DEADLINE_ENV] !== undefined && process.env[DEADLINE_ENV] !== String(parsed.deadlineMs)) {
+    throw new Error("Nested subagent deadline does not match its control state.");
+  }
+  if (parsed.rootRunId !== rootRunId && rootRunId !== "") {
+    throw new Error("Nested subagent root id is inconsistent.");
+  }
+  return { statePath: controlPath, rootRunId: parsed.rootRunId, deadlineMs: parsed.deadlineMs };
+}
+
+function childEnvironment(
+  depth: number,
+  control: ControlContext,
+  parentRunId: string,
+  childRunId: string,
+  budgetRemaining: number,
+  cwd: string,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of SAFE_ENV_KEYS) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  // Allow the user to explicitly opt in to additional non-standard provider
+  // variables without making every ambient environment variable available to
+  // a delegated bash-capable agent.
+  for (const key of (process.env[PASSTHROUGH_ENV] ?? "").split(",")) {
+    const name = key.trim();
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && process.env[name] !== undefined) env[name] = process.env[name];
+  }
+  env["PWD"] = cwd;
+  env[DEPTH_ENV] = String(depth);
+  env[RUN_ID_ENV] = childRunId;
+  env[PARENT_ID_ENV] = parentRunId;
+  env[ROOT_ID_ENV] = control.rootRunId;
+  env[CONTROL_ENV] = control.statePath;
+  env[DEADLINE_ENV] = String(control.deadlineMs);
+  env[BUDGET_ENV] = String(budgetRemaining);
+  if (process.env[TIMEOUT_ENV] !== undefined) env[TIMEOUT_ENV] = process.env[TIMEOUT_ENV];
+  if (process.env[PASSTHROUGH_ENV] !== undefined) env[PASSTHROUGH_ENV] = process.env[PASSTHROUGH_ENV];
+  if (process.env[SUBAGENT_BIN_ENV] !== undefined) env[SUBAGENT_BIN_ENV] = process.env[SUBAGENT_BIN_ENV];
+  if (process.env[PI_BIN_ENV] !== undefined) env[PI_BIN_ENV] = process.env[PI_BIN_ENV];
+  return env;
+}
+
+async function reserveChild(control: ControlContext, signal?: AbortSignal): Promise<{ reservation?: ChildReservation; reason?: string }> {
+  try {
+    const result = await withControlState(control, (state) => {
+      if (Date.now() >= state.deadlineMs) return { reason: "Root subagent deadline reached." };
+      if (state.remaining <= 0) return { reason: `Root descendant budget exhausted (maximum ${MAX_DESCENDANTS}).` };
+      // Do not queue here: a full tree may otherwise deadlock when every
+      // active parent is waiting for a nested child. Nested callers fail fast.
+      if (state.active >= state.maxConcurrent) return { reason: `Shared subagent concurrency limit reached (maximum ${state.maxConcurrent}).` };
+      state.remaining--;
+      state.active++;
+      return { reservation: { budgetRemaining: state.remaining } };
+    }, signal);
+    return result;
+  } catch (error) {
+    return { reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function releaseChild(control: ControlContext): Promise<void> {
+  try {
+    await withControlState(control, (state) => {
+      state.active = Math.max(0, state.active - 1);
+    });
+  } catch {
+    // The root may already be shutting down and removing its ephemeral state.
+  }
+}
+
+export interface DepthStatus {
+  valid: boolean;
+  depth: number;
+}
+
+/** Invalid depth values fail closed at the maximum rather than resetting to zero. */
+export function readDepth(value?: string): DepthStatus {
+  // An explicit undefined is useful to tests and callers that want to parse a
+  // value without consulting ambient process state; no argument reads env.
+  const raw = arguments.length === 0 ? process.env[DEPTH_ENV] : value;
+  if (raw === undefined) return { valid: true, depth: 0 };
+  if (!/^(?:0|[1-9]\d*)$/.test(raw)) return { valid: false, depth: MAX_DEPTH };
+  const depth = Number(raw);
+  if (!Number.isSafeInteger(depth)) return { valid: false, depth: MAX_DEPTH };
+  return { valid: true, depth };
+}
+
+export interface ParsedJsonEvent {
+  kind: "message" | "messages" | "progress" | "error";
+  message?: Message;
+  messages?: Message[];
+  /** Cumulative message carried by Pi's message_update event for stream accounting. */
+  streamMessage?: Message;
+  text?: string;
   errorMessage?: string;
 }
 
-interface RunResult {
-  agent: string;
-  task: string;
+/** Parse one JSON-mode line; malformed/non-event lines are safely ignored. */
+export function parseJsonEventLine(line: string): ParsedJsonEvent | undefined {
+  if (!line.trim()) return undefined;
+  let event: unknown;
+  try {
+    event = JSON.parse(line);
+  } catch {
+    return undefined;
+  }
+  if (!event || typeof event !== "object") return undefined;
+  const candidate = event as Record<string, unknown>;
+  if (candidate.type === "message_end" && isFinalMessage(candidate.message)) {
+    return { kind: "message", message: candidate.message };
+  }
+  if (candidate.type === "tool_execution_end") {
+    const toolName = typeof candidate.toolName === "string" ? candidate.toolName : "tool";
+    return { kind: "progress", text: `Finished ${truncateOutput(toolName, 256)}.` };
+  }
+  if (candidate.type === "agent_end" && Array.isArray(candidate.messages)) {
+    const messages = candidate.messages.filter(isFinalMessage);
+    return messages.length > 0 ? { kind: "messages", messages } : undefined;
+  }
+  if (candidate.type === "message_update" && isMessage(candidate.message)) {
+    return { kind: "progress", text: textFromMessage(candidate.message), streamMessage: candidate.message };
+  }
+  if (candidate.type === "tool_execution_start" || candidate.type === "tool_execution_update") {
+    const toolName = typeof candidate.toolName === "string" ? candidate.toolName : "tool";
+    return { kind: "progress", text: `Running ${truncateOutput(toolName, 256)}...` };
+  }
+  if (candidate.type === "error") {
+    const errorMessage = typeof candidate.errorMessage === "string"
+      ? candidate.errorMessage
+      : typeof candidate.message === "string" ? candidate.message : "Subagent process reported an error.";
+    return { kind: "error", errorMessage };
+  }
+  return undefined;
+}
+
+interface ProcessResult {
   exitCode: number;
-  output: string;
+  stopReason?: StopReason;
+  errorMessage?: string;
   stderr: string;
-  cost: number;
-  duration: number;
-  messages: AgentMessage[];
-  turns: number;
-  model?: string;
-  stopReason?: string;
-  sessionPath?: string;
-  sessionId?: string;
 }
 
-interface RunRecord {
-  id: string;
-  agent: string;
-  task: string;
-  status: "running" | "completed" | "failed";
-  startedAt: number;
-  sessionPath: string;
-  result?: RunResult;
-  // Not persisted — only for live processes
-  proc?: ReturnType<typeof spawn>;
+interface StreamAccounting {
+  messageKey?: string;
+  messageBytes: number;
+  logicalBytes: number;
 }
 
-type ToolResult = {
-  content: { type: "text"; text: string }[];
-  details: unknown;
-};
-
-// ── Constants ───────────────────────────────────────────────────────────────
-
-const MAX_DEPTH = 3;
-const MAX_PARALLEL = 8;
-const MAX_CONCURRENCY = 4; // limit concurrent subprocess spawns
-const MAX_RETRIES = 3;
-const MAX_OUTPUT_BYTES = 100 * 1024; // 100KB per agent output
-const MAX_STDERR_BYTES = 1024 * 1024; // 1MB stderr cap during accumulation
-const PER_TASK_OUTPUT_CAP = 50 * 1024; // 50KB per task in parallel mode
-const INACTIVITY_TIMEOUT_MS = 60_000; // kill if no activity for 60s (subprocess: stdout/stderr, inline: session events)
-const PROGRESS_INTERVAL_MS = 10_000; // emit elapsed time every 10s
-const DEFAULT_GATE_TIMEOUT_MS = 30_000;
-const BACKGROUND_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes for background agents
-const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
-
-// ── State ───────────────────────────────────────────────────────────────────
-
-const runs = new Map<string, RunRecord>();
-
-function runsFilePath(): string {
-  return path.join(os.homedir(), ".pi", "agent", "subagent-runs.json");
+function streamMessageKey(message: Message): string {
+  const candidate = message as unknown as Record<string, unknown>;
+  return [candidate.role, candidate.timestamp, candidate.toolCallId, candidate.model].map((value) => String(value ?? "")).join("|");
 }
-
-/** Atomic write: write to temp file, then rename. */
-function persistRuns(): void {
-  const entries: Array<Omit<RunRecord, "proc">> = [];
-  for (const r of runs.values()) {
-    const { proc: _, ...rest } = r;
-    entries.push(rest);
-  }
-  try {
-    const fp = runsFilePath();
-    fs.mkdirSync(path.dirname(fp), { recursive: true });
-    const tmp = fp + ".tmp";
-    fs.writeFileSync(tmp, JSON.stringify(entries));
-    fs.renameSync(tmp, fp);
-  } catch (e: unknown) {
-    console.error("[pi-subagents] Failed to persist runs:", e instanceof Error ? e.message : e);
-  }
-}
-
-/** Remove old completed/failed runs from memory and disk. Keeps last 100 entries. */
-let pruneCounter = 0;
-function pruneRuns(): void {
-  // Only run every 10th call to avoid O(n log n) on every persistRuns
-  if (++pruneCounter % 10 !== 0) return;
-  const MAX_RUNS = 100;
-  const entries = [...runs.values()];
-  if (entries.length <= MAX_RUNS) return;
-
-  // Sort by startedAt descending, keep newest
-  entries.sort((a, b) => b.startedAt - a.startedAt);
-  const toRemove = entries.slice(MAX_RUNS);
-  for (const r of toRemove) {
-    // Clean up session dir if it still exists
-    if (r.status !== "running" && r.sessionPath) {
-      try {
-        fs.rmSync(r.sessionPath, { recursive: true, force: true });
-      } catch {}
-    }
-    runs.delete(r.id);
-  }
-  persistRuns();
-}
-
-function loadRuns(): void {
-  try {
-    const data = JSON.parse(fs.readFileSync(runsFilePath(), "utf-8"));
-    if (!Array.isArray(data)) return;
-    for (const r of data) {
-      // Validate required fields and types to handle corrupted persistence
-      if (!r.id || !r.sessionPath || typeof r.id !== "string" || typeof r.sessionPath !== "string")
-        continue;
-      if (!r.status || !["running", "completed", "failed"].includes(r.status)) continue;
-      if (typeof r.startedAt !== "number") continue;
-      runs.set(r.id, r as RunRecord);
-    }
-  } catch (e: unknown) {
-    // File not found is expected on first run
-    if (e instanceof Error && "code" in e && (e as NodeJS.ErrnoException).code !== "ENOENT") {
-      console.error("[pi-subagents] Failed to load runs:", e.message);
-    }
-  }
-}
-
-/** Reconcile persisted running records: if session file exists with output, mark completed. */
-function reconcileRuns(): void {
-  const now = Date.now();
-  const STALE_MS = 24 * 60 * 60 * 1000; // 24 hours
-  let changed = false;
-  for (const [id, r] of runs) {
-    if (r.status !== "running") continue;
-    // If we have a live process, leave it alone
-    if (r.proc) continue;
-    // Check if session file has output (process completed while we were away)
-    const session = readSessionOutput(r.sessionPath);
-    if (session.output) {
-      // Use session file mtime for duration (excludes downtime while pi was away)
-      const sessionFile = findSessionFile(r.sessionPath);
-      let endTime = now;
-      try {
-        if (sessionFile) endTime = fs.statSync(sessionFile).mtimeMs || now;
-      } catch {
-        /* file may have been deleted */
-      }
-      // Infer exit code from stopReason: "stop" = success, anything else = failure
-      const exitCode = session.stopReason === "stop" ? 0 : 1;
-      r.status = exitCode === 0 ? "completed" : "failed";
-      r.result = {
-        agent: r.agent,
-        task: r.task,
-        exitCode,
-        output: truncate(session.output, MAX_OUTPUT_BYTES),
-        stderr: exitCode !== 0 ? `Agent stopped: ${session.stopReason ?? "unknown"}` : "",
-        cost: session.cost,
-        duration: Math.max(0, endTime - r.startedAt),
-        sessionPath: r.sessionPath,
-        messages: [],
-        turns: 0,
-      };
-      changed = true;
-    } else if (!fs.existsSync(r.sessionPath)) {
-      // Session dir gone — stale run
-      runs.delete(id);
-      changed = true;
-    } else if (now - r.startedAt > STALE_MS) {
-      // Running for >24h with no output and session dir still exists — mark failed
-      r.status = "failed";
-      r.result = {
-        agent: r.agent,
-        task: r.task,
-        exitCode: 1,
-        output: "",
-        stderr: "Background agent timed out after 24h with no output.",
-        cost: 0,
-        duration: now - r.startedAt,
-        sessionPath: r.sessionPath,
-        messages: [],
-        turns: 0,
-      };
-      changed = true;
-    }
-    // else: still running or no output yet, leave as-is
-  }
-  if (changed) persistRuns();
-
-  // Clean up session dirs for completed/failed runs older than 1 hour
-  // (keep recent ones so resume still works)
-  const RESUME_WINDOW_MS = 60 * 60 * 1000; // 1 hour
-  for (const [, r] of runs) {
-    if (r.status === "running") continue;
-    if (r.sessionPath && r.result && now - r.startedAt > RESUME_WINDOW_MS) {
-      try {
-        fs.rmSync(r.sessionPath, { recursive: true, force: true });
-      } catch {}
-    }
-  }
-  pruneRuns();
-}
-
-// ── Helpers ─────────────────────────────────────────────────────────────────
-
-/** Quote a YAML value if it contains characters that would break unquoted parsing. */
-const yamlQuote = (v: string) =>
-  /[:#"'\n{}\[\],&*?|>!%@`]/.test(v)  // oxlint-disable-line no-useless-escape
-    ? `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
-    : v;
-
-const ok = (text: string, details?: unknown): ToolResult => ({
-  content: [{ type: "text", text }],
-  details,
-});
 
 /**
- * Signal a tool error by throwing. Per pi SDK docs:
- * "Returning a value never sets the error flag regardless of what properties you include.
- *  To mark a tool execution as failed, throw an error from execute."
+ * Pi's `message_update` event carries a cumulative message, not a delta.
+ * Count only growth for the active message so a long response does not look
+ * quadratic on the wire. Non-message protocol lines are counted in full.
  */
-function toolError(message: string): never {
-  throw new Error(message);
-}
-
-function genId(): string {
-  return crypto.randomBytes(4).toString("hex");
-}
-
-function getDepth(): number {
-  const v = parseInt(process.env[DEPTH_ENV] ?? "0", 10);
-  return isNaN(v) ? 0 : v;
-}
-
-function childEnv(depth: number): NodeJS.ProcessEnv {
-  return { ...process.env, [DEPTH_ENV]: String(depth) };
-}
-
-function truncate(s: string, maxBytes: number): string {
-  if (Buffer.byteLength(s, "utf-8") <= maxBytes) return s;
-  // Binary search for the right cutoff point — O(n log n) vs O(n²) char-by-char
-  let lo = 0,
-    hi = s.length;
-  while (lo < hi) {
-    const mid = (lo + hi + 1) >>> 1;
-    if (Buffer.byteLength(s.slice(0, mid), "utf-8") <= maxBytes) lo = mid;
-    else hi = mid - 1;
+function accountStreamEvent(accounting: StreamAccounting, event: ParsedJsonEvent | undefined, lineBytes: number): number {
+  if (!event) return lineBytes;
+  const envelopeBytes = Math.min(lineBytes, 1024);
+  const message = event.streamMessage ?? event.message;
+  if (message) {
+    const bytes = jsonBytes(message);
+    const key = streamMessageKey(message);
+    const growth = key === accounting.messageKey ? Math.max(0, bytes - accounting.messageBytes) : bytes;
+    accounting.messageKey = key;
+    accounting.messageBytes = bytes;
+    return envelopeBytes + growth;
   }
-  return `${s.slice(0, lo)}\n[truncated — ${Buffer.byteLength(s, "utf-8")} bytes total]`;
+  if (event.messages) {
+    let bytes = envelopeBytes;
+    for (const item of event.messages) {
+      const itemBytes = jsonBytes(item);
+      const key = streamMessageKey(item);
+      bytes += key === accounting.messageKey ? Math.max(0, itemBytes - accounting.messageBytes) : itemBytes;
+      accounting.messageKey = key;
+      accounting.messageBytes = itemBytes;
+    }
+    return bytes;
+  }
+  return lineBytes;
 }
 
-/** Find newest session JSONL file by modification time. */
-function findSessionFile(sessionDir: string): string | undefined {
+function descendantPids(pid: number): number[] {
+  if (process.platform === "win32") return [];
+  const snapshot = spawnSync("ps", ["-eo", "pid=,ppid="], { encoding: "utf8", timeout: 1000 });
+  if (snapshot.status !== 0 || typeof snapshot.stdout !== "string") return [];
+  const children = new Map<number, number[]>();
+  for (const line of snapshot.stdout.split("\n")) {
+    const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+    if (!match) continue;
+    const childPid = Number(match[1]);
+    const parentPid = Number(match[2]);
+    if (!Number.isSafeInteger(childPid) || !Number.isSafeInteger(parentPid)) continue;
+    const siblings = children.get(parentPid) ?? [];
+    siblings.push(childPid);
+    children.set(parentPid, siblings);
+  }
+  const result: number[] = [];
+  const visit = (parentPid: number) => {
+    for (const childPid of children.get(parentPid) ?? []) {
+      visit(childPid);
+      result.push(childPid);
+    }
+  };
+  visit(pid);
+  return result;
+}
+
+/**
+ * Terminate a child and its descendants without killing an ancestor group.
+ *
+ * Keep the first descendant snapshot until the SIGKILL escalation. A nested
+ * leader can exit after SIGTERM while its descendants become reparented, so a
+ * later `ps` snapshot rooted at the leader would otherwise miss them.
+ */
+const terminatedProcessDescendants = new WeakMap<ChildProcess, Set<number>>();
+
+function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (process.platform !== "win32" && child.pid) {
+    const tracked = terminatedProcessDescendants.get(child) ?? new Set<number>();
+    for (const pid of descendantPids(child.pid)) tracked.add(pid);
+    if (signal === "SIGTERM") terminatedProcessDescendants.set(child, tracked);
+    for (const pid of tracked) {
+      try {
+        process.kill(pid, signal);
+      } catch {
+        // The process may have exited between the snapshot and the signal.
+      }
+    }
+    if (signal === "SIGKILL") terminatedProcessDescendants.delete(child);
+  }
+  terminateProcessGroup(child, signal);
+}
+
+function terminateProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (process.platform === "win32") {
+    if (child.pid) {
+      // `ChildProcess.kill()` does not include descendants on Windows.
+      const tree = spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore" });
+      tree.on("error", () => {});
+      tree.unref();
+    }
+    return;
+  }
   try {
-    const files = fs
-      .readdirSync(sessionDir)
-      .filter((f) => f.endsWith(".jsonl"))
-      .map((f) => ({ name: f, mtime: fs.statSync(path.join(sessionDir, f)).mtimeMs }))
-      .sort((a, b) => b.mtime - a.mtime);
-    return files.length ? path.join(sessionDir, files[0]!.name) : undefined;
+    if (child.pid) {
+      process.kill(-child.pid, signal);
+      return;
+    }
+  } catch {
+    // Fall through to the direct child. The process may have exited already.
+  }
+  try {
+    child.kill(signal);
+  } catch {
+    // The close event will produce the final result.
+  }
+}
+
+/** Sweep only the detached root group after its leader exits. */
+function sweepRootProcessGroup(child: ChildProcess): void {
+  if (!child.pid) return;
+  if (process.platform === "win32") {
+    terminateProcessGroup(child, "SIGTERM");
+    return;
+  }
+  try {
+    process.kill(-child.pid, "SIGTERM");
+  } catch {
+    // No surviving group; importantly, do not signal a potentially reused
+    // direct-child PID after the leader has already exited.
+    return;
+  }
+  setTimeout(() => {
+    try {
+      process.kill(-child.pid!, 0);
+      process.kill(-child.pid!, "SIGKILL");
+    } catch {
+      // The group exited during the grace period.
+    }
+  }, 5000);
+  // Keep the host alive through the grace period so an unresponsive
+  // descendant cannot outlive the delegation merely because the parent exits.
+}
+
+function addAssistantUsage(usage: UsageSummary, message: Message): void {
+  if (message.role !== "assistant") return;
+  usage.turns++;
+  if (message.usage) addUsage(usage, message.usage);
+}
+
+function recordMessage(result: AgentResult, message: Message): void {
+  result.messages.push(boundMessage(message));
+  if (result.messages.length > MAX_MESSAGES_PER_AGENT) result.messages.shift();
+  addAssistantUsage(result.usage, message);
+  if (message.role !== "assistant") return;
+  const output = textFromMessage(message);
+  if (output) result.output = truncateOutput(output, MAX_OUTPUT_BYTES);
+  if (typeof message.model === "string" && message.model) result.model = truncateOutput(message.model, 256);
+  if (message.stopReason === "stop" || message.stopReason === "length" || message.stopReason === "toolUse" || message.stopReason === "error" || message.stopReason === "aborted") {
+    result.stopReason = message.stopReason;
+  }
+  if (typeof message.errorMessage === "string" && message.errorMessage) result.errorMessage = boundedDiagnostic(message.errorMessage);
+}
+
+async function runPiProcess(
+  args: string[],
+  cwd: string,
+  depth: number,
+  control: ControlContext,
+  parentRunId: string,
+  childRunId: string,
+  reservation: ChildReservation,
+  signal: AbortSignal | undefined,
+  onEvent: (event: ParsedJsonEvent) => void,
+): Promise<ProcessResult> {
+  if (signal?.aborted) return { exitCode: 1, stopReason: "aborted", errorMessage: "Subagent aborted.", stderr: "" };
+  const timeoutMs = processTimeoutMs(control.deadlineMs);
+  if (control.deadlineMs <= Date.now()) return { exitCode: 1, stopReason: "error", errorMessage: "Root subagent deadline reached.", stderr: "" };
+
+  const invocation = getPiInvocation(args);
+  return new Promise((resolve) => {
+    let settled = false;
+    let aborted = false;
+    let outputLimitExceeded = false;
+    let outputLimitMessage = `Subagent logical output exceeded ${MAX_STREAM_BYTES} bytes.`;
+    let rawStreamBytes = 0;
+    const streamAccounting: StreamAccounting = { messageBytes: 0, logicalBytes: 0 };
+    let stderr = "";
+    let trailing = "";
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    let processTimer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    let eventError: string | undefined;
+    const decoder = new StringDecoder("utf8");
+    let abortHandler: (() => void) | undefined;
+
+    const finish = (result: ProcessResult) => {
+      if (settled) return;
+      // A nested leader can close before the escalation timer fires while a
+      // descendant ignores SIGTERM and does not hold an inherited pipe open.
+      // Force the retained tree snapshot before dropping the timer.
+      if (aborted || timedOut || outputLimitExceeded || eventError) {
+        terminateProcessTree(child, "SIGKILL");
+      }
+      settled = true;
+      if (killTimer) clearTimeout(killTimer);
+      if (processTimer) clearTimeout(processTimer);
+      if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
+      resolve({ ...result, stderr: truncateOutput(stderr) });
+    };
+
+    let child: ChildProcess;
+    try {
+      child = spawn(invocation.command, invocation.args, {
+        cwd,
+        env: childEnvironment(depth + 1, control, parentRunId, childRunId, reservation.budgetRemaining, cwd),
+        shell: false,
+        // Keep nested children in the root child's process group. The root
+        // child is detached from the host; descendants then die with that
+        // group instead of becoming independent orphaned model callers.
+        detached: depth === 0,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      activeChildren.add(child);
+      let rootGroupSwept = false;
+      const sweepRoot = () => {
+        if (depth !== 0 || rootGroupSwept) return;
+        rootGroupSwept = true;
+        sweepRootProcessGroup(child);
+      };
+      // `close` waits for stdio streams; a descendant can keep an inherited
+      // pipe open after the leader exits. Sweep on `exit` first so that child
+      // cannot defer cleanup until the hard timeout.
+      child.once("exit", sweepRoot);
+      child.once("close", sweepRoot);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      finish({ exitCode: 1, stopReason: "error", errorMessage: message, stderr });
+      return;
+    }
+
+    const stopForAbort = () => {
+      if (settled) return;
+      aborted = true;
+      terminateProcessTree(child, "SIGTERM");
+      killTimer = setTimeout(() => {
+        if (!settled) terminateProcessTree(child, "SIGKILL");
+      }, 5000);
+    };
+    const stopForTimeout = () => {
+      if (settled) return;
+      timedOut = true;
+      terminateProcessTree(child, "SIGTERM");
+      killTimer = setTimeout(() => {
+        if (!settled) terminateProcessTree(child, "SIGKILL");
+      }, 5000);
+    };
+    processTimer = setTimeout(stopForTimeout, timeoutMs);
+    const deliverEvent = (event: ParsedJsonEvent) => {
+      if (settled || eventError) return;
+      try {
+        onEvent(event);
+      } catch (error) {
+        eventError = error instanceof Error ? error.message : String(error);
+        terminateProcessTree(child, "SIGTERM");
+        killTimer = setTimeout(() => {
+          if (!settled) terminateProcessTree(child, "SIGKILL");
+        }, 5000);
+      }
+    };
+    const stopForOutputLimit = (message: string) => {
+      if (outputLimitExceeded) return;
+      outputLimitExceeded = true;
+      outputLimitMessage = message;
+      terminateProcessTree(child, "SIGTERM");
+      killTimer = setTimeout(() => {
+        if (!settled) terminateProcessTree(child, "SIGKILL");
+      }, 5000);
+    };
+    abortHandler = stopForAbort;
+    if (signal) signal.addEventListener("abort", abortHandler, { once: true });
+
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      if (outputLimitExceeded) return;
+      rawStreamBytes += typeof chunk === "string" ? Buffer.byteLength(chunk, "utf8") : chunk.byteLength;
+      if (rawStreamBytes > MAX_RAW_STREAM_BYTES) {
+        stopForOutputLimit(`Subagent raw stream exceeded ${MAX_RAW_STREAM_BYTES} bytes.`);
+        return;
+      }
+      trailing += decoder.write(chunk);
+      const lines = trailing.split("\n");
+      trailing = lines.pop() ?? "";
+      if (Buffer.byteLength(trailing, "utf8") > MAX_STREAM_BYTES) {
+        stopForOutputLimit(`Subagent logical output exceeded ${MAX_STREAM_BYTES} bytes.`);
+        return;
+      }
+      for (const line of lines) {
+        const event = parseJsonEventLine(line);
+        streamAccounting.logicalBytes += accountStreamEvent(streamAccounting, event, Buffer.byteLength(line, "utf8"));
+        if (streamAccounting.logicalBytes > MAX_STREAM_BYTES) {
+          stopForOutputLimit(`Subagent logical output exceeded ${MAX_STREAM_BYTES} bytes.`);
+          return;
+        }
+        if (event) deliverEvent(event);
+      }
+    });
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      stderr = capStderr(stderr, typeof chunk === "string" ? chunk : chunk.toString("utf8"));
+    });
+    child.on("error", (error) => {
+      activeChildren.delete(child);
+      const message = error instanceof Error ? error.message : String(error);
+      if (eventError) {
+        finish({ exitCode: 1, stopReason: "error", errorMessage: `Subagent event handling failed: ${eventError}`, stderr });
+      } else if (timedOut) {
+        finish({ exitCode: 1, stopReason: "error", errorMessage: `Subagent timed out after ${timeoutMs} ms.`, stderr });
+      } else if (outputLimitExceeded) {
+        finish({ exitCode: 1, stopReason: "error", errorMessage: outputLimitMessage, stderr });
+      } else if (aborted) {
+        finish({ exitCode: 1, stopReason: "aborted", errorMessage: "Subagent aborted.", stderr });
+      } else {
+        finish({ exitCode: 1, stopReason: "error", errorMessage: message, stderr });
+      }
+    });
+    child.on("close", (code) => {
+      activeChildren.delete(child);
+      trailing += decoder.end();
+      if (trailing.trim()) {
+        const event = parseJsonEventLine(trailing);
+        streamAccounting.logicalBytes += accountStreamEvent(streamAccounting, event, Buffer.byteLength(trailing, "utf8"));
+        if (streamAccounting.logicalBytes > MAX_STREAM_BYTES) outputLimitMessage = `Subagent logical output exceeded ${MAX_STREAM_BYTES} bytes.`;
+        if (event && !outputLimitExceeded) deliverEvent(event);
+      }
+      if (eventError) {
+        finish({ exitCode: 1, stopReason: "error", errorMessage: `Subagent event handling failed: ${eventError}`, stderr });
+        return;
+      }
+      if (timedOut) {
+        finish({ exitCode: 1, stopReason: "error", errorMessage: `Subagent timed out after ${timeoutMs} ms.`, stderr });
+        return;
+      }
+      if (outputLimitExceeded) {
+        finish({ exitCode: 1, stopReason: "error", errorMessage: outputLimitMessage, stderr });
+        return;
+      }
+      if (aborted || signal?.aborted) {
+        finish({ exitCode: code ?? 1, stopReason: "aborted", errorMessage: "Subagent aborted.", stderr });
+        return;
+      }
+      const exitCode = code ?? 1;
+      finish({ exitCode, stderr, stopReason: exitCode === 0 ? undefined : "error", errorMessage: exitCode === 0 ? undefined : `Subagent exited with code ${exitCode}.` });
+    });
+
+    if (signal?.aborted) stopForAbort();
+  });
+}
+
+async function runAgent(
+  agents: AgentConfig[],
+  name: string,
+  task: string,
+  cwd: string,
+  execution: ExecutionContext,
+  parentModel: Model<any> | undefined,
+  modelOverride: string | undefined,
+  step: number | undefined,
+  signal: AbortSignal | undefined,
+  emit: (result: AgentResult, progress?: string) => void,
+): Promise<AgentResult> {
+  const agent = agents.find((candidate) => candidate.name === name);
+  if (!agent) {
+    return {
+      agent: name,
+      agentSource: "unknown",
+      task: truncateOutput(task, MAX_DIAGNOSTIC_BYTES),
+      runId: randomUUID(),
+      parentRunId: execution.runId,
+      rootRunId: execution.rootRunId,
+      depth: execution.depth + 1,
+      step,
+      exitCode: 1,
+      stopReason: "error",
+      errorMessage: truncateOutput(`Unknown agent: "${name}". Available agents: ${agents.map((item) => item.name).join(", ") || "none"}.`, MAX_DIAGNOSTIC_BYTES),
+      stderr: "",
+      messages: [],
+      usage: emptyUsage(),
+    };
+  }
+
+  const result: AgentResult = {
+    agent: name,
+    agentSource: agent.source,
+    task: truncateOutput(task, MAX_DIAGNOSTIC_BYTES),
+    runId: randomUUID(),
+    parentRunId: execution.runId,
+    rootRunId: execution.rootRunId,
+    depth: execution.depth + 1,
+    step,
+    exitCode: -1,
+    stderr: "",
+    messages: [],
+    usage: emptyUsage(),
+    model: resolveModel(agent, modelOverride, parentModel),
+  };
+  let updateError: string | undefined;
+  let eventFailure: string | undefined;
+  const report = (progress: string, propagate = true) => {
+    try {
+      emit(result, progress);
+    } catch (error) {
+      updateError = error instanceof Error ? error.message : String(error);
+      if (propagate) throw error;
+    }
+  };
+
+  let tempDir: string | undefined;
+  let reservation: ChildReservation | undefined;
+  try {
+    report(`Starting ${name}...`);
+    const reservationResult = await reserveChild(execution.control, signal);
+    if (!reservationResult.reservation) {
+      result.exitCode = 1;
+      result.stopReason = signal?.aborted ? "aborted" : "error";
+      result.errorMessage = truncateOutput(reservationResult.reason ?? "Subagent child budget unavailable.", MAX_DIAGNOSTIC_BYTES);
+      report(result.errorMessage, false);
+      return result;
+    }
+    reservation = reservationResult.reservation;
+    const args = ["--mode", "json", "-p", "--no-session"];
+    if (result.model) args.push("--model", result.model);
+    const tools = effectiveTools(agent);
+    if (tools.length > 0) args.push("--tools", tools.join(","));
+    else args.push("--no-tools");
+    tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
+    if (agent.systemPrompt.trim()) {
+      const promptPath = path.join(tempDir, "system-prompt.md");
+      await fs.promises.writeFile(promptPath, agent.systemPrompt, { encoding: "utf8", mode: 0o600 });
+      args.push("--append-system-prompt", promptPath);
+    }
+    const taskPath = path.join(tempDir, "task.md");
+    await fs.promises.writeFile(taskPath, `Task:\n${task}`, { encoding: "utf8", mode: 0o600 });
+    args.push(`@${taskPath}`);
+
+    const processResult = await runPiProcess(args, cwd, execution.depth, execution.control, execution.runId, result.runId, reservation, signal, (event) => {
+      if (event.kind === "message" && event.message) {
+        recordMessage(result, event.message);
+        if (eventFailure) {
+          result.stopReason = "error";
+          result.errorMessage = eventFailure;
+        }
+        report(result.output || getFinalOutput(result.messages) || "Subagent is working...");
+      } else if (event.kind === "messages" && event.messages && result.messages.length === 0) {
+        for (const message of event.messages) recordMessage(result, message);
+        report(result.output || getFinalOutput(result.messages) || "Subagent finished...");
+      } else if (event.kind === "progress") {
+        report(event.text || "Subagent is working...");
+      } else if (event.kind === "error") {
+        eventFailure = truncateOutput(event.errorMessage || "Subagent process reported an error.", MAX_DIAGNOSTIC_BYTES);
+        result.stopReason = "error";
+        result.errorMessage = eventFailure;
+        report(eventFailure);
+      }
+    });
+
+    result.exitCode = processResult.exitCode;
+    result.stopReason = processResult.stopReason ?? result.stopReason ?? (processResult.exitCode === 0 ? "stop" : "error");
+    result.errorMessage = boundedDiagnostic(processResult.errorMessage ?? result.errorMessage);
+    result.stderr = truncateOutput(processResult.stderr, MAX_STDERR_BYTES);
+    if (eventFailure) {
+      result.exitCode = 1;
+      result.stopReason = "error";
+      result.errorMessage = eventFailure;
+    } else if (updateError) {
+      result.exitCode = 1;
+      result.stopReason = "error";
+      result.errorMessage = truncateOutput(`Subagent update failed: ${updateError}`, MAX_DIAGNOSTIC_BYTES);
+    } else if (result.exitCode === 0 && !result.output && !getFinalOutput(result.messages)) {
+      result.exitCode = 1;
+      result.stopReason = "error";
+      result.errorMessage = "Subagent produced no assistant output.";
+    }
+    if (result.stopReason === "error" && !result.errorMessage) result.errorMessage = "Subagent failed.";
+    report(result.output || getFinalOutput(result.messages) || result.errorMessage || "(no output)", false);
+    if (updateError && result.exitCode === 0) {
+      result.exitCode = 1;
+      result.stopReason = "error";
+      result.errorMessage = truncateOutput(`Subagent update failed: ${updateError}`, MAX_DIAGNOSTIC_BYTES);
+    }
+    return result;
+  } catch (error) {
+    result.exitCode = 1;
+    result.stopReason = signal?.aborted ? "aborted" : "error";
+    result.errorMessage = boundedDiagnostic(error instanceof Error ? error.message : String(error), MAX_DIAGNOSTIC_BYTES) ?? "Subagent failed.";
+    result.stderr = result.errorMessage;
+    report(result.errorMessage, false);
+    return result;
+  } finally {
+    if (tempDir) {
+      try {
+        await fs.promises.rm(tempDir, { recursive: true, force: true });
+      } catch {
+        // Best-effort cleanup; the prompt contains no secrets beyond the agent definition.
+      }
+    }
+    if (reservation) await releaseChild(execution.control);
+  }
+}
+
+function failed(result: AgentResult): boolean {
+  // -1 is the live placeholder used by parallel progress updates.
+  return result.exitCode !== -1 && (result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted");
+}
+
+function isRenderableUsage(value: unknown): value is UsageSummary {
+  if (!value || typeof value !== "object") return false;
+  const usage = value as Record<string, unknown>;
+  const cost = usage.cost;
+  return ["input", "output", "cacheRead", "cacheWrite", "totalTokens", "turns"].every((key) => isFiniteNumber(usage[key]))
+    && !!cost && typeof cost === "object"
+    && ["input", "output", "cacheRead", "cacheWrite", "total"].every((key) => isFiniteNumber((cost as Record<string, unknown>)[key]));
+}
+
+function isRenderableAgentResult(value: unknown): value is AgentResult {
+  if (!value || typeof value !== "object") return false;
+  const result = value as Partial<AgentResult>;
+  return typeof result.agent === "string"
+    && typeof result.agentSource === "string"
+    && typeof result.task === "string"
+    && (result.output === undefined || typeof result.output === "string")
+    && typeof result.runId === "string"
+    && typeof result.rootRunId === "string"
+    && isFiniteNumber(result.depth)
+    && isFiniteNumber(result.exitCode)
+    && typeof result.stderr === "string"
+    && Array.isArray(result.messages)
+    && isRenderableUsage(result.usage);
+}
+
+function resultText(result: AgentResult): string {
+  if (failed(result)) return result.errorMessage || result.stderr || result.output || getFinalOutput(result.messages) || "(no output)";
+  return result.output || getFinalOutput(result.messages) || "(no output)";
+}
+
+function copyResult(result: AgentResult): AgentResult {
+  return { ...result, messages: [...result.messages], usage: { ...result.usage, cost: { ...result.usage.cost } } };
+}
+
+async function mapWithConcurrency<T>(items: T[], fn: (item: T, index: number) => Promise<AgentResult>): Promise<AgentResult[]> {
+  const results: AgentResult[] = Array.from({ length: items.length });
+  let next = 0;
+  const worker = async () => {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await fn(items[index]!, index);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(MAX_CONCURRENCY, items.length) }, worker));
+  return results;
+}
+
+function formatTokens(value: number): string {
+  if (value < 1000) return String(value);
+  if (value < 10000) return `${(value / 1000).toFixed(1)}k`;
+  if (value < 1_000_000) return `${Math.round(value / 1000)}k`;
+  return `${(value / 1_000_000).toFixed(1)}M`;
+}
+
+function formatUsage(usage: UsageSummary, model?: string): string {
+  const parts = [`${usage.turns} turn${usage.turns === 1 ? "" : "s"}`];
+  if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
+  if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
+  if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
+  if (usage.cacheWrite) parts.push(`W${formatTokens(usage.cacheWrite)}`);
+  if (usage.cost.total) parts.push(`$${usage.cost.total.toFixed(4)}`);
+  if (model) parts.push(stripTerminalControls(model));
+  return parts.join(" ");
+}
+
+function aggregateUsage(results: AgentResult[]): UsageSummary {
+  const total = emptyUsage();
+  for (const result of results) {
+    total.turns += result.usage.turns;
+    addUsage(total, result.usage);
+  }
+  return total;
+}
+
+class SubagentExecutionError extends Error {
+  constructor(message: string, readonly details: SubagentDetails) {
+    super(message);
+    this.name = "SubagentExecutionError";
+  }
+}
+
+function toolResult(text: string, details: SubagentDetails, isError = false): AgentToolResult<SubagentDetails> {
+  const boundedText = truncateOutput(text, MAX_OUTPUT_BYTES);
+  const bounded = boundDetails(details);
+  // pi-agent-core intentionally turns thrown tool errors into its normal error
+  // result and does not preserve custom Error fields. Keep throwing for that
+  // semantic, but do not claim these details survive that boundary.
+  if (isError) throw new SubagentExecutionError(boundedText, bounded);
+  return { content: [{ type: "text", text: boundedText }], details: bounded };
+}
+
+const TaskItem = Type.Object({
+  agent: Type.String({ description: "Name of the agent to invoke", minLength: 1, maxLength: 256 }),
+  task: Type.String({ description: "Task to delegate", minLength: 1, maxLength: MAX_TASK_BYTES }),
+  model: Type.Optional(Type.String({ description: "Optional model override for this task" })),
+  cwd: Type.Optional(Type.String({ description: "Working directory for this task" })),
+}, { additionalProperties: false });
+
+const ChainItem = Type.Object({
+  agent: Type.String({ description: "Name of the agent to invoke", minLength: 1, maxLength: 256 }),
+  task: Type.String({ description: "Task, with optional {previous} for the preceding output", minLength: 1, maxLength: MAX_TASK_BYTES }),
+  model: Type.Optional(Type.String({ description: "Optional model override for this step" })),
+  cwd: Type.Optional(Type.String({ description: "Working directory for this step" })),
+}, { additionalProperties: false });
+
+const SubagentParamsSchema = Type.Object({
+  action: Type.Optional(StringEnum(["list"] as const, { description: "List available agents" })),
+  agent: Type.Optional(Type.String({ description: "Agent name for single mode", minLength: 1, maxLength: 256 })),
+  task: Type.Optional(Type.String({ description: "Task for single mode", minLength: 1, maxLength: MAX_TASK_BYTES })),
+  tasks: Type.Optional(Type.Array(TaskItem, { description: "Parallel tasks (maximum 8)", maxItems: MAX_PARALLEL_TASKS })),
+  chain: Type.Optional(Type.Array(ChainItem, { description: "Sequential steps using {previous}", maxItems: MAX_CHAIN_STEPS })),
+  agentScope: Type.Optional(StringEnum(["user", "project", "both"] as const, { description: "Agent scope; bundled agents are always included" })),
+  model: Type.Optional(Type.String({ description: "Model override, provider/model-id; applies to every mode" })),
+  cwd: Type.Optional(Type.String({ description: "Working directory for the delegation" })),
+}, { additionalProperties: false });
+
+function requestedAgentNames(params: SubagentParams): string[] {
+  const names = new Set<string>();
+  if (params.agent) names.add(params.agent.trim());
+  for (const task of params.tasks ?? []) names.add(task.agent.trim());
+  for (const step of params.chain ?? []) names.add(step.agent.trim());
+  return [...names];
+}
+
+function modeOf(params: SubagentParams): SubagentDetails["mode"] {
+  if (params.chain !== undefined) return "chain";
+  if (params.tasks !== undefined) return "parallel";
+  return "single";
+}
+
+function validSingle(params: SubagentParams): boolean {
+  return typeof params.agent === "string" && params.agent.trim().length > 0 && typeof params.task === "string" && params.task.trim().length > 0;
+}
+
+function hasValidItems(params: SubagentParams): boolean {
+  return (params.tasks ?? []).every((item) => item.agent.trim().length > 0 && item.task.trim().length > 0)
+    && (params.chain ?? []).every((item) => item.agent.trim().length > 0 && item.task.trim().length > 0);
+}
+
+function hasBlankModel(params: SubagentParams): boolean {
+  return [
+    params.model,
+    ...(params.tasks ?? []).map((item) => item.model),
+    ...(params.chain ?? []).map((item) => item.model),
+  ].some((model) => model !== undefined && model.trim().length === 0);
+}
+
+function availableText(agents: AgentConfig[]): string {
+  return truncateOutput(agents.map((agent) => `${agent.name} (${agent.source})`).join(", ") || "none", MAX_DIAGNOSTIC_BYTES);
+}
+
+function requestedProjectAgents(names: string[], agents: AgentConfig[]): AgentConfig[] {
+  return names.map((name) => agents.find((agent) => agent.name === name)).filter((agent): agent is AgentConfig => agent?.source === "project");
+}
+
+async function confirmProjectAgents(
+  ctx: ExtensionContext,
+  names: string[],
+  agents: AgentConfig[],
+  projectAgentsDir: string | null,
+  trustedProjectRoot: string,
+  projectRoot: string,
+  signal?: AbortSignal,
+): Promise<{ allowed: boolean; reason?: string }> {
+  const projectAgents = requestedProjectAgents(names, agents);
+  if (projectAgents.length === 0) return { allowed: true };
+
+  // A UI confirmation is not available in print/RPC mode. Requiring both pi's
+  // project-trust decision and this explicit confirmation prevents a model from
+  // opting into a repository-controlled prompt without a user-approved boundary.
+  if (projectRoot !== trustedProjectRoot) {
+    return { allowed: false, reason: "Project agents must belong to the trusted project cwd." };
+  }
+  if (typeof ctx.isProjectTrusted === "function" && !ctx.isProjectTrusted()) {
+    return { allowed: false, reason: "The current project is not trusted by pi." };
+  }
+  if (!ctx.hasUI || typeof ctx.ui?.confirm !== "function") {
+    return { allowed: false, reason: "Project agents require an interactive confirmation; headless delegation cannot run repository-controlled prompts." };
+  }
+  const allowed = await ctx.ui.confirm(
+    "Use project-local agents?",
+    `Agents: ${truncateOutput(projectAgents.map((agent) => agent.name).join(", "), MAX_DIAGNOSTIC_BYTES)}\nSource: ${projectAgentsDir ?? "unknown"}\n\nProject agents are repository-controlled prompts. Only continue for trusted repositories.`,
+    { signal },
+  );
+  return allowed ? { allowed: true } : { allowed: false, reason: "Project-local agents were not approved." };
+}
+
+function cwdFor(base: string, value: string | undefined): string {
+  return path.resolve(base, value ?? ".");
+}
+
+function existingDirectory(directory: string): string | undefined {
+  try {
+    if (!fs.statSync(directory).isDirectory()) return undefined;
+    return fs.realpathSync.native(directory);
   } catch {
     return undefined;
   }
 }
 
-function parseSessionFile(sessionPath: string): {
-  output: string;
-  cost: number;
-  stopReason?: string;
-} {
-  let output = "",
-    cost = 0,
-    stopReason: string | undefined;
-  try {
-    const content = fs.readFileSync(sessionPath, "utf-8");
-    for (const line of content.split("\n")) {
-      if (!line.trim()) continue;
-      let ev: any;
-      try {
-        ev = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (ev.type === "message_end" && ev.message?.role === "assistant") {
-        const texts: string[] = [];
-        for (const p of ev.message.content ?? []) {
-          if (p.type === "text") texts.push(p.text);
-        }
-        if (texts.length) output = texts.join("\n");
-        cost += ev.message.usage?.cost?.total ?? 0;
-        if (ev.message.stopReason) stopReason = ev.message.stopReason;
-      } else if (ev.type === "message" && ev.message?.role === "assistant") {
-        const texts: string[] = [];
-        for (const p of ev.message.content ?? []) {
-          if (p.type === "text") texts.push(p.text);
-        }
-        if (texts.length) output = texts.join("\n");
-        cost += ev.message.usage?.cost?.total ?? 0;
-        if (ev.message.stopReason) stopReason = ev.message.stopReason;
-      }
-    }
-  } catch {}
-  return { output, cost, stopReason };
+function isWithinDirectory(root: string, directory: string): boolean {
+  const relative = path.relative(root, directory);
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
 }
 
-function readSessionOutput(sessionDir: string): {
-  output: string;
-  cost: number;
-  stopReason?: string;
-} {
-  const file = findSessionFile(sessionDir);
-  return file ? parseSessionFile(file) : { output: "", cost: 0 };
-}
-
-/** Strip non-serializable proc before returning RunRecord to pi (structured clone can't handle functions). */
-function safeRecord(r: RunRecord): Omit<RunRecord, "proc"> {
-  const { proc: _, ...rest } = r;
-  return rest;
-}
-
-function fmtRunStatus(r: RunRecord): string {
-  const elapsed = Date.now() - r.startedAt;
-  const ms = elapsed < 1000 ? `${elapsed}ms` : `${(elapsed / 1000).toFixed(1)}s`;
-  const cost = r.result?.cost;
-  const costStr = cost ? ` $${cost.toFixed(4)}` : "";
-  return `${r.agent} [${r.status}] (${ms}${costStr}) id:${r.id}`;
-}
-
-function findRun(id: string): RunRecord | { ambiguous: string[] } | undefined {
-  const exact = runs.get(id);
-  if (exact) return exact;
-  const matches = Array.from(runs.values()).filter((r) => r.id.startsWith(id));
-  if (matches.length === 0) return undefined;
-  if (matches.length === 1) return matches[0]!;
-  return { ambiguous: matches.map((r) => r.id) };
-}
-
-/** Kill a process group (not just the direct child). */
-function killProc(proc: ReturnType<typeof spawn>, signal: NodeJS.Signals): void {
-  try {
-    if (proc.pid && typeof proc.pid === "number") {
-      // Kill the process group (negative pid)
-      process.kill(-proc.pid, signal);
-    }
-  } catch {
-    try {
-      proc.kill(signal);
-    } catch {}
-  }
-}
-
-// ── Agent Discovery ─────────────────────────────────────────────────────────
-
-function parseFrontmatter(content: string): { meta: Record<string, string>; body: string } {
-  const s = content.replace(/\r\n/g, "\n");
-  if (!s.startsWith("---")) return { meta: {}, body: s };
-  const end = s.indexOf("\n---", 3);
-  if (end === -1) return { meta: {}, body: s };
-  const meta: Record<string, string> = {};
-  for (const line of s.slice(4, end).split("\n")) {
-    const m = line.match(/^([\w-]+):\s*(.*)$/);
-    if (m) {
-      let v = m[2]!.trim();
-      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")))
-        v = v.slice(1, -1);
-      meta[m[1]!] = v;
-    }
-  }
-  return { meta, body: s.slice(end + 4).trim() };
-}
-
-function loadAgents(dir: string, source: "bundled" | "user" | "project"): AgentConfig[] {
-  if (!fs.existsSync(dir)) return [];
-  const agents: AgentConfig[] = [];
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (!e.name.endsWith(".md") || !e.isFile()) continue;
-    const fp = path.join(dir, e.name);
-    let raw: string;
-    try {
-      raw = fs.readFileSync(fp, "utf-8");
-    } catch {
-      continue;
-    }
-    const { meta, body } = parseFrontmatter(raw);
-    if (!meta.name || !meta.description) continue;
-    const tools = meta.tools
-      ?.split(",")
-      .map((t) => t.trim())
-      .filter(Boolean);
-    const execution = meta.execution as "inline" | "subprocess" | undefined;
-    const model = meta.model || undefined;
-    // Validate model format at load time (warn, don't reject — models may be added later)
-    if (model) {
-      const [provider, ...rest] = model.split("/");
-      const modelId = rest.join("/");
-      if (!provider || !modelId) {
-        console.warn(`[pi-subagents] Agent "${meta.name}": invalid model format "${model}". Expected "provider/model-id" (e.g. "openrouter/anthropic/fable-5").`);
-      }
-    }
-    agents.push({
-      name: meta.name,
-      description: meta.description,
-      model,
-      execution: execution === "subprocess" ? "subprocess" : undefined, // default inline, only store if subprocess
-      tools: tools?.length ? tools : undefined,
-      systemPrompt: body,
-      source,
-    });
-  }
-  return agents;
-}
-
-function isProjectRoot(dir: string): boolean {
-  return (
-    fs.existsSync(path.join(dir, ".git")) ||
-    fs.existsSync(path.join(dir, "package.json")) ||
-    fs.existsSync(path.join(dir, "Cargo.toml")) ||
-    fs.existsSync(path.join(dir, "go.mod"))
-  );
-}
-
-function discoverAgents(cwd: string): AgentConfig[] {
-  const map = new Map<string, AgentConfig>();
-  // 1. Bundled agents (lowest priority) — ships with the extension
-  const extensionDir = import.meta.dir ?? (typeof __dirname !== "undefined" ? __dirname : undefined);
-  if (!extensionDir) return [];
-  let bundledDir: string;
-  try {
-    bundledDir = path.resolve(extensionDir, "..", "..", "agents");
-  } catch {
-    return [];
-  }
-  for (const a of loadAgents(bundledDir, "bundled")) map.set(a.name, a);
-  // 2. User-level agents (override bundled)
-  for (const a of loadAgents(path.join(os.homedir(), ".pi", "agents"), "user")) map.set(a.name, a);
-  // 3. Project-level agents (highest priority)
-  let dir = cwd;
-  const home = os.homedir();
-  while (true) {
-    // Check both .pi/agents/ and agents/ at each level
-    const piAgents = path.join(dir, ".pi", "agents");
-    const agents = path.join(dir, "agents");
-    let found = false;
-    if (fs.existsSync(piAgents)) {
-      for (const a of loadAgents(piAgents, "project")) map.set(a.name, a);
-      found = true;
-    }
-    if (fs.existsSync(agents)) {
-      for (const a of loadAgents(agents, "project")) map.set(a.name, a);
-      found = true;
-    }
-    if (found) break;
-    // Stop at project root or home directory to avoid walking to /
-    if (isProjectRoot(dir) || dir === home) break;
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return Array.from(map.values());
-}
-
-/** Find the .md file path for an agent by name. Walks up from cwd (like discoverAgents) then checks user global. */
-function findAgentFile(cwd: string, name: string): string | undefined {
-  // Walk up from cwd checking .pi/agents/ and agents/ at each level
-  let dir = cwd;
-  const home = os.homedir();
-  while (true) {
-    const piPath = path.join(dir, ".pi", "agents", `${name}.md`);
-    if (fs.existsSync(piPath)) return piPath;
-    const agentsPath = path.join(dir, "agents", `${name}.md`);
-    if (fs.existsSync(agentsPath)) return agentsPath;
-    if (isProjectRoot(dir) || dir === home) break;
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  // Check user global
-  const userPath = path.join(home, ".pi", "agents", `${name}.md`);
-  if (fs.existsSync(userPath)) return userPath;
-  return undefined;
-}
-
-// ── Subprocess Runner ───────────────────────────────────────────────────────
-
-function getPiCmd(): { cmd: string; baseArgs: string[] } {
-  const script = process.argv[1];
-  if (script && !script.startsWith("/$bunfs/root/") && fs.existsSync(script)) {
-    return { cmd: process.execPath, baseArgs: [script] };
-  }
-  const exec = path.basename(process.execPath).toLowerCase();
-  if (/^(node|bun)(\.exe)?$/.test(exec)) return { cmd: "pi", baseArgs: [] };
-  return { cmd: process.execPath, baseArgs: [] };
-}
-
-function resolveModel(agent: AgentConfig, overrideModel?: string, parentModel?: Model<any>): string | undefined {
-  return overrideModel ?? agent.model ?? (parentModel ? `${parentModel.provider}/${parentModel.id}` : undefined);
-}
-
-/** Resolve model string to a Model object via the registry. */
-function findModel(modelStr: string | undefined, ctx?: ExtensionContext): Model<any> | undefined {
-  if (!modelStr || !ctx?.modelRegistry) return undefined;
-  const [provider, ...rest] = modelStr.split("/");
-  const modelId = rest.join("/");
-  if (!provider || !modelId) return undefined;
-  return ctx.modelRegistry.find(provider, modelId) as Model<any> | undefined;
-}
-
-function buildArgs(
-  agent: AgentConfig,
-  task: string,
-  sessionDir: string,
-  overrideModel?: string,
-  opts?: { context?: "fresh" | "fork"; parentSessionFile?: string },
-  parentModel?: Model<any>,
-): { args: string[]; tmpFile?: string; cmd: string; baseArgs: string[] } {
-  const { cmd, baseArgs } = getPiCmd();
-  const args = [...baseArgs, "--mode", "json", "-p"];
-  // Context mode: fork inherits parent session, fresh starts clean
-  if (opts?.context === "fork" && opts.parentSessionFile) {
-    args.push("--fork", opts.parentSessionFile);
-  } else {
-    args.push("--session-dir", sessionDir);
-  }
-  const model = resolveModel(agent, overrideModel, parentModel);
-  if (model) args.push("--model", model);
-  if (agent.tools?.length) args.push("--tools", agent.tools.join(","));
-  let tmpFile: string | undefined;
-  if (agent.systemPrompt.trim()) {
-    tmpFile = path.join(sessionDir, "system-prompt.md");
-    fs.writeFileSync(tmpFile, agent.systemPrompt, { mode: 0o600 });
-    args.push("--append-system-prompt", tmpFile);
-  }
-  args.push(`Task: ${task}`);
-  return { args, tmpFile, cmd, baseArgs };
-}
-
-/** Shared spawn + parse logic for foreground runs. */
-function spawnAndParse(
-  cmd: string,
-  args: string[],
-  opts: {
-    cwd: string;
-    env: NodeJS.ProcessEnv;
-    signal?: AbortSignal;
-    parseStdout?: boolean;
-    onMessage?: (msg: AgentMessage) => void;
-  },
-): Promise<{
-  exitCode: number;
-  output: string;
-  stderr: string;
-  cost: number;
-  messages: AgentMessage[];
-  turns: number;
-  model?: string;
-  stopReason?: string;
-}> {
-  const { cwd, env, signal, parseStdout = true, onMessage } = opts;
+function waitForChild(child: ChildProcess): Promise<void> {
   return new Promise((resolve) => {
-    let output = "",
-      stderr = "",
-      cost = 0,
-      turns = 0,
-      model: string | undefined,
-      stopReason: string | undefined;
-    const messages: AgentMessage[] = [];
-    let closed = false;
-    let killTimeout: ReturnType<typeof setTimeout> | undefined;
-    let lastActivity = Date.now();
-    let inactivityTimer: ReturnType<typeof setInterval> | undefined;
-    const stdio: ["ignore", "pipe" | "ignore", "pipe"] = parseStdout
-      ? ["ignore", "pipe", "pipe"]
-      : ["ignore", "ignore", "pipe"];
-    const proc = spawn(cmd, args, { cwd, shell: false, stdio, env });
-
-    // Inactivity watchdog — kill if no stdout/stderr for INACTIVITY_TIMEOUT_MS
-    const resetActivity = () => { lastActivity = Date.now(); };
-    inactivityTimer = setInterval(() => {
-      if (closed) return;
-      if (Date.now() - lastActivity > INACTIVITY_TIMEOUT_MS) {
-        stderr += `\n[pi-subagents] Killed: no activity for ${INACTIVITY_TIMEOUT_MS / 1000}s`;
-        killProc(proc, "SIGTERM");
-        killTimeout = setTimeout(() => {
-          if (!closed) killProc(proc, "SIGKILL");
-        }, 5000);
-      }
-    }, Math.min(INACTIVITY_TIMEOUT_MS / 2, 15_000));
-
-    let buf = "";
-    const processLine = (line: string) => {
-      if (!line.trim()) return;
-      let ev: any;
-      try {
-        ev = JSON.parse(line);
-      } catch {
-        return;
-      }
-
-      // Capture tool calls from tool_use events (sub-agent invocations, file ops, etc.)
-      if (ev.type === "tool_use" || ev.type === "tool_use_start") {
-        const toolName = ev.name ?? ev.tool?.name ?? "unknown";
-        const toolArgs = ev.input ?? ev.args ?? {};
-        const msg: AgentMessage = {
-          role: "assistant",
-          toolCalls: [{ name: toolName, args: toolArgs }],
-        };
-        messages.push(msg);
-        onMessage?.(msg);
-      }
-
-      // Capture tool results for visibility
-      if (ev.type === "tool_result_end" || ev.type === "tool_result") {
-        const toolName = ev.name ?? "tool";
-        let toolOutput = "";
-        if (typeof ev.result === "string") toolOutput = ev.result;
-        else if (ev.result?.text) toolOutput = ev.result.text;
-        else if (ev.content?.text) toolOutput = ev.content.text;
-        const msg: AgentMessage = {
-          role: "tool",
-          toolResult: { name: toolName, output: truncate(toolOutput, 2048) },
-        };
-        messages.push(msg);
-        onMessage?.(msg);
-      }
-
-      // Capture assistant messages (final text + usage)
-      if (ev.type === "message_end" && ev.message?.role === "assistant") {
-        turns++;
-        const texts: string[] = [];
-        for (const p of ev.message.content ?? []) {
-          if (p.type === "text" && p.text) texts.push(p.text);
-          if (p.type === "toolCall") {
-            const toolName = p.name ?? "tool";
-            const toolArgs = p.arguments ?? p.input ?? {};
-            messages.push({ role: "assistant", toolCalls: [{ name: toolName, args: toolArgs }] });
-          }
-        }
-        if (texts.length) output = texts.join("\n");
-        const u = ev.message.usage;
-        const usage = u
-          ? {
-              input: u.input ?? 0,
-              output: u.output ?? 0,
-              cacheRead: u.cacheRead ?? 0,
-              cacheWrite: u.cacheWrite ?? 0,
-              cost: u.cost?.total ?? 0,
-            }
-          : undefined;
-        if (usage) cost += usage.cost;
-        if (ev.message.model) model = ev.message.model;
-        if (ev.message.stopReason) stopReason = ev.message.stopReason;
-        const msg: AgentMessage = {
-          role: "assistant",
-          text: output,
-          usage,
-          model: ev.message.model,
-          stopReason: ev.message.stopReason,
-        };
-        messages.push(msg);
-        onMessage?.(msg);
-      }
-
-      // Capture error messages
-      if (ev.type === "error") {
-        const msg: AgentMessage = {
-          role: "assistant",
-          errorMessage: ev.message ?? ev.error ?? "Unknown error",
-        };
-        messages.push(msg);
-        onMessage?.(msg);
-      }
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      child.removeListener("close", done);
+      child.removeListener("error", done);
+      resolve();
     };
-
-    if (parseStdout && proc.stdout) {
-      proc.stdout.on("data", (d) => {
-        resetActivity();
-        buf += d.toString();
-        const lines = buf.split("\n");
-        buf = lines.pop() ?? "";
-        for (const l of lines) processLine(l);
-      });
-    }
-    proc.stderr?.on("data", (d) => {
-      resetActivity();
-      if (Buffer.byteLength(stderr, "utf-8") < MAX_STDERR_BYTES) stderr += d.toString();
-    });
-    proc.on("close", (c) => {
-      closed = true;
-      if (inactivityTimer) clearInterval(inactivityTimer);
-      if (killTimeout) clearTimeout(killTimeout);
-      if (buf.trim()) processLine(buf);
-      resolve({ exitCode: c ?? 0, output, stderr, cost, messages, turns, model, stopReason });
-    });
-    proc.on("error", () => {
-      if (!closed) {
-        closed = true;
-        if (inactivityTimer) clearInterval(inactivityTimer);
-        resolve({ exitCode: 1, output, stderr, cost, messages, turns, model, stopReason });
-      }
-    });
-
-    if (signal) {
-      const kill = () => {
-        killProc(proc, "SIGTERM");
-        killTimeout = setTimeout(() => {
-          if (!closed) killProc(proc, "SIGKILL");
-        }, 5000);
-      };
-      if (signal.aborted) kill();
-      else signal.addEventListener("abort", kill, { once: true });
-    }
+    child.once("close", done);
+    child.once("error", done);
+    if (child.exitCode !== null || child.signalCode !== null) setTimeout(done, 0);
   });
 }
 
-/** Foreground run — blocks until the subprocess exits. */
-async function runAgentSync(
-  agents: AgentConfig[],
-  name: string,
-  task: string,
-  cwd: string,
-  depth: number,
-  signal?: AbortSignal,
-  overrideModel?: string,
-  contextOpts?: { context?: "fresh" | "fork"; parentSessionFile?: string },
-  ctx?: ExtensionContext,
-  overrideExecution?: "inline" | "subprocess",
-  parentModel?: Model<any>,
-): Promise<RunResult> {
-  const agent = agents.find((a) => a.name === name);
-  if (!agent) {
-    const avail = agents.map((a) => `"${a.name}"`).join(", ") || "none";
-    return {
-      agent: name,
-      task,
-      exitCode: 1,
-      output: "",
-      stderr: `Unknown agent "${name}". Available: ${avail}`,
-      cost: 0,
-      duration: 0,
-      messages: [],
-      turns: 0,
-    };
-  }
-
-  // Execution routing: param override > agent config > default (inline)
-  const execution = overrideExecution ?? agent.execution;
-  if (execution !== "subprocess") {
-    return runAgentInLine(agent, task, cwd, overrideModel, signal, ctx, parentModel); // contextOpts not applicable — inline shares parent memory
-  }
-
-  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
-  const { args, tmpFile, cmd } = buildArgs(agent, task, sessionDir, overrideModel, contextOpts, parentModel);
-  const start = Date.now();
-
-  try {
-    const raw = await spawnAndParse(cmd, args, {
-      cwd,
-      env: childEnv(depth),
-      signal,
-      parseStdout: true,
-    });
-    let { output, cost } = raw;
-    // Fallback: read from session file if stdout parsing missed output
-    if (!output || cost === 0) {
-      const session = readSessionOutput(sessionDir);
-      if (!output && session.output) output = session.output;
-      if (cost === 0 && session.cost > 0) cost = session.cost;
-    }
-    return {
-      agent: name,
-      task,
-      exitCode: raw.exitCode,
-      output: truncate(output, MAX_OUTPUT_BYTES),
-      stderr: truncate(raw.stderr, MAX_OUTPUT_BYTES),
-      cost,
-      duration: Date.now() - start,
-      sessionPath: sessionDir,
-      messages: raw.messages,
-      turns: raw.turns,
-      model: raw.model,
-      stopReason: raw.stopReason,
-    };
-  } finally {
-    if (tmpFile) {
-      try {
-        fs.unlinkSync(tmpFile);
-      } catch {}
-    }
-    try {
-      fs.rmSync(sessionDir, { recursive: true, force: true });
-    } catch {}
-  }
-}
-
-/** In-process run — uses createAgentSession() SDK API. Shared memory, no subprocess overhead. */
-async function runAgentInLine(
-  agent: AgentConfig,
-  task: string,
-  cwd: string,
-  overrideModel?: string,
-  signal?: AbortSignal,
-  ctx?: ExtensionContext,
-  parentModel?: Model<any>,
-): Promise<RunResult> {
-  const start = Date.now();
-  let session: AgentSession | undefined;
-  let abortHandler: (() => void) | undefined;
-
-  try {
-    // Resolve model: override > agent.model > parent model > pi default
-    const modelStr = resolveModel(agent, overrideModel, parentModel);
-    let model: Model<any> | undefined = undefined;
-    if (modelStr) {
-      model = findModel(modelStr, ctx);
-      if (!model) {
-        // Model configured but not in registry — return a clear error
-        return {
-          agent: agent.name,
-          task,
-          exitCode: 1,
-          output: "",
-          stderr: `Model "${modelStr}" not found in registry. Check that the provider/model ID is correct and the API key is configured. Run 'pi models' to see available models.`,
-          cost: 0,
-          duration: Date.now() - start,
-          messages: [],
-          turns: 0,
-        };
-      }
-    }
-
-    // Prepend system prompt to task (createAgentSession doesn't accept systemPrompt)
-    const fullTask = agent.systemPrompt.trim()
-      ? `${agent.systemPrompt}\n\n---\n\nTask: ${task}`
-      : task;
-
-    // Create in-process session
-    const result = await createAgentSession({
-      cwd,
-      sessionManager: SessionManager.inMemory(),
-      tools: agent.tools,
-      ...(model ? { model: model as any } : {}),
-    });
-    session = result.session;
-
-    // Handle abort signal — store reference for cleanup
-    if (signal) {
-      abortHandler = () => {
-        session?.abort();
-      };
-      signal.addEventListener("abort", abortHandler, { once: true });
-    }
-
-    // Run the agent with inactivity timeout — reset on any session event
-    let lastActivity = Date.now();
-    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
-    const unsubscribe = session.subscribe(() => { lastActivity = Date.now(); });
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      const check = () => {
-        if (Date.now() - lastActivity > INACTIVITY_TIMEOUT_MS) {
-          session?.abort();
-          reject(new Error(`Inline agent timed out: no activity for ${INACTIVITY_TIMEOUT_MS / 1000}s`));
-        } else {
-          timeoutTimer = setTimeout(check, Math.min(INACTIVITY_TIMEOUT_MS / 2, 15_000));
-        }
-      };
-      timeoutTimer = setTimeout(check, INACTIVITY_TIMEOUT_MS);
-    });
-    try {
-      await Promise.race([session.prompt(fullTask), timeoutPromise]);
-    } finally {
-      if (timeoutTimer) clearTimeout(timeoutTimer);
-      unsubscribe();
-    }
-
-    // Extract messages with tool calls, usage, and text
-    const parsedMessages: AgentMessage[] = [];
-    let output = "";
-    let cost = 0;
-    let turns = 0;
-    let modelId: string | undefined;
-    let stopReason: string | undefined;
-    const rawMessages = session.messages as Array<{
-      role: string;
-      content?: Array<{
-        type: string;
-        text?: string;
-        name?: string;
-        arguments?: Record<string, unknown>;
-      }>;
-      usage?: {
-        input?: number;
-        output?: number;
-        cacheRead?: number;
-        cacheWrite?: number;
-        cost?: { total?: number };
-      };
-      model?: string;
-      stopReason?: string;
-      // ToolResultMessage fields
-      toolName?: string;
-      toolCallId?: string;
-    }>;
-
-    for (const msg of rawMessages) {
-      if (msg.role === "assistant") {
-        turns++;
-        const texts: string[] = [];
-        const toolCalls: Array<{ name: string; args: Record<string, unknown> }> = [];
-        for (const p of msg.content ?? []) {
-          if (p.type === "text" && p.text) texts.push(p.text);
-          if (p.type === "toolCall" && p.name)
-            toolCalls.push({ name: p.name, args: p.arguments ?? {} });
-        }
-        if (texts.length) output = texts.join("\n");
-        const u = msg.usage;
-        const usage = u
-          ? {
-              input: u.input ?? 0,
-              output: u.output ?? 0,
-              cacheRead: u.cacheRead ?? 0,
-              cacheWrite: u.cacheWrite ?? 0,
-              cost: u.cost?.total ?? 0,
-            }
-          : undefined;
-        if (usage) cost += usage.cost;
-        if (msg.model) modelId = msg.model;
-        if (msg.stopReason) stopReason = msg.stopReason;
-        parsedMessages.push({
-          role: "assistant",
-          text: texts.join("\n") || undefined,
-          toolCalls: toolCalls.length ? toolCalls : undefined,
-          usage,
-          model: msg.model,
-          stopReason: msg.stopReason,
-        });
-      }
-      if (msg.role === "toolResult") {
-        const toolName = msg.toolName ?? "tool";
-        const texts: string[] = [];
-        for (const p of msg.content ?? []) {
-          if (p.type === "text" && p.text) texts.push(p.text);
-        }
-        parsedMessages.push({
-          role: "tool",
-          toolResult: { name: toolName, output: truncate(texts.join("\n"), 2048) },
-        });
-      }
-    }
-
-    return {
-      agent: agent.name,
-      task,
-      exitCode: 0,
-      output: truncate(output, MAX_OUTPUT_BYTES),
-      stderr: "",
-      cost,
-      duration: Date.now() - start,
-      sessionId: session.sessionId,
-      messages: parsedMessages,
-      turns,
-      model: modelId,
-      stopReason,
-    };
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return {
-      agent: agent.name,
-      task,
-      exitCode: 1,
-      output: "",
-      stderr: msg,
-      cost: 0,
-      duration: Date.now() - start,
-      messages: [],
-      turns: 0,
-    };
-  } finally {
-    if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
-    session?.dispose();
-  }
-}
-
-/** Background run — spawns detached, returns immediately. stdout ignored (read from session files). */
-function runAgentAsync(
-  agents: AgentConfig[],
-  name: string,
-  task: string,
-  cwd: string,
-  depth: number,
-  overrideModel?: string,
-  contextOpts?: { context?: "fresh" | "fork"; parentSessionFile?: string },
-  parentModel?: Model<any>,
-): RunRecord {
-  const agent = agents.find((a) => a.name === name);
-  const id = genId();
-  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
-
-  if (!agent) {
-    const avail = agents.map((a) => `"${a.name}"`).join(", ") || "none";
-    const record: RunRecord = {
-      id,
-      agent: name,
-      task,
-      status: "failed",
-      startedAt: Date.now(),
-      sessionPath: sessionDir,
-      result: {
-        agent: name,
-        task,
-        exitCode: 1,
-        output: "",
-        stderr: `Unknown agent "${name}". Available: ${avail}`,
-        cost: 0,
-        duration: 0,
-        messages: [],
-        turns: 0,
-      },
-    };
-    runs.set(id, record);
-    persistRuns();
-    return record;
-  }
-
-  const { args, tmpFile, cmd } = buildArgs(agent, task, sessionDir, overrideModel, contextOpts, parentModel);
-  // stdout ignored — we read from session files. This prevents pipe buffer hangs.
-  const proc = spawn(cmd, args, {
-    cwd,
-    shell: false,
-    stdio: ["ignore", "ignore", "pipe"],
-    env: childEnv(depth),
-    detached: true,
-  });
-  proc.unref();
-
-  const record: RunRecord = {
-    id,
-    agent: name,
-    task,
-    status: "running",
-    startedAt: Date.now(),
-    sessionPath: sessionDir,
-    proc,
-  };
-  runs.set(id, record);
-  persistRuns();
-
-  // Inactivity watchdog for background agents — monitors session file mtime
-  const killBg = (reason: string) => {
-    if (record.status !== "running") return;
-    try { proc.kill("SIGTERM"); } catch {}
-    record.status = "failed";
-    record.result = {
-      agent: name, task, exitCode: 1, output: "",
-      stderr: reason, cost: 0, duration: Date.now() - record.startedAt,
-      sessionPath: sessionDir, messages: [], turns: 0,
-    };
-    record.proc = undefined;
-    if (tmpFile) { try { fs.unlinkSync(tmpFile); } catch {} }
-    persistRuns();
-  };
-
-  // Hard safety net
-  const hardTimeout = setTimeout(() => killBg(`Background agent timed out after ${BACKGROUND_TIMEOUT_MS / 1000}s`), BACKGROUND_TIMEOUT_MS);
-  if (hardTimeout.unref) hardTimeout.unref();
-
-  // Inactivity check — look at session file mtime
-  const inactivityCheck = setInterval(() => {
-    if (record.status !== "running") { clearInterval(inactivityCheck); return; }
-    let lastMod = record.startedAt;
-    try {
-      const sessionFile = findSessionFile(sessionDir);
-      if (sessionFile) lastMod = fs.statSync(sessionFile).mtimeMs;
-    } catch { /* dir or file deleted — use startedAt */ }
-    if (Date.now() - lastMod > INACTIVITY_TIMEOUT_MS) {
-      clearInterval(inactivityCheck);
-      killBg(`Background agent killed: no session activity for ${INACTIVITY_TIMEOUT_MS / 1000}s`);
-    }
-  }, Math.min(INACTIVITY_TIMEOUT_MS / 2, 15_000));
-  if (inactivityCheck.unref) inactivityCheck.unref();
-
-  let stderr = "";
-  proc.stderr.on("data", (d) => {
-    if (Buffer.byteLength(stderr, "utf-8") < MAX_STDERR_BYTES) stderr += d.toString();
-  });
-  proc.on("close", (code) => {
-    if (record.status !== "running") {
-      if (tmpFile) { try { fs.unlinkSync(tmpFile); } catch {} }
-      return;
-    }
-    const session = readSessionOutput(sessionDir);
-    record.status = code === 0 ? "completed" : "failed";
-    record.result = {
-      agent: name,
-      task,
-      exitCode: code ?? 1,
-      output: truncate(session.output, MAX_OUTPUT_BYTES),
-      stderr: truncate(stderr, MAX_OUTPUT_BYTES),
-      cost: session.cost,
-      duration: Date.now() - record.startedAt,
-      sessionPath: sessionDir,
-      messages: [],
-      turns: 0,
-    };
-    record.proc = undefined;
-    if (tmpFile) {
-      try {
-        fs.unlinkSync(tmpFile);
-      } catch {}
-    }
-    persistRuns();
-  });
-  proc.on("error", () => {
-    if (record.status !== "running") {
-      if (tmpFile) { try { fs.unlinkSync(tmpFile); } catch {} }
-      return;
-    }
-    record.status = "failed";
-    record.result = {
-      agent: name,
-      task,
-      exitCode: 1,
-      output: "",
-      stderr: stderr || "process error",
-      cost: 0,
-      messages: [],
-      turns: 0,
-      duration: Date.now() - record.startedAt,
-      sessionPath: sessionDir,
-    };
-    record.proc = undefined;
-    if (tmpFile) {
-      try {
-        fs.unlinkSync(tmpFile);
-      } catch {}
-    }
-    persistRuns();
-    pruneRuns();
-  });
-
-  return record;
-}
-
-/** Resume a completed or failed run with a follow-up message. */
-async function resumeRun(
-  run: RunRecord,
-  message: string,
-  cwd: string,
-  signal?: AbortSignal,
-): Promise<RunResult> {
-  const sessionFile = findSessionFile(run.sessionPath);
-  if (!sessionFile) {
-    return {
-      agent: run.agent,
-      task: message,
-      exitCode: 1,
-      output: "",
-      stderr: `No session file found in ${run.sessionPath}`,
-      cost: 0,
-      duration: 0,
-      messages: [],
-      turns: 0,
-    };
-  }
-
-  const { cmd, baseArgs } = getPiCmd();
-  const args = [...baseArgs, "--mode", "json", "-p", "--session", sessionFile, message];
-  const start = Date.now();
-
-  const raw = await spawnAndParse(cmd, args, {
-    cwd,
-    env: childEnv(getDepth()),
-    signal,
-    parseStdout: true,
-  });
-  let { output, cost } = raw;
-  // Fallback: read from session file
-  if (!output || cost === 0) {
-    const session = readSessionOutput(run.sessionPath);
-    if (!output && session.output) output = session.output;
-    if (cost === 0 && session.cost > 0) cost = session.cost;
-  }
-
-  return {
-    agent: run.agent,
-    task: message,
-    exitCode: raw.exitCode,
-    output: truncate(output, MAX_OUTPUT_BYTES),
-    stderr: truncate(raw.stderr, MAX_OUTPUT_BYTES),
-    cost,
-    duration: Date.now() - start,
-    sessionPath: run.sessionPath,
-    messages: raw.messages,
-    turns: raw.turns,
-    model: raw.model,
-    stopReason: raw.stopReason,
-  };
-}
-
-// ── Gate Execution ──────────────────────────────────────────────────────────
-
-async function runGate(
-  gateCmd: string,
-  stepOutput: string,
-  cwd: string,
-  timeoutMs: number,
-  signal?: AbortSignal,
-): Promise<{ exitCode: number; stderr: string }> {
-  if (signal?.aborted) return { exitCode: 1, stderr: "aborted" };
+function waitForChildren(children: ChildProcess[], timeoutMs: number): Promise<void> {
   return new Promise((resolve) => {
-    let stderr = "";
-    let closed = false;
-    let gateTimeout: ReturnType<typeof setTimeout> | undefined;
-    let killTimeout: ReturnType<typeof setTimeout> | undefined;
-    const proc = spawn("sh", ["-c", gateCmd], {
-      cwd,
-      stdio: ["ignore", "ignore", "pipe"],
-      env: { ...process.env, SUBAGENT_OUTPUT: stepOutput },
-    });
-    const cleanup = () => {
-      if (gateTimeout) clearTimeout(gateTimeout);
-      if (killTimeout) clearTimeout(killTimeout);
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
     };
-    proc.stderr.on("data", (d) => {
-      if (Buffer.byteLength(stderr, "utf-8") < MAX_STDERR_BYTES) stderr += d.toString();
-    });
-    proc.on("close", (c) => {
-      closed = true;
-      cleanup();
-      resolve({ exitCode: c ?? 1, stderr: truncate(stderr, 1024) });
-    });
-    proc.on("error", () => {
-      if (!closed) {
-        cleanup();
-        resolve({ exitCode: 1, stderr: "gate process error" });
-      }
-    });
-    // Configurable timeout
-    gateTimeout = setTimeout(() => {
-      if (closed) return;
-      killProc(proc, "SIGTERM");
-      killTimeout = setTimeout(() => {
-        if (!closed) killProc(proc, "SIGKILL");
-      }, 5000);
-    }, timeoutMs);
-    // Signal
-    if (signal && !signal.aborted) {
-      const onAbort = () => {
-        if (closed) return;
-        killProc(proc, "SIGTERM");
-        killTimeout = setTimeout(() => {
-          if (!closed) killProc(proc, "SIGKILL");
-        }, 5000);
-      };
-      signal.addEventListener("abort", onAbort, { once: true });
-    }
+    timer = setTimeout(done, timeoutMs);
+    Promise.all(children.map((child) => waitForChild(child))).then(done);
   });
 }
-
-// ── Concurrency ─────────────────────────────────────────────────────────────
-
-async function mapConcurrent<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T, i: number) => Promise<R>,
-): Promise<R[]> {
-  if (!items.length) return [];
-  const results: R[] = Array.from({ length: items.length });
-  let next = 0;
-  await Promise.all(
-    Array.from({ length: Math.min(limit, items.length) }, async () => {
-      while (true) {
-        const i = next++;
-        if (i >= items.length) return;
-        const item = items[i];
-        if (item === undefined) return;
-        results[i] = await fn(item, i);
-      }
-    }),
-  );
-  return results;
-}
-
-function fmtResult(r: RunResult): string {
-  const icon = r.exitCode === 0 ? "✓" : "✗";
-  const ms = r.duration < 1000 ? `${r.duration}ms` : `${(r.duration / 1000).toFixed(1)}s`;
-  const c = r.cost > 0 ? ` $${r.cost.toFixed(4)}` : "";
-  const t = r.turns > 0 ? ` ${r.turns} turn${r.turns > 1 ? "s" : ""}` : "";
-  const tc = r.messages.reduce((s, m) => s + (m.toolCalls?.length ?? 0), 0);
-  const tcStr = tc > 0 ? ` ${tc} tool call${tc > 1 ? "s" : ""}` : "";
-  const model = r.model ? ` [${r.model}]` : "";
-  return `${icon} ${r.agent}${model} (${ms}${c}${t}${tcStr})`;
-}
-
-// ── Extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  // Load and reconcile persisted runs on startup
-  loadRuns();
-  reconcileRuns();
+  // A detached process group is used so cancellation cannot kill the parent
+  // pi process. Reap groups when the extension/session is shut down as well.
+  if (typeof pi.on === "function") {
+    pi.on("session_shutdown", async () => {
+      const children = [...activeChildren];
+      if (children.length === 0) return;
+      for (const child of children) terminateProcessTree(child, "SIGTERM");
+      await waitForChildren(children, 5000);
+      // Kill the original process groups even if a leader exited while a
+      // descendant retained a pipe or otherwise outlived it.
+      for (const child of children) terminateProcessTree(child, "SIGKILL");
+      await waitForChildren(children, 1000);
+    });
+  }
 
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
     description: [
-      "Delegate tasks to specialized subagents with isolated context.",
-      "Modes: agent+task (single), chain[...] (sequential), tasks[...] (parallel, max 8). Use exactly one.",
-      "Actions: list (agents), status/wait (background runs), resume (follow-up), interrupt (cancel). Set action, omit mode.",
-      "Agent management: create/update/delete define NEW agent types (.md files). To run an existing agent, use agent+task directly.",
-      "Background: background=true returns run id. action=wait to block for result.",
-      "Chain templates: {task} = original request, {previous} = prior step output (empty on first step). Gates: shell cmd, exit 0 = pass, $SUBAGENT_OUTPUT = step output.",
-      "Model: agent definition sets default, parent can override with model param.",
-      "Execution: execution param overrides agent default. inline (default): in-process, shared memory. subprocess: isolated, crash-safe.",
-      "Max depth: 3.",
-    ].join("\n"),
+      "Delegate to specialized agents using exactly one mode: single (agent + task), parallel (tasks), or sequential chain (chain with {previous}).",
+      `Bundled agents are always available. User agents come from ${path.join(getAgentDir(), "agents")}; project agents come from ${CONFIG_DIR_NAME}/agents and require pi trust plus interactive confirmation.`,
+      "All delegation runs in an isolated subprocess. A top-level model override applies to every mode; otherwise the parent model is inherited.",
+      "The only action is list. Model-visible output and partial updates share one deterministic 50KB cap per tool call.",
+    ].join(" "),
+    parameters: SubagentParamsSchema,
+    // The tool owns its own parallel mode and rejects unsafe same-cwd writes.
+    // Serialize sibling top-level calls so two separate tool calls cannot
+    // bypass that per-call mutation guard.
+    executionMode: "sequential",
+    promptSnippet: "Delegate work to an isolated named subagent (single, parallel, or chain).",
+    promptGuidelines: [
+      "Call subagent in parallel only for independent tasks; same-cwd potentially-mutating tasks are rejected.",
+      "Call subagent in a chain when a later agent needs the previous agent's report.",
+    ],
 
-    parameters: Type.Object({
-      action: Type.Optional(
-        Type.String({
-          enum: ["list", "status", "wait", "resume", "interrupt", "create", "update", "delete"],
-          description:
-            "Lifecycle action. interrupt: cancel running agent. create/update/delete: manage agent DEFINITIONS (.md files) — NOT for running agents. To run an agent, use agent+task directly.",
-        }),
-      ),
-      id: Type.Optional(Type.String({ description: "Run id for status/wait/resume actions" })),
-      background: Type.Optional(
-        Type.Boolean({ description: "Run in background (single mode only). Returns immediately." }),
-      ),
-      agent: Type.Optional(Type.String({ description: "Agent name for single mode" })),
-      task: Type.Optional(
-        Type.String({
-          description:
-            "Task for single mode, {task} template source for chain mode, or follow-up message for resume",
-        }),
-      ),
-      model: Type.Optional(
-        Type.String({
-          description:
-            "Override agent's default model (provider/model-id format, e.g. 'openrouter/anthropic/fable-5')",
-        }),
-      ),
-      execution: Type.Optional(
-        Type.String({
-          enum: ["inline", "subprocess"],
-          description:
-            "Execution mode. 'inline' (default): in-process, shared memory, EventBus access. 'subprocess': isolated, 230MB per agent, crash-safe.",
-        }),
-      ),
-      tasks: Type.Optional(
-        Type.Array(
-          Type.Object({
-            agent: Type.String({
-              description: "Agent name. Use action=list to see available agents.",
-            }),
-            task: Type.String({ description: "Task description for this agent." }),
-            cwd: Type.Optional(
-              Type.String({
-                description:
-                  "Working directory for this agent (absolute path). Defaults to top-level cwd.",
-              }),
-            ),
-          }),
-          {
-            description:
-              "Parallel mode: array of agent+task pairs. Max 8 tasks, run concurrently up to concurrency limit (default 4).",
-          },
-        ),
-      ),
-      concurrency: Type.Optional(
-        Type.Integer({
-          description:
-            "Max concurrent agents in parallel mode. Default: 4. Increase for subprocess agents or providers with high concurrency limits.",
-        }),
-      ),
-      chain: Type.Optional(
-        Type.Array(
-          Type.Object({
-            agent: Type.String({
-              description: "Agent name. Use action=list to see available agents.",
-            }),
-            task: Type.String({
-              description:
-                "Task template. {task} = original request, {previous} = prior step output (empty on first step).",
-            }),
-            cwd: Type.Optional(
-              Type.String({
-                description:
-                  "Working directory for this step (absolute path). Defaults to top-level cwd.",
-              }),
-            ),
-            gate: Type.Optional(
-              Type.String({
-                description:
-                  "Shell command to validate step output. Exit 0 = pass. Step output in $SUBAGENT_OUTPUT env var.",
-              }),
-            ),
-            gateTimeout: Type.Optional(
-              Type.Integer({ description: "Gate timeout in ms. Default: 30000." }),
-            ),
-            onFail: Type.Optional(
-              Type.String({
-                enum: ["retry", "skip", "abort"],
-                description:
-                  "Action on gate failure. retry: re-run step (max 3). skip: continue chain. abort: stop. Default: abort.",
-              }),
-            ),
-            as: Type.Optional(
-              Type.String({
-                description: "Named output. Available as {outputs.name} in later chain steps.",
-              }),
-            ),
-          }),
-          { description: "Chain mode: sequential steps with optional quality gates between them." },
-        ),
-      ),
-      context: Type.Optional(
-        Type.String({
-          enum: ["fresh", "fork"],
-          description:
-            "Context mode. 'fresh' (default): child gets only the task. 'fork': child inherits parent's session history.",
-        }),
-      ),
-      cwd: Type.Optional(
-        Type.String({
-          description:
-            "Working directory for the run (absolute path). Defaults to the current project directory.",
-        }),
-      ),
-      acceptance: Type.Optional(
-        Type.Object(
-          {
-            criteria: Type.Optional(
-              Type.Array(Type.String(), {
-                description:
-                  "Describes what 'done' looks like. Reported in output for parent to evaluate.",
-              }),
-            ),
-            verify: Type.Optional(
-              Type.Array(Type.String(), {
-                description:
-                  "Shell commands to validate output. All must exit 0 for acceptance to pass.",
-              }),
-            ),
-            maxAttempts: Type.Optional(
-              Type.Integer({
-                description: "Max retry attempts on acceptance failure. Default: 1 (no retries).",
-              }),
-            ),
-          },
-          {
-            description:
-              "Acceptance contract. Defines success criteria and verification for the agent's output.",
-          },
-        ),
-      ),
-      prompt: Type.Optional(
-        Type.String({
-          description: "System prompt for create/update actions. The agent's instructions.",
-        }),
-      ),
-    }),
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      const runId = randomUUID();
+      const parentRunId = process.env[RUN_ID_ENV];
+      const inheritedRootRunId = process.env[ROOT_ID_ENV] ?? runId;
+      const depth = readDepth();
+      const inheritedDeadline = Number(process.env[DEADLINE_ENV]);
+      let detailRootRunId = inheritedRootRunId;
+      let detailDeadline = Number.isSafeInteger(inheritedDeadline) ? inheritedDeadline : 0;
+      const effectiveCwd = ctx.cwd ? path.resolve(ctx.cwd) : process.cwd();
+      const agentScope: AgentScope = params.agentScope ?? "user";
+      const requestedRoot = cwdFor(effectiveCwd, params.cwd);
+      const rootCwd = existingDirectory(requestedRoot);
+      const trustedCwd = existingDirectory(effectiveCwd) ?? effectiveCwd;
+      const trustedProjectRoot = findNearestProjectRoot(trustedCwd) ?? trustedCwd;
+      // Discover against the same canonical cwd that will be used to run the
+      // child. This avoids approving one project and executing in another.
+      const discovery = discoverAgents(rootCwd ?? effectiveCwd, agentScope);
+      const projectRoot = findNearestProjectRoot(rootCwd ?? effectiveCwd) ?? (rootCwd ?? effectiveCwd);
+      const baseDetails = (mode: SubagentDetails["mode"], results: AgentResult[]): SubagentDetails => boundDetails({
+        mode,
+        agentScope,
+        projectAgentsDir: discovery.projectAgentsDir,
+        runId,
+        parentRunId,
+        rootRunId: detailRootRunId,
+        depth: depth.depth,
+        deadlineMs: detailDeadline,
+        results,
+      });
+      const hasSingleFields = params.agent !== undefined || params.task !== undefined;
+      const hasSingle = hasSingleFields;
+      const hasParallel = params.tasks !== undefined;
+      const hasChain = params.chain !== undefined;
 
-    async execute(_id, params, signal, onUpdate, ctx) {
-      // Defensive fallback: ctx.cwd can be undefined in some execution contexts
-      const effectiveCwd = ctx.cwd ?? process.cwd();
+      if (params.action && (hasSingle || hasParallel || hasChain)) {
+        return toolResult("action=\"list\" cannot be combined with a delegation mode.", baseDetails("single", []), true);
+      }
 
-      // Elapsed time progress indicator — label updated per mode below
-      const startTime = Date.now();
-      let progressLabel = "Running...";
-      const progressTimer = setInterval(() => {
-        const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
-        onUpdate?.({ content: [{ type: "text", text: `${progressLabel} ${elapsed}s` }], details: undefined });
-      }, PROGRESS_INTERVAL_MS);
-      const clearProgress = () => clearInterval(progressTimer);
-
-      try {
-
-      // ── Lifecycle actions ──
       if (params.action) {
-        if (params.action === "list") {
-          const agents = discoverAgents(effectiveCwd);
-          if (!agents.length)
-            return ok(
-              "No agents found. Place .md files in .pi/agents/ (project) or ~/.pi/agents/ (global).",
-            );
-          const parentModel = ctx?.model;
-          const lines = agents.map((a) => {
-            const resolvedModel = a.model ?? (parentModel ? `${parentModel.provider}/${parentModel.id}` : undefined);
-            const model = resolvedModel ? ` [${resolvedModel}${a.model ? "" : " (inherit)"}]` : "";
-            const exec = a.execution === "subprocess" ? " subprocess" : "";
-            const tools = a.tools?.length ? ` tools:${a.tools.join(",")}` : "";
-            return `${a.name}: ${a.description}${model}${exec}${tools} (${a.source})`;
-          });
-          return ok(`Available agents:\n${lines.join("\n")}`);
+        if (params.action !== "list") {
+          return toolResult(`Unknown action: ${params.action}`, baseDetails("single", []), true);
         }
-
-        if (params.action === "status") {
-          if (!params.id) return toolError("Provide id for status action.");
-          const match = findRun(params.id);
-          if (!match) {
-            // Check if they passed an agent name instead of a run ID
-            const agents = discoverAgents(effectiveCwd);
-            const agentMatch = agents.find((a) => a.name === params.id);
-            if (agentMatch) {
-              return toolError(
-                `"${params.id}" is an agent name, not a run ID. To run an agent, use:\n\n  subagent(agent="${params.id}", task="your task here")\n\nThen use action="status" with the returned run ID.`,
-              );
-            }
-            return toolError(`Run not found: ${params.id}`);
-          }
-          if ("ambiguous" in match)
-            return toolError(
-              `Ambiguous id "${params.id}" — matches ${match.ambiguous.join(", ")}. Provide more characters.`,
-            );
-          return ok(fmtRunStatus(match), { run: safeRecord(match) });
-        }
-
-        if (params.action === "wait") {
-          if (!params.id) return toolError("Provide id for wait action.");
-          const match = findRun(params.id);
-          if (!match) {
-            // Check if they passed an agent name instead of a run ID
-            const agents = discoverAgents(effectiveCwd);
-            const agentMatch = agents.find((a) => a.name === params.id);
-            if (agentMatch) {
-              return toolError(
-                `"${params.id}" is an agent name, not a run ID. To run an agent, use:\n\n  subagent(agent="${params.id}", task="your task here")\n\nThen use action="wait" with the returned run ID.`,
-              );
-            }
-            return toolError(`Run not found: ${params.id}`);
-          }
-          if ("ambiguous" in match)
-            return toolError(
-              `Ambiguous id "${params.id}" — matches ${match.ambiguous.join(", ")}. Provide more characters.`,
-            );
-          // Quick reconcile: if no live proc (e.g. after restart), check session file for output
-          if (match.status === "running" && !match.proc) {
-            const session = readSessionOutput(match.sessionPath);
-            if (session.output) {
-              const exitCode = session.stopReason === "stop" ? 0 : 1;
-              match.status = exitCode === 0 ? "completed" : "failed";
-              match.result = {
-                agent: match.agent, task: match.task, exitCode,
-                output: truncate(session.output, MAX_OUTPUT_BYTES), stderr: "",
-                cost: session.cost, duration: Date.now() - match.startedAt,
-                sessionPath: match.sessionPath, messages: [], turns: 0,
-              };
-              persistRuns();
-            } else if (!fs.existsSync(match.sessionPath)) {
-              match.status = "failed";
-              match.result = {
-                agent: match.agent, task: match.task, exitCode: 1,
-                output: "", stderr: "Background agent session not found.",
-                cost: 0, duration: 0,
-                sessionPath: match.sessionPath, messages: [], turns: 0,
-              };
-              persistRuns();
-            }
-          }
-          if (match.status !== "running") {
-            if (!match.result)
-              return toolError(
-                `Run ${match.id} is ${match.status} but has no result. Data may be corrupted.`,
-              );
-            const r = match.result;
-            const d = { mode: "background", results: [r] };
-            return r.exitCode === 0
-              ? ok(r.output, d)
-              : toolError(`Agent failed: ${r.stderr || r.output}`);
-          }
-          await new Promise<void>((resolve) => {
-            if (match.status !== "running") return resolve();
-            const poll = setInterval(() => {
-              if (match.status !== "running") {
-                clearInterval(poll);
-                resolve();
-              }
-            }, 500);
-            signal?.addEventListener(
-              "abort",
-              () => {
-                clearInterval(poll);
-                resolve();
-              },
-              { once: true },
-            );
-          });
-          if (signal?.aborted) return toolError("Wait aborted.");
-          if (!match.result)
-            return toolError(`Run ${match.id} completed but has no result. Data may be corrupted.`);
-          const r = match.result;
-          const d = { mode: "background", results: [r] };
-          return r.exitCode === 0
-            ? ok(r.output, d)
-            : toolError(`Agent failed: ${r.stderr || r.output}`);
-        }
-
-        if (params.action === "resume") {
-          if (!params.id) return toolError("Provide id for resume action.");
-          if (!params.task) return toolError("Provide task (follow-up message) for resume action.");
-          const match = findRun(params.id);
-          if (!match) return toolError(`Run not found: ${params.id}`);
-          if ("ambiguous" in match)
-            return toolError(
-              `Ambiguous id "${params.id}" — matches ${match.ambiguous.join(", ")}. Provide more characters.`,
-            );
-          const cwd = params.cwd ? path.resolve(params.cwd) : effectiveCwd;
-          const r = await resumeRun(match, params.task, cwd, signal);
-          // Create a new run record for the resumed turn
-          const resumeId = genId();
-          const resumeRecord: RunRecord = {
-            id: resumeId,
-            agent: r.agent,
-            task: r.task,
-            status: r.exitCode === 0 ? "completed" : "failed",
-            startedAt: Date.now() - r.duration,
-            sessionPath: r.sessionPath ?? match.sessionPath,
-            result: r,
-          };
-          runs.set(resumeId, resumeRecord);
-          persistRuns();
-          const d = { mode: "resume", results: [r], originalRunId: match.id, resumeId };
-          return r.exitCode === 0
-            ? ok(r.output, d)
-            : toolError(`Resume failed: ${r.stderr || r.output}`);
-        }
-
-        if (params.action === "interrupt") {
-          if (!params.id) return toolError("Provide id for interrupt action.");
-          const match = findRun(params.id);
-          if (!match) return toolError(`Run not found: ${params.id}`);
-          if ("ambiguous" in match)
-            return toolError(
-              `Ambiguous id "${params.id}" — matches ${match.ambiguous.join(", ")}. Provide more characters.`,
-            );
-          if (match.status !== "running")
-            return toolError(`Run ${match.id} is ${match.status}, not running. Cannot interrupt.`);
-          if (!match.proc)
-            return toolError(
-              `Run ${match.id} has no process handle. It may have been started in a different session.`,
-            );
-          try {
-            killProc(match.proc, "SIGTERM");
-            return ok(
-              `Sent SIGTERM to ${match.agent} (${match.id}). It may take a few seconds to stop.`,
-            );
-          } catch (e: unknown) {
-            const msg = e instanceof Error ? e.message : String(e);
-            return toolError(`Failed to interrupt ${match.id}: ${msg}`);
-          }
-        }
-
-        if (params.action === "create") {
-          if (!params.agent) return toolError("Provide agent name for create action.");
-          if (!params.task && !params.prompt)
-            return toolError(
-              "Provide task (description) and/or prompt (system prompt) for create action.",
-            );
-          // If only prompt given, use agent name as description
-          const description = params.task ?? `${params.agent} agent`;
-          const systemPrompt = params.prompt ?? "";
-          const existingAgents = discoverAgents(effectiveCwd);
-          const alreadyExists = existingAgents.find((a) => a.name === params.agent);
-          if (alreadyExists) {
-            return toolError(
-              `Agent "${params.agent}" already exists (${alreadyExists.source}). You don't need to create it — just run it directly:\n\n  subagent(agent="${params.agent}", task="your task here")\n\naction="create" is for defining NEW agent types. To run an existing agent, use agent+task.`,
-            );
-          }
-          const agentsDir = path.join(effectiveCwd, ".pi", "agents");
-          fs.mkdirSync(agentsDir, { recursive: true });
-          const fp = path.join(agentsDir, `${params.agent}.md`);
-          const yamlQuote = (v: string) =>
-            /[:#"'\n{}\[\],&*?|>!%@`]/.test(v)  // oxlint-disable-line no-useless-escape
-              ? `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
-              : v;
-          const fm = [
-            "---",
-            `name: ${yamlQuote(params.agent)}`,
-            `description: ${yamlQuote(description)}`,
-            params.model ? `model: ${yamlQuote(params.model)}` : "",
-            "---",
-            "",
-            systemPrompt,
-          ]
-            .filter(Boolean)
-            .join("\n");
-          fs.writeFileSync(fp, fm, "utf-8");
-          return ok(`Created agent "${params.agent}" at ${fp}`);
-        }
-
-        if (params.action === "update") {
-          if (!params.agent) return toolError("Provide agent name for update action.");
-          const existing = findAgentFile(effectiveCwd, params.agent);
-          if (!existing) return toolError(`Agent "${params.agent}" not found.`);
-          const raw = fs.readFileSync(existing, "utf-8");
-          const { meta, body } = parseFrontmatter(raw);
-          if (params.task) meta.description = yamlQuote(params.task);
-          if (params.model) meta.model = yamlQuote(params.model);
-          const prompt = params.prompt || body;
-          const fm = [
-            "---",
-            ...Object.entries(meta).map(([k, v]) => `${k}: ${v}`),
-            "---",
-            "",
-            prompt,
-          ].join("\n");
-          fs.writeFileSync(existing, fm, "utf-8");
-          return ok(`Updated agent "${params.agent}" at ${existing}`);
-        }
-
-        if (params.action === "delete") {
-          if (!params.agent) return toolError("Provide agent name for delete action.");
-          const existing = findAgentFile(effectiveCwd, params.agent);
-          if (!existing) return toolError(`Agent "${params.agent}" not found.`);
-          try {
-            fs.unlinkSync(existing);
-          } catch (e: unknown) {
-            const msg = e instanceof Error ? e.message : String(e);
-            return toolError(`Failed to delete "${params.agent}": ${msg}`);
-          }
-          return ok(`Deleted agent "${params.agent}" (${existing})`);
-        }
-
-        return toolError(`Unknown action: ${params.action}`);
-      }
-
-      // ── Validate: exactly one execution mode ──
-      const hasSingle = Boolean(params.agent && params.task);
-      const hasChain = Boolean(params.chain?.length);
-      const hasParallel = Boolean(params.tasks?.length);
-      const modeCount = Number(hasSingle) + Number(hasChain) + Number(hasParallel);
-      if (modeCount !== 1) {
-        const agents = discoverAgents(effectiveCwd);
-        const avail = agents.map((a) => `${a.name}: ${a.description}`).join("\n") || "none";
-        return toolError(
-          `Provide exactly one mode: agent+task, tasks[], or chain[]. Or use an action.\n\nAvailable agents:\n${avail}`,
+        const listApproval = await confirmProjectAgents(
+          ctx,
+          discovery.agents.filter((agent) => agent.source === "project").map((agent) => agent.name),
+          discovery.agents,
+          discovery.projectAgentsDir,
+          trustedProjectRoot,
+          projectRoot,
+          signal,
         );
-      }
-
-      const cwd = params.cwd ? path.resolve(params.cwd) : effectiveCwd;
-      if (!fs.existsSync(cwd)) return toolError(`cwd does not exist: ${cwd}`);
-
-      const agents = discoverAgents(cwd);
-      const depth = getDepth();
-      if (depth >= MAX_DEPTH)
-        return toolError(`Max depth (${MAX_DEPTH}) reached. Cannot spawn deeper.`);
-
-      // Build context options for fork mode
-      const contextOpts =
-        params.context === "fork"
-          ? {
-              context: "fork" as const,
-              parentSessionFile: ctx.sessionManager?.getSessionFile?.() ?? undefined,
-            }
-          : undefined;
-      if (params.context === "fork" && !contextOpts?.parentSessionFile) {
-        return toolError("Cannot use context: 'fork' — no parent session file available.");
-      }
-
-      // ── Background single ──
-      if (hasSingle && params.background) {
-        const record = runAgentAsync(
-          agents,
-          params.agent!,
-          params.task!,
-          cwd,
-          depth + 1,
-          params.model,
-          contextOpts,
-          ctx?.model,
-        );
-        const agentCfg = agents.find(a => a.name === params.agent!);
-        const agentModel = agentCfg ? resolveModel(agentCfg, params.model, ctx?.model) : undefined;
-        const modelNote = agentModel ? ` [${agentModel}]` : "";
-        return ok(
-          `Background run started: ${record.id}\nAgent: ${record.agent}${modelNote}\nSession: ${record.sessionPath}\n\nUse action: 'wait', id: '${record.id}' to get the result.`,
-          { mode: "background", runId: record.id, sessionPath: record.sessionPath },
-        );
-      }
-
-      // ── Foreground single ──
-      if (hasSingle) {
-        const maxAttempts = params.acceptance?.maxAttempts ?? 1;
-        const agentCfg = agents.find(a => a.name === params.agent!);
-        const agentModel = agentCfg ? resolveModel(agentCfg, params.model, ctx?.model) : undefined;
-        progressLabel = `${params.agent!}${agentModel ? ` [${agentModel}]` : ""} running...`;
-
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-          const r = await runAgentSync(
-            agents,
-            params.agent!,
-            params.task!,
-            cwd,
-            depth + 1,
-            signal,
-            params.model,
-            contextOpts,
-            ctx,
-            params.execution as "inline" | "subprocess" | undefined,
-            ctx?.model,
-          );
-          if (r.exitCode !== 0) {
-            return toolError(`Agent failed: ${r.stderr || r.output}`);
-          }
-
-          // Run acceptance verification if specified
-          if (params.acceptance?.verify?.length) {
-            const verifyResults: string[] = [];
-            let allPassed = true;
-            for (const cmd of params.acceptance.verify) {
-              const { exitCode } = await runGate(cmd, r.output, cwd, 30_000, signal);
-              const passed = exitCode === 0;
-              verifyResults.push(`${passed ? "✓" : "✗"} ${cmd}`);
-              if (!passed) allPassed = false;
-            }
-
-            if (allPassed) {
-              const criteria = params.acceptance.criteria?.length
-                ? `\nCriteria: ${params.acceptance.criteria.join(", ")}`
-                : "";
-              return ok(
-                `${r.output}\n\nAcceptance: all checks passed${criteria}\n${verifyResults.join("\n")}`,
-                { mode: "single", results: [r], accepted: true },
-              );
-            }
-
-            if (attempt < maxAttempts) continue; // retry
-            return toolError(
-              `Acceptance failed after ${attempt} attempt(s):\n${verifyResults.join("\n")}`,
-            );
-          }
-
-          // No acceptance — return directly
-          const d = { mode: "single" as const, results: [r] };
-          return ok(r.output, d);
+        if (!listApproval.allowed) {
+          return toolResult(listApproval.reason ?? "Project-local agents were not approved.", baseDetails("single", []), true);
         }
-
-        // Should not reach here, but safety fallback
-        return toolError("Agent did not produce a result.");
-      }
-
-      // ── Chain with quality gates ──
-      if (hasChain) {
-        // Validate all chain agents exist before executing any
-        for (let si = 0; si < params.chain!.length; si++) {
-          const step = params.chain![si]!;
-          const cfg = agents.find((a) => a.name === step.agent);
-          if (!cfg)
-            return toolError(
-              `Chain step ${si + 1}: unknown agent "${step.agent}". Use action="list" to see available agents.`,
-            );
-        }
-
-        const results: RunResult[] = [];
-        const outputs: Record<string, string> = {};
-        let previous = "";
-        let i = 0;
-        let retries = 0;
-
-        while (i < params.chain!.length) {
-          const step = params.chain![i]!;
-          const stepAgentCfg = agents.find(a => a.name === step.agent);
-          const stepModel = resolveModel(stepAgentCfg!, undefined, ctx?.model);
-          progressLabel = `chain ${i + 1}/${params.chain!.length} [${step.agent}${stepModel ? ` (${stepModel})` : ""}] running...`;
-          let task = step.task.replace(/\{previous\}/g, previous);
-          task = task.replace(/\{task\}/g, params.task ?? "");
-          // Replace {outputs.name} with stored named outputs
-          task = task.replace(
-            /\{outputs\.([^}]+)\}/g,
-            (_: string, key: string) => outputs[key] ?? "",
-          );
-          const r = await runAgentSync(
-            agents,
-            step.agent,
-            task,
-            step.cwd ? path.resolve(step.cwd) : cwd,
-            depth + 1,
-            signal,
-            undefined,
-            contextOpts,
-            ctx,
-            undefined,
-            ctx?.model,
-          );
-          results.push(r);
-
-          if (r.exitCode !== 0) {
-            return toolError(
-              `Chain failed at step ${i + 1} (${step.agent}): ${r.stderr || r.output}`,
-            );
-          }
-
-          // Store named output if step defines 'as'
-          if (step.as) outputs[step.as] = r.output;
-
-          if (step.gate) {
-            const timeout = step.gateTimeout ?? DEFAULT_GATE_TIMEOUT_MS;
-            const { exitCode: gateExit, stderr: gateStderr } = await runGate(
-              step.gate,
-              r.output,
-              step.cwd ? path.resolve(step.cwd) : cwd,
-              timeout,
-              signal,
-            );
-
-            if (gateExit !== 0) {
-              const onFail = step.onFail ?? "abort";
-              if (onFail === "retry" && retries < MAX_RETRIES) {
-                retries++;
-                previous = `[RETRY ${retries}/${MAX_RETRIES} — gate failed: ${gateStderr || `exit ${gateExit}`}]\n${r.output}`;
-                continue;
-              }
-              if (onFail === "skip") {
-                previous = r.output;
-                i++;
-                retries = 0;
-                continue;
-              }
-              return toolError(
-                `Gate failed at step ${i + 1} (${step.agent}): ${gateStderr || `exit ${gateExit}`}`,
-              );
-            }
-          }
-
-          previous = r.output;
-          i++;
-          retries = 0;
-        }
-
-        const summary = results.map(fmtResult).join("\n");
-        return ok(`${summary}\n\n${results[results.length - 1]?.output ?? ""}`, {
-          mode: "chain",
-          results,
+        const lines = discovery.agents.map((agent) => {
+          const configuredModel = agent.model ? ` [${agent.model}]` : " [parent model]";
+          return `${agent.name}: ${agent.description}${configuredModel} (${agent.source})`;
         });
+        return toolResult(lines.length ? `Available agents:\n${lines.join("\n")}` : "No agents found.", baseDetails("single", []));
       }
 
-      // ── Parallel ──
+      if (Number(hasSingle) + Number(hasParallel) + Number(hasChain) !== 1) {
+        return toolResult(
+          `Invalid parameters. Provide exactly one mode: agent + task, tasks[], or chain[].\nAvailable agents: ${availableText(discovery.agents)}`,
+          baseDetails(modeOf(params), []),
+          true,
+        );
+      }
+      if (hasSingle && !validSingle(params)) {
+        return toolResult("Single mode requires both a non-blank agent and task.", baseDetails("single", []), true);
+      }
+      if (hasParallel && params.tasks!.length === 0) {
+        return toolResult("Parallel mode requires at least one task.", baseDetails("parallel", []), true);
+      }
+      if (hasChain && params.chain!.length === 0) {
+        return toolResult("Chain mode requires at least one step.", baseDetails("chain", []), true);
+      }
+      if (!hasValidItems(params)) {
+        return toolResult("Agent names and tasks must not be blank.", baseDetails(hasChain ? "chain" : "parallel", []), true);
+      }
+      if (hasBlankModel(params)) {
+        return toolResult("Model overrides must not be blank.", baseDetails(modeOf(params), []), true);
+      }
+      if (params.tasks && params.tasks.length > MAX_PARALLEL_TASKS) {
+        return toolResult(`Too many parallel tasks (${params.tasks.length}). Maximum is ${MAX_PARALLEL_TASKS}.`, baseDetails("parallel", []), true);
+      }
+      if (params.chain && params.chain.length > MAX_CHAIN_STEPS) {
+        return toolResult(`Too many chain steps (${params.chain.length}). Maximum is ${MAX_CHAIN_STEPS}.`, baseDetails("chain", []), true);
+      }
+      const texts = [params.task, ...(params.tasks ?? []).map((item) => item.task), ...(params.chain ?? []).map((item) => item.task)];
+      if (texts.some((text) => text !== undefined && Buffer.byteLength(text, "utf8") > MAX_TASK_BYTES)) {
+        return toolResult(`Tasks must be at most ${MAX_TASK_BYTES} bytes.`, baseDetails(modeOf(params), []), true);
+      }
+
+      if (!depth.valid || depth.depth >= MAX_DEPTH) {
+        return toolResult(
+          `Subagent depth limit reached or invalid ${DEPTH_ENV}; refusing to spawn (maximum depth ${MAX_DEPTH}).`,
+          baseDetails(modeOf(params), []),
+          true,
+        );
+      }
+
+      if (!rootCwd) {
+        return toolResult(`Working directory does not exist: ${requestedRoot}`, baseDetails(modeOf(params), []), true);
+      }
+
+      const projectAgentNames = new Set(requestedProjectAgents(requestedAgentNames(params), discovery.agents).map((agent) => agent.name));
+      const taskLocations = [
+        ...(params.tasks ?? []),
+        ...(params.chain ?? []),
+      ];
+      const parallelMutators = new Map<string, string[]>();
+      for (const item of taskLocations) {
+        const requestedCwd = cwdFor(rootCwd, item.cwd);
+        const taskCwd = existingDirectory(requestedCwd);
+        if (!taskCwd) {
+          return toolResult(`Working directory does not exist: ${requestedCwd}`, baseDetails(modeOf(params), []), true);
+        }
+        if (projectAgentNames.has(item.agent.trim()) && !isWithinDirectory(trustedProjectRoot, taskCwd)) {
+          return toolResult(
+            `Project agent "${item.agent.trim()}" may only run within the trusted project root: ${trustedProjectRoot}`,
+            baseDetails(modeOf(params), []),
+            true,
+          );
+        }
+        if (hasParallel && potentiallyMutating(discovery.agents.find((agent) => agent.name === item.agent.trim()))) {
+          // Distinct subdirectories of one repository still share files and
+          // Git state. Reject concurrent mutators at the nearest project root,
+          // falling back to the canonical cwd outside recognized projects.
+          const conflictRoot = findNearestProjectRoot(taskCwd) ?? taskCwd;
+          const names = parallelMutators.get(conflictRoot) ?? [];
+          names.push(item.agent.trim());
+          parallelMutators.set(conflictRoot, names);
+        }
+      }
       if (hasParallel) {
-        progressLabel = `${params.tasks!.length} tasks running...`;
-        if (params.tasks!.length > MAX_PARALLEL)
-          return toolError(`Too many tasks (${params.tasks!.length}). Max: ${MAX_PARALLEL}.`);
-
-        const concurrency = Math.max(
-          1,
-          Math.min(params.concurrency ?? MAX_CONCURRENCY, MAX_PARALLEL),
-        );
-        const results = await mapConcurrent(params.tasks!, concurrency, (t) =>
-          runAgentSync(
-            agents,
-            t.agent,
-            t.task,
-            t.cwd ? path.resolve(t.cwd) : cwd,
-            depth + 1,
-            signal,
-            undefined,
-            contextOpts,
-            ctx,
-            params.execution as "inline" | "subprocess" | undefined,
-            ctx?.model,
-          ),
-        );
-
-        const okCount = results.filter((r) => r.exitCode === 0).length;
-        const summary = results
-          .map((r) => {
-            const raw = r.exitCode === 0 ? r.output : r.stderr || r.output;
-            const output = truncate(raw, PER_TASK_OUTPUT_CAP);
-            return `### [${r.agent}] ${r.exitCode === 0 ? "completed" : "failed"}\n${output}`;
-          })
-          .join("\n\n---\n\n");
-        const d = { mode: "parallel", results };
-        const text = `Parallel: ${okCount}/${results.length} succeeded\n\n${summary}`;
-        return okCount < results.length ? toolError(text) : ok(text, d);
+        for (const [taskCwd, names] of parallelMutators) {
+          if (names.length > 1) {
+            return toolResult(
+              `Parallel mutation rejected: potentially mutating agents (${names.join(", ")}) share project root ${taskCwd}. Use distinct cwd values or a serial chain.`,
+              baseDetails("parallel", []),
+              true,
+            );
+          }
+        }
       }
 
-      return toolError("Internal error: no mode matched");
+      const projectApproval = await confirmProjectAgents(
+        ctx,
+        requestedAgentNames(params),
+        discovery.agents,
+        discovery.projectAgentsDir,
+        trustedProjectRoot,
+        projectRoot,
+        signal,
+      );
+      if (!projectApproval.allowed) {
+        return toolResult(projectApproval.reason ?? "Project-local agents were not approved.", baseDetails(modeOf(params), []), true);
+      }
 
+      let control: ControlContext;
+      try {
+        control = await inheritedControlState(depth, process.env[ROOT_ID_ENV] ?? "") ?? await createControlState(runId);
+      } catch (error) {
+        return toolResult(error instanceof Error ? error.message : String(error), baseDetails(modeOf(params), []), true);
+      }
+      detailRootRunId = control.rootRunId;
+      detailDeadline = control.deadlineMs;
+      const execution: ExecutionContext = {
+        runId,
+        parentRunId,
+        rootRunId: control.rootRunId,
+        depth: depth.depth,
+        deadlineMs: control.deadlineMs,
+        control,
+      };
+      try {
+        const parentModel = ctx.model;
+        let updateFailure: string | undefined;
+      const notify = (text: string, details: SubagentDetails) => {
+        try {
+          onUpdate?.({ content: [{ type: "text", text: truncateOutput(text, MAX_OUTPUT_BYTES) }], details: boundDetails(details) });
+        } catch (error) {
+          updateFailure = error instanceof Error ? error.message : String(error);
+          throw error;
+        }
+      };
+      const emitSingle = (mode: SubagentDetails["mode"], results: AgentResult[], result: AgentResult, progress?: string) => {
+        notify(progress ?? resultText(result), baseDetails(mode, results.map(copyResult)));
+      };
+
+      if (hasSingle) {
+        const result = await runAgent(
+          discovery.agents,
+          params.agent!.trim(),
+          params.task!,
+          rootCwd,
+          execution,
+          parentModel,
+          params.model,
+          undefined,
+          signal,
+          (current, progress) => emitSingle("single", [current], current, progress),
+        );
+        return toolResult(resultText(result), baseDetails("single", [result]), failed(result));
+      }
+
+      if (hasChain) {
+        const results: AgentResult[] = [];
+        let previous = "";
+        for (let index = 0; index < params.chain!.length; index++) {
+          const step = params.chain![index]!;
+          const task = interpolatePrevious(step.task, previous, MAX_TASK_BYTES);
+          const stepCwd = existingDirectory(cwdFor(rootCwd, step.cwd));
+          if (!stepCwd) {
+            const errorResult: AgentResult = {
+              agent: step.agent.trim(),
+              agentSource: "unknown",
+              task: truncateOutput(task, MAX_DIAGNOSTIC_BYTES),
+              runId: randomUUID(),
+              parentRunId: execution.runId,
+              rootRunId: execution.rootRunId,
+              depth: execution.depth + 1,
+              step: index + 1,
+              exitCode: 1,
+              stopReason: "error",
+              errorMessage: truncateOutput(`Working directory does not exist: ${stepCwd}`, MAX_DIAGNOSTIC_BYTES),
+              stderr: "",
+              messages: [],
+              usage: emptyUsage(),
+            };
+            results.push(errorResult);
+            return toolResult(`Chain stopped at step ${index + 1} (${step.agent}): ${resultText(errorResult)}`, baseDetails("chain", results), true);
+          }
+          const result = await runAgent(
+            discovery.agents,
+            step.agent.trim(),
+            task,
+            stepCwd,
+            execution,
+            parentModel,
+            params.model ?? step.model,
+            index + 1,
+            signal,
+            (current, progress) => emitSingle("chain", [...results, current], current, progress),
+          );
+          results.push(result);
+          if (failed(result)) {
+            return toolResult(`Chain stopped at step ${index + 1} (${step.agent}): ${resultText(result)}`, baseDetails("chain", results), true);
+          }
+          previous = truncateOutput(result.output || getFinalOutput(result.messages), MAX_CHAIN_CONTEXT_BYTES);
+        }
+        const finalResult = results[results.length - 1];
+        return toolResult(finalResult ? resultText(finalResult) : "(no output)", baseDetails("chain", results));
+      }
+
+      const placeholders: AgentResult[] = (params.tasks ?? []).map((task) => {
+        const configuredAgent = discovery.agents.find((agent) => agent.name === task.agent.trim());
+        return {
+          agent: task.agent.trim(),
+          agentSource: configuredAgent?.source ?? "unknown",
+          task: truncateOutput(task.task, MAX_DIAGNOSTIC_BYTES),
+          runId: randomUUID(),
+          parentRunId: execution.runId,
+          rootRunId: execution.rootRunId,
+          depth: execution.depth + 1,
+          exitCode: -1,
+          stderr: "",
+          messages: [],
+          usage: emptyUsage(),
+          model: configuredAgent
+            ? resolveModel(configuredAgent, params.model ?? task.model, parentModel)
+            : params.model ?? task.model ?? modelName(parentModel),
+        };
+      });
+      const current = placeholders.map(copyResult);
+      try {
+        notify(`Parallel: 0/${current.length} done`, baseDetails("parallel", current));
+      } catch {
+        return toolResult(`Subagent update failed: ${updateFailure ?? "unknown update error"}`, baseDetails("parallel", current), true);
+      }
+      const results = await mapWithConcurrency(params.tasks!, async (task, index) => runAgent(
+        discovery.agents,
+        task.agent.trim(),
+        task.task,
+        existingDirectory(cwdFor(rootCwd, task.cwd)) ?? cwdFor(rootCwd, task.cwd),
+        execution,
+        parentModel,
+        params.model ?? task.model,
+        undefined,
+        signal,
+        (result, progress) => {
+          current[index] = copyResult(result);
+          const done = current.filter((item) => item.exitCode !== -1).length;
+          notify(progress ?? `Parallel: ${done}/${current.length} done`, baseDetails("parallel", current.map(copyResult)));
+        },
+      ));
+      const successCount = results.filter((result) => !failed(result)).length;
+      const summary = results.map((result) => {
+        const status = failed(result) ? `failed${result.stopReason ? ` (${result.stopReason})` : ""}` : "completed";
+        return `### [${result.agent}] ${status}\n\n${truncateOutput(resultText(result), MAX_DIAGNOSTIC_BYTES)}`;
+      }).join("\n\n---\n\n");
+      return toolResult(`Parallel: ${successCount}/${results.length} succeeded\n\n${truncateOutput(summary, MAX_OUTPUT_BYTES)}`, baseDetails("parallel", results), successCount !== results.length);
       } finally {
-        clearProgress();
+        if (control.ownerDirectory) await fs.promises.rm(control.ownerDirectory, { recursive: true, force: true }).catch(() => {});
       }
     },
 
     renderCall(args, theme) {
-      const label = args.action
-        ? args.action + (args.id ? ` ${args.id}` : "")
-        : args.chain?.length
-          ? `chain (${args.chain.length})`
-          : args.tasks?.length
-            ? `parallel (${args.tasks.length})`
-            : args.background
-              ? `bg ${args.agent ?? "?"}${args.model ? ` [${args.model}]` : ""}`
-              : `${args.agent ?? "?"}${args.model ? ` [${args.model}]` : ""}`;
-      return new Text(
-        `${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", label)}`,
-        0,
-        0,
-      );
+      if (args.action === "list") return new Text(theme.fg("toolTitle", theme.bold("subagent list")), 0, 0);
+      const scope = stripTerminalControls(args.agentScope ?? "user");
+      const label = args.chain?.length
+        ? `chain (${args.chain.length})`
+        : args.tasks?.length
+          ? `parallel (${args.tasks.length})`
+          : stripTerminalControls(args.agent ?? "...");
+      let text = `${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", label)}${theme.fg("muted", ` [${scope}]`)}`;
+      if (args.chain?.length) {
+        for (const [index, step] of args.chain.slice(0, 3).entries()) text += `\n  ${index + 1}. ${theme.fg("accent", stripTerminalControls(step.agent))} ${theme.fg("dim", truncateChars(stripTerminalControls(step.task.replaceAll("{previous}", "").trim()), 60))}`;
+      } else if (args.tasks?.length) {
+        for (const task of args.tasks.slice(0, 3)) text += `\n  ${theme.fg("accent", stripTerminalControls(task.agent))} ${theme.fg("dim", truncateChars(stripTerminalControls(task.task), 60))}`;
+      } else if (args.task) {
+        text += `\n  ${theme.fg("dim", truncateChars(stripTerminalControls(args.task), 80))}`;
+      }
+      return new Text(text, 0, 0);
     },
 
     renderResult(result, { expanded }, theme) {
-      const text = result.content[0]?.type === "text" ? result.content[0].text : "(no output)";
-      const d = result.details as { results?: RunResult[] } | undefined;
-      const hasErr = d?.results?.some((r) => r.exitCode !== 0) ?? false;
-      const icon = hasErr ? theme.fg("error", "✗") : theme.fg("success", "✓");
+      const details = result.details as SubagentDetails | undefined;
+      const fallback = result.content[0]?.type === "text" && typeof result.content[0].text === "string"
+        ? stripTerminalControls(truncateOutput(result.content[0].text, MAX_OUTPUT_BYTES))
+        : "(no output)";
+      if (!details || !["single", "parallel", "chain"].includes(details.mode) || !Array.isArray(details.results) || details.results.length === 0 || !details.results.every(isRenderableAgentResult)) return new Text(fallback, 0, 0);
 
-      // Build summary line with usage stats
-      const summaryParts: string[] = [];
-      if (d?.results?.length) {
-        const totalDuration = d.results.reduce((s, r) => s + r.duration, 0);
-        if (totalDuration >= 1000) {
-          const secs = (totalDuration / 1000).toFixed(1);
-          summaryParts.push(`${secs}s`);
+      const renderBudget = { remaining: MAX_OUTPUT_BYTES };
+      const takeRender = (value: string): string => {
+        if (renderBudget.remaining <= 0) return "[render output truncated]";
+        const bounded = truncateOutput(stripTerminalControls(value), renderBudget.remaining);
+        renderBudget.remaining = Math.max(0, renderBudget.remaining - Buffer.byteLength(bounded, "utf8"));
+        return bounded;
+      };
+      const iconFor = (item: AgentResult) => item.exitCode === -1 ? theme.fg("warning", "⏳") : failed(item) ? theme.fg("error", "✗") : theme.fg("success", "✓");
+      const renderOutput = (item: AgentResult, full: boolean) => {
+        const output = resultText(item);
+        if (item.exitCode === -1 && output === "(no output)") {
+          return details.results.length === 1 ? takeRender(fallback) : takeRender("(running...)");
         }
-        const totalCost = d.results.reduce((s, r) => s + r.cost, 0);
-        const totalTurns = d.results.reduce((s, r) => s + r.turns, 0);
-        if (totalCost > 0) summaryParts.push(`$${totalCost.toFixed(4)}`);
-        if (totalTurns > 0) summaryParts.push(`${totalTurns} turn${totalTurns > 1 ? "s" : ""}`);
-        // Count tool calls across all results
-        const toolCallCount = d.results.reduce(
-          (s, r) => s + r.messages.reduce((ms, m) => ms + (m.toolCalls?.length ?? 0), 0),
-          0,
-        );
-        if (toolCallCount > 0)
-          summaryParts.push(`${toolCallCount} tool call${toolCallCount > 1 ? "s" : ""}`);
-      }
-      const firstModel = d?.results?.find(r => r.model)?.model;
-      const modelStr = firstModel ? ` [${firstModel}]` : "";
-      const inner = `${modelStr}${summaryParts.length ? ` (${summaryParts.join(", ")})` : ""}`;
-      const summaryLine = inner ? ` ${theme.fg("muted", inner)}` : "";
+        return takeRender(full ? output : output.split("\n").slice(0, 5).join("\n"));
+      };
 
       if (expanded) {
-        const c = new Container();
-        c.addChild(
-          new Text(`${icon} ${theme.fg("toolTitle", theme.bold("subagent"))}${summaryLine}`, 0, 0),
-        );
-
-        // Show tool calls from the first result with messages
-        const firstWithMessages = d?.results?.find((r) => r.messages.length > 0);
-        if (firstWithMessages) {
-          const toolCalls = firstWithMessages.messages.filter(
-            (m) => m.role === "assistant" && m.toolCalls?.length,
-          );
-          if (toolCalls.length > 0) {
-            c.addChild(new Spacer(1));
-            c.addChild(new Text(theme.fg("muted", "Tool calls:"), 0, 0));
-            for (const msg of toolCalls.slice(0, 10)) {
-              for (const tc of msg.toolCalls ?? []) {
-                const args =
-                  Object.keys(tc.args).length > 0
-                    ? ` ${theme.fg("muted", JSON.stringify(tc.args).slice(0, 120))}`
-                    : "";
-                c.addChild(new Text(`  ${theme.fg("accent", tc.name)}${args}`, 0, 0));
-              }
-            }
-            if (toolCalls.length > 10)
-              c.addChild(new Text(theme.fg("muted", `  ... +${toolCalls.length - 10} more`), 0, 0));
-          }
+        const container = new Container();
+        container.addChild(new Text(`${iconFor(details.results.some(failed) ? details.results.find(failed)! : details.results[0]!)} ${theme.fg("toolTitle", theme.bold(details.mode))}`, 0, 0));
+        for (const item of details.results) {
+          container.addChild(new Spacer(1));
+          container.addChild(new Text(`${iconFor(item)} ${theme.fg("accent", stripTerminalControls(item.agent))}${theme.fg("muted", ` (${stripTerminalControls(item.agentSource)})`)}${item.stopReason ? theme.fg("dim", ` [${item.stopReason}]`) : ""}`, 0, 0));
+          container.addChild(new Text(theme.fg("dim", takeRender(truncateChars(item.task, 500))), 0, 0));
+          const output = renderOutput(item, true);
+          if (output && output !== "(no output)") container.addChild(new Markdown(output.trim(), 0, 0, getMarkdownTheme()));
+          else container.addChild(new Text(theme.fg("muted", "(no output)"), 0, 0));
+          container.addChild(new Text(theme.fg("dim", formatUsage(item.usage, item.model)), 0, 0));
         }
-
-        c.addChild(new Spacer(1));
-        c.addChild(new Text(text, 0, 0));
-        return c;
+        if (details.results.length > 1) container.addChild(new Text(theme.fg("dim", `Total: ${formatUsage(aggregateUsage(details.results))}`), 0, 0));
+        return container;
       }
 
-      // Collapsed: show first few lines + summary
-      const lines = text.split("\n");
-      const preview =
-        lines.length > 8
-          ? [
-              ...lines.slice(0, 8),
-              theme.fg("muted", `... +${lines.length - 8} more (Ctrl+O to expand)`),
-            ]
-          : lines;
-      return new Text(`${icon} ${preview.join("\n")}${summaryLine}`, 0, 0);
+      let text = `${iconFor(details.results.some(failed) ? details.results.find(failed)! : details.results[0]!)} ${theme.fg("toolTitle", theme.bold(details.mode))}`;
+      for (const item of details.results) {
+        text += `\n\n${iconFor(item)} ${theme.fg("accent", stripTerminalControls(item.agent))}${theme.fg("muted", ` (${stripTerminalControls(item.agentSource)})`)}`;
+        text += `\n${theme.fg("toolOutput", truncateChars(renderOutput(item, false), 500))}`;
+      }
+      text += `\n${theme.fg("dim", formatUsage(aggregateUsage(details.results)))}`;
+      return new Text(text, 0, 0);
     },
   });
 }
+
+/** Keep untrusted agent text from emitting terminal control sequences in the TUI. */
+export function stripTerminalControls(value: string): string {
+  return value
+    // oxlint-disable-next-line no-control-regex
+    .replace(/\u001B\][\s\S]*?(?:\u0007|\u001B\\)/g, "")
+    // oxlint-disable-next-line no-control-regex
+    .replace(/\u001BP[\s\S]*?(?:\u0007|\u001B\\)/g, "")
+    // oxlint-disable-next-line no-control-regex
+    .replace(/\u001B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "")
+    // oxlint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
+}
+
+function truncateChars(value: string, max: number): string {
+  return value.length > max ? `${value.slice(0, Math.max(0, max - 1))}…` : value;
+}
+
+export { SubagentParamsSchema };

@@ -1,6 +1,6 @@
 # pi-subagents
 
-Pi extension for declarative agent delegation. Single file, 7 built-in agents.
+Pi extension for declarative agent delegation. Single, parallel, and sequential-chain delegation with seven bundled agents.
 
 ## Stack
 
@@ -9,7 +9,7 @@ TypeScript, Bun. Pi extension API (`@earendil-works/pi-coding-agent`, `@earendil
 ## Testing
 
 ```bash
-bun test
+bun run check
 ```
 
 No build step — pi loads the extension directly.
@@ -17,30 +17,30 @@ No build step — pi loads the extension directly.
 ## Key Files
 
 ```
-extensions/pi-subagents/index.ts   # everything
-agents/*.md                        # agent definitions (YAML frontmatter)
+extensions/pi-subagents/index.ts   # tool schema, subprocess runner, controls, orchestration, rendering
+extensions/pi-subagents/agents.ts  # scoped discovery and frontmatter policy
+agents/*.md                        # bundled agent definitions
 skills/pi-subagents/SKILL.md       # agent-facing tool reference
-tests/agents.test.ts               # unit tests
+tests/                              # deterministic discovery, runner, and tool tests
 ```
 
 ## Agent Definitions
 
-Markdown + YAML frontmatter in `agents/` (project) or `~/.pi/agents/` (global). Required: `name`, `description`. Optional: `model`, `execution`, `tools`.
+Markdown + YAML frontmatter in `~/.pi/agent/agents/` (user) or `.pi/agents/` (project). Bundled definitions ship in `agents/`. Required: `name`, `description`. Optional: `model`, explicit `tools`, `delegation`, and `capability`.
 
 ```markdown
 ---
 name: reviewer
 description: Code review for correctness and quality
-model: openrouter/anthropic/fable-5
-execution: inline
-tools: read,write,edit,bash,grep,find,ls
+capability: read
+tools: read,grep,find,ls
 ---
 ```
 
-## Key Patterns
+Missing `tools` means `--no-tools`, never all tools. `delegation` defaults false; only `delegation: true` permits the `subagent` tool. `capability` is effect metadata, not a sandbox: `read` or `write`; omission is treated as potentially mutating when parallel tasks share a canonical cwd. A `read` profile must use only known read-only tools (`read`, `grep`, `find`, `ls`, `code_search`, `web_search`, or `fetch_content`) and cannot delegate; unknown or mutation-capable tools invalidate the definition. Bundled `architect` and `worker` may delegate; other bundled agents are leaves.
 
-- Two execution paths: `runAgentInLine` (inline, default) and subprocess. Know which you're modifying.
-- `session.prompt()` returns `Promise<void>`. Output is in `session.messages` after await.
-- Model resolution: `resolveModel` → `findModel` → `ctx.modelRegistry.find(provider, modelId)`.
-- Agent discovery walks up from cwd, stops at first project root (`.git`, `package.json`, `Cargo.toml`, `go.mod`).
-- Background always uses subprocess. `contextOpts` is subprocess-only (inline shares parent memory).
+Project agents are opt-in, require pi project trust, and receive a confirmation in UI sessions; headless sessions reject them. Their task cwd must remain inside the trusted project root. Delegation always runs in a fresh subprocess with `--no-session`; nested calls are bounded by depth 3, a root-wide 32-descendant budget, a shared four-process limit, and a propagated deadline/control file.
+
+Task and system-prompt contents use mode-0600 temporary files. Child environment variables are allowlisted; set `PI_SUBAGENT_PASSTHROUGH_ENV=NAME1,NAME2` to explicitly pass additional provider variables. The package does not implement persistent sessions, background registries, or managed worktrees; those are future explicit opt-ins.
+
+The implementation relies on the current pi CLI/API (`--mode json`, `--no-session`, `--tools`/`--no-tools`, and `@file`) and does not claim compatibility with older pi versions.

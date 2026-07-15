@@ -1,177 +1,126 @@
-import { describe, test, expect } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
+import {
+  discoverAgents,
+  findNearestProjectAgentsDir,
+  findNearestProjectRoot,
+  getBundledAgentsDir,
+  loadAgentsFromDir,
+} from "../extensions/pi-subagents/agents.ts";
 
-const AGENTS_DIR = path.join(import.meta.dir, "..", "agents");
-const EXTENSION = path.join(import.meta.dir, "..", "extensions", "pi-subagents", "index.ts");
-
-// ── Agent file format ───────────────────────────────────────────────────────
-
-describe("agent definitions", () => {
-  const agentFiles = fs.readdirSync(AGENTS_DIR).filter(f => f.endsWith(".md"));
-
-  test("every .md file has valid frontmatter with name and description", () => {
-    for (const file of agentFiles) {
-      const raw = fs.readFileSync(path.join(AGENTS_DIR, file), "utf-8");
-      expect(raw.startsWith("---"), `${file}: must start with ---`).toBe(true);
-
-      const end = raw.indexOf("\n---", 3);
-      expect(end, `${file}: must have closing ---`).toBeGreaterThan(0);
-
-      const frontmatter = raw.slice(4, end);
-      const meta: Record<string, string> = {};
-      for (const line of frontmatter.split("\n")) {
-        const m = line.match(/^([\w-]+):\s*(.*)$/);
-        if (m) meta[m[1]!] = m[2]!.trim();
-      }
-
-      expect(meta.name, `${file}: missing name`).toBeTruthy();
-      expect(meta.description, `${file}: missing description`).toBeTruthy();
-    }
-  });
-
-  test("no agent declares unsupported frontmatter fields", () => {
-    const SUPPORTED = new Set(["name", "description", "model", "tools", "execution"]);
-    for (const file of agentFiles) {
-      const raw = fs.readFileSync(path.join(AGENTS_DIR, file), "utf-8");
-      const end = raw.indexOf("\n---", 3);
-      const frontmatter = raw.slice(4, end);
-      for (const line of frontmatter.split("\n")) {
-        const m = line.match(/^([\w-]+):\s*(.*)$/);
-        if (m) {
-          expect(
-            SUPPORTED.has(m[1]!),
-            `${file}: unsupported field "${m[1]}" — only ${[...SUPPORTED].join(", ")} are read by the extension`,
-          ).toBe(true);
-        }
-      }
-    }
-  });
-
-  test("tools field is comma-separated", () => {
-    for (const file of agentFiles) {
-      const raw = fs.readFileSync(path.join(AGENTS_DIR, file), "utf-8");
-      const end = raw.indexOf("\n---", 3);
-      const frontmatter = raw.slice(4, end);
-      const toolsLine = frontmatter.split("\n").find(l => l.startsWith("tools:"));
-      if (toolsLine) {
-        const value = toolsLine.slice(toolsLine.indexOf(":") + 1).trim();
-        // Should be comma-separated, no spaces around commas expected
-        const tools = value.split(",").map(t => t.trim());
-        expect(tools.length, `${file}: tools must have at least one entry`).toBeGreaterThan(0);
-        for (const t of tools) {
-          expect(t, `${file}: empty tool entry in "${value}"`).toBeTruthy();
-        }
-      }
-    }
-  });
-
-  test("agent names are unique", () => {
-    const names = new Set<string>();
-    for (const file of agentFiles) {
-      const raw = fs.readFileSync(path.join(AGENTS_DIR, file), "utf-8");
-      const end = raw.indexOf("\n---", 3);
-      const frontmatter = raw.slice(4, end);
-      const nameLine = frontmatter.split("\n").find(l => l.startsWith("name:"));
-      if (nameLine) {
-        const name = nameLine.slice(nameLine.indexOf(":") + 1).trim();
-        expect(names.has(name), `${file}: duplicate agent name "${name}"`).toBe(false);
-        names.add(name);
-      }
-    }
-  });
-
-  test("body (system prompt) is non-empty", () => {
-    for (const file of agentFiles) {
-      const raw = fs.readFileSync(path.join(AGENTS_DIR, file), "utf-8");
-      const end = raw.indexOf("\n---", 3);
-      const body = raw.slice(end + 4).trim();
-      expect(body.length, `${file}: system prompt body must not be empty`).toBeGreaterThan(0);
-    }
-  });
-});
-
-// ── Extension entry point ───────────────────────────────────────────────────
-
-describe("extension", () => {
-  test("extension file exists and exports default function", async () => {
-    const mod = await import(EXTENSION);
-    expect(typeof mod.default, "must export default function").toBe("function");
-  });
-});
-
-// ── parseFrontmatter (reimplemented for testing) ────────────────────────────
-
-function parseFrontmatter(content: string): { meta: Record<string, string>; body: string } {
-  const s = content.replace(/\r\n/g, "\n");
-  if (!s.startsWith("---")) return { meta: {}, body: s };
-  const end = s.indexOf("\n---", 3);
-  if (end === -1) return { meta: {}, body: s };
-  const meta: Record<string, string> = {};
-  for (const line of s.slice(4, end).split("\n")) {
-    const m = line.match(/^([\w-]+):\s*(.*)$/);
-    if (m) {
-      let v = m[2]!.trim();
-      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
-      meta[m[1]!] = v;
-    }
-  }
-  return { meta, body: s.slice(end + 4).trim() };
+const tempDirs: string[] = [];
+function tempDir(): string {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-test-"));
+  tempDirs.push(directory);
+  return directory;
+}
+function writeAgent(directory: string, file: string, name: string, extra = "", body = "Prompt") {
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(path.join(directory, file), `---\nname: ${name}\ndescription: ${name} agent${extra}\n---\n${body}\n`);
 }
 
-describe("parseFrontmatter", () => {
-  test("parses name and description", () => {
-    const { meta, body } = parseFrontmatter("---\nname: test\ndescription: A test agent\n---\nHello world");
-    expect(meta.name).toBe("test");
-    expect(meta.description).toBe("A test agent");
-    expect(body).toBe("Hello world");
-  });
-
-  test("handles quoted values", () => {
-    const { meta } = parseFrontmatter('---\nname: "quoted"\ndescription: \'also quoted\'\n---');
-    expect(meta.name).toBe("quoted");
-    expect(meta.description).toBe("also quoted");
-  });
-
-  test("returns empty meta for no frontmatter", () => {
-    const { meta, body } = parseFrontmatter("No frontmatter here");
-    expect(meta).toEqual({});
-    expect(body).toBe("No frontmatter here");
-  });
-
-  test("handles \r\n line endings", () => {
-    const { meta } = parseFrontmatter("---\r\nname: test\r\n---");
-    expect(meta.name).toBe("test");
-  });
-
-  test("ignores malformed lines", () => {
-    const { meta } = parseFrontmatter("---\nname: test\nno-colon-here\n---");
-    expect(meta.name).toBe("test");
-    expect(meta["no-colon-here"]).toBeUndefined();
-  });
+afterEach(() => {
+  for (const directory of tempDirs.splice(0)) fs.rmSync(directory, { recursive: true, force: true });
 });
 
-// ── truncate (reimplemented for testing) ────────────────────────────────────
+describe("agent discovery", () => {
+  test("bundled agents are always included and scopes are explicit", () => {
+    const root = tempDir();
+    const bundled = path.join(root, "bundled");
+    const user = path.join(root, "user");
+    const project = path.join(root, "project", ".pi", "agents");
+    writeAgent(bundled, "bundled.md", "bundled");
+    writeAgent(user, "shared.md", "shared", "\ntools: read, grep\ndelegation: true\ncapability: write");
+    writeAgent(project, "shared.md", "shared", "\nmodel: project/model\ncapability: write");
+    writeAgent(project, "project.md", "project");
 
-function truncate(s: string, maxBytes: number): string {
-  if (Buffer.byteLength(s, "utf-8") <= maxBytes) return s;
-  let t = s;
-  while (Buffer.byteLength(t, "utf-8") > maxBytes) t = t.slice(0, -1);
-  return `${t}\n[truncated — ${Buffer.byteLength(s, "utf-8")} bytes total]`;
-}
+    const userScope = discoverAgents(root, "user", { bundledAgentsDir: bundled, userAgentsDir: user });
+    expect(userScope.agents.map((agent) => agent.name)).toEqual(["bundled", "shared"]);
+    expect(userScope.agents.find((agent) => agent.name === "shared")?.source).toBe("user");
 
-describe("truncate", () => {
-  test("returns string unchanged if under limit", () => {
-    expect(truncate("hello", 100)).toBe("hello");
+    const projectScope = discoverAgents(path.join(root, "project", "src"), "project", { bundledAgentsDir: bundled, userAgentsDir: user });
+    expect(projectScope.agents.map((agent) => agent.name)).toEqual(["bundled", "project", "shared"]);
+    expect(projectScope.agents.find((agent) => agent.name === "shared")?.source).toBe("project");
+    expect(projectScope.agents.find((agent) => agent.name === "project")?.source).toBe("project");
+
+    const bothScope = discoverAgents(path.join(root, "project"), "both", { bundledAgentsDir: bundled, userAgentsDir: user });
+    expect(bothScope.agents.map((agent) => agent.name)).toEqual(["bundled", "project", "shared"]);
   });
 
-  test("truncates to maxBytes and appends notice", () => {
-    const result = truncate("hello world", 5);
-    expect(result).toContain("[truncated");
-    expect(Buffer.byteLength(result.split("\n")[0]!, "utf-8")).toBeLessThanOrEqual(5);
+  test("uses the nearest CONFIG_DIR_NAME agents directory", () => {
+    const root = tempDir();
+    const nested = path.join(root, "nested", "deep");
+    fs.mkdirSync(nested, { recursive: true });
+    writeAgent(path.join(root, ".pi", "agents"), "root.md", "root");
+    writeAgent(path.join(root, "nested", ".pi", "agents"), "nested.md", "nested");
+    expect(findNearestProjectAgentsDir(nested)).toBe(fs.realpathSync.native(path.join(root, "nested", ".pi", "agents")));
   });
 
-  test("handles empty string", () => {
-    expect(truncate("", 100)).toBe("");
+  test("does not walk beyond a repository root", () => {
+    const root = tempDir();
+    const nested = path.join(root, "repo", "src");
+    fs.mkdirSync(nested, { recursive: true });
+    fs.writeFileSync(path.join(root, "repo", "package.json"), "{}");
+    writeAgent(path.join(root, ".pi", "agents"), "outside.md", "outside");
+    expect(findNearestProjectAgentsDir(nested)).toBeNull();
+    expect(findNearestProjectRoot(nested)).toBe(fs.realpathSync.native(path.join(root, "repo")));
+  });
+
+  test("does not follow a symlinked project config directory", () => {
+    const root = tempDir();
+    const repo = path.join(root, "repo");
+    const outside = path.join(root, "outside", "agents");
+    fs.mkdirSync(repo, { recursive: true });
+    fs.writeFileSync(path.join(repo, "package.json"), "{}");
+    writeAgent(outside, "outside.md", "outside");
+    fs.symlinkSync(path.join(root, "outside"), path.join(repo, ".pi"));
+    expect(findNearestProjectAgentsDir(repo)).toBeNull();
+  });
+
+  test("skips malformed files and project symlinks", () => {
+    const directory = tempDir();
+    writeAgent(directory, "valid.md", "valid");
+    fs.symlinkSync(path.join(directory, "valid.md"), path.join(directory, "linked.md"));
+    expect(loadAgentsFromDir(directory, "project")).toHaveLength(1);
+  });
+
+  test("skips malformed files and parses pi frontmatter", () => {
+    const directory = tempDir();
+    writeAgent(directory, "valid.md", "valid", "\ntools: read, grep", "System prompt");
+    fs.writeFileSync(path.join(directory, "missing.md"), "---\nname: missing\n---\nignored");
+    fs.writeFileSync(path.join(directory, "broken.md"), "---\nname: [broken\n---\nignored");
+    fs.writeFileSync(path.join(directory, "huge.md"), "x".repeat(256 * 1024 + 1));
+    fs.writeFileSync(path.join(directory, "note.txt"), "not an agent");
+    const agents = loadAgentsFromDir(directory, "user");
+    expect(agents).toHaveLength(1);
+    expect(agents[0]).toMatchObject({ name: "valid", tools: ["read", "grep"], delegation: false, systemPrompt: "System prompt" });
+  });
+
+  test("parses nested delegation and capability metadata", () => {
+    const directory = tempDir();
+    writeAgent(directory, "nested.md", "nested", "\ndelegation: true\ncapability: write\ntools: read, subagent");
+    const [agent] = loadAgentsFromDir(directory, "user");
+    expect(agent).toMatchObject({ delegation: true, capability: "write", tools: ["read", "subagent"] });
+  });
+
+  test("skips read profiles with mutation-capable or unknown tools", () => {
+    const directory = tempDir();
+    writeAgent(directory, "bash.md", "bash", "\ncapability: read\ntools: read, bash");
+    writeAgent(directory, "nested.md", "nested", "\ndelegation: true\ncapability: read\ntools: read");
+    writeAgent(directory, "unknown.md", "unknown", "\ncapability: read\ntools: read, custom_tool");
+    expect(loadAgentsFromDir(directory, "user")).toHaveLength(0);
+  });
+
+  test("skips invalid control metadata instead of broadening policy", () => {
+    const directory = tempDir();
+    writeAgent(directory, "bad-delegation.md", "bad-delegation", "\ndelegation: yes");
+    writeAgent(directory, "bad-capability.md", "bad-capability", "\ncapability: execute");
+    expect(loadAgentsFromDir(directory, "user")).toHaveLength(0);
+  });
+
+  test("bundled directory points at package definitions", () => {
+    expect(fs.statSync(getBundledAgentsDir()).isDirectory()).toBe(true);
   });
 });

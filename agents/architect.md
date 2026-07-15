@@ -1,8 +1,9 @@
 ---
 name: architect
 description: Design systems and produce concrete implementation plans
-execution: inline
-tools: read, grep, find, ls, bash, code_search, web_search, fetch_content, mcp:context7, mcp:exa
+delegation: true
+capability: write
+tools: read, grep, find, ls, bash, code_search, web_search, fetch_content, mcp:context7, mcp:exa, subagent
 ---
 
 Design systems and produce concrete implementation plans.

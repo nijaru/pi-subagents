@@ -1,211 +1,48 @@
 ---
 name: pi-subagents
 description: |
-  Delegate work to subagents with single-agent, chain, and parallel workflows.
-  Use for review, implementation handoffs, research, and multi-step tasks.
+  Delegate work to specialized agents with single-agent, parallel, and sequential-chain workflows.
+  Use for review, implementation handoffs, and bounded recursive delegation.
 ---
 
 # Pi Subagents
 
-Delegate tasks to specialized subagents with isolated context.
+Use the `subagent` tool to delegate focused work to isolated pi subprocesses.
 
-## When to Use
+## Contract
 
-Concrete triggers — delegate when any of these apply:
+The tool accepts exactly one mode:
 
-- **New feature touching 3+ files** → architect designs, worker implements, reviewer reviews
-- **Auth/security/crypto/input-validation change** → security-auditor reviews before commit
-- **Bug you can't reproduce in 2 attempts** → explore gets fresh eyes
-- **Large refactor** → explore maps impact, worker executes, reviewer validates
-- **PR-ready code** → reviewer does adversarial review
-- **Performance issue with measurable target** → profiler profiles and recommends
-- **Need external docs/API patterns/examples** → researcher searches and synthesizes
-- **Unknown codebase or scope** → explore maps structure
+| Mode | Shape | Behavior |
+|---|---|---|
+| Single | `{ agent, task }` | Run one agent and return its final output |
+| Parallel | `{ tasks: [{ agent, task, model?, cwd? }] }` | Run up to 8 tasks with bounded concurrency |
+| Chain | `{ chain: [{ agent, task, model?, cwd? }] }` | Run steps serially; `{previous}` is the preceding final output |
 
-## When NOT to Delegate
+Use the top-level `model` to override any mode. Resolution is top-level/item override → agent definition → parent pi model. `cwd` defaults to the current project directory. A chain stops at its first failed step.
 
-- Reading specific files with known paths — read directly
-- Small changes (< 3 files, clear scope) — handle in main session
-- Quick targeted fixes — no delegation overhead
-- Iterative refinement — main session needs ongoing context
+`action: "list"` is the only action and cannot be combined with a delegation mode.
 
-## Agent Discovery
+## Agent policy
 
-Agents are loaded in priority order (highest wins):
+Definitions are Markdown files with YAML frontmatter. Required: `name`, `description`. Optional: `model`, `tools`, `capability`, and `delegation`.
 
-1. **Bundled** — ships with the extension (`agents/*.md` in the extension directory)
-2. **User-level** — `~/.pi/agents/*.md` (always loaded, overrides bundled)
-3. **Project-level** — `.pi/agents/*.md` or `agents/*.md` walking up from cwd (overrides user)
+- `tools` is an explicit allowlist. Missing tools means the child receives `--no-tools`, not pi's defaults.
+- `capability: read` is effect metadata for scheduling safety, not a security sandbox; `capability: write` marks it potentially mutating. Omitted capability is conservatively potentially mutating. A read profile is accepted only with the known read-only tools (`read`, `grep`, `find`, `ls`, `code_search`, `web_search`, or `fetch_content`) and cannot delegate; unknown or mutation-capable tools invalidate the definition.
+- `delegation: true` is required for nested `subagent` calls and defaults false. Delegation-capable profiles must use `capability: write` or omit the capability. Bundled `architect` and `worker` may delegate; other bundled agents are leaves.
 
-To customize agents: place `.md` files in `~/.pi/agents/` (global) or `.pi/agents/` (project). Same name overrides the bundled definition.
+Project agents are repository-controlled prompts. The current pi project must be trusted, UI sessions confirm before using them, and headless calls reject them. Project-agent task `cwd` values must remain inside the trusted project root. Parallel potentially mutating tasks sharing the same canonical cwd are rejected; distinct cwd values may run concurrently. Use a serial chain for shared-worktree writes.
 
-To override models for bundled agents: use `settings.json` `subagents.agentOverrides` — don't modify the bundled `.md` files.
+## Safety and limits
 
-## Included Agents
+Every delegation starts a fresh `pi --mode json -p --no-session` subprocess. Task and system-prompt contents travel through temporary mode-0600 files, not argv. Cancellation terminates the root process group; normal completion also sweeps surviving descendants.
 
-| Agent | Use when | Default model |
-|-------|----------|---------------|
-| architect | Designing a feature before implementation, need a plan | *(inherits parent)* |
-| explore | Scope unknown, need to map codebase structure | *(inherits parent)* |
-| profiler | Have a measurable perf target, need evidence-based optimization | *(inherits parent)* |
-| researcher | Need external docs, API patterns, library examples | *(inherits parent)* |
-| reviewer | Finished code needs adversarial review before merge | *(inherits parent)* |
-| security-auditor | Touching auth, crypto, input validation, trust boundaries | *(inherits parent)* |
-| worker | No specialist needed, general implementation | *(inherits parent)* |
+Nested calls propagate depth, run/parent/root IDs, deadline, timeout, explicit passthrough-env policy, and an ephemeral mode-0600 control state. The root-wide limits are depth 3, 32 total descendants, and four live child processes. These are guardrails rather than a hostile-code sandbox: a Bash-capable child can intentionally launch outside the extension's control file or process group. A full shared semaphore fails fast rather than deadlocking active parents. Each process has a 30-minute hard timeout, configurable up to two hours with `PI_SUBAGENT_TIMEOUT_MS`, and bounded by the root deadline.
 
-All agents inherit the parent session's model by default. Override per-agent via `~/.pi/agents/<name>.md` frontmatter or `settings.json` `subagents.agentOverrides`.
+Only an environment allowlist is copied. Additional provider variables require `PI_SUBAGENT_PASSTHROUGH_ENV=NAME1,NAME2`; ambient secrets are not copied automatically. Parent-model inheritance passes `provider/id`, not runtime-registered provider/auth state. The model-visible final result and partial updates use one deterministic 50 KiB cap per tool call; final output is separate from bounded message records, and cumulative message updates are charged by logical growth with an independent raw stream cap. Stream data, stderr, diagnostics, stored messages, and rendering are bounded too.
 
-## Tool Modes
+Result details include bounded typed pi messages, usage, stop reasons, and run/depth IDs where available. Thrown tool errors preserve pi-agent-core semantics; custom `Error` fields may be dropped by pi, so structured details are not guaranteed on failures. Malformed subprocess JSON and malformed result details are ignored or rendered safely.
 
-| Mode | Parameters | Description |
-|------|-----------|-------------|
-| Single | `{ agent, task }` | One agent, one task (blocks until done) |
-| Single + model | `{ agent, task, model }` | Override agent's default model |
-| Single + bg | `{ agent, task, background: true }` | Non-blocking, returns run ID |
-| Single + fork | `{ agent, task, context: "fork" }` | Child inherits parent's session history |
-| Single + execution | `{ agent, task, execution: "subprocess" }` | Override execution mode |
-| Single + acceptance | `{ agent, task, acceptance: {...} }` | Verify output with shell commands, retry on failure |
-| Chain | `{ chain: [...] }` | Sequential with `{previous}`, `{task}`, `{outputs.name}` placeholders |
-| Parallel | `{ tasks: [...] }` | Concurrent execution (max 8) |
-| Parallel + concurrency | `{ tasks: [...], concurrency: N }` | Limit concurrent agents (default 4) |
+`pi-workflows` is a separate orchestration extension with private in-process SDK leaf sessions; it should not invoke this public tool as its worker backend. A future process-isolated workflow adapter, if needed, should be a private leaf runner rather than nested public scheduling.
 
-### Execution Modes
-
-- **inline** (default): in-process, shared memory, faster. Use when agent doesn't need crash isolation.
-- **subprocess**: isolated, crash-safe, ~230MB per agent. Use for background runs or untrusted code.
-- **context: "fork"**: agent inherits parent's conversation history. Use when agent needs prior context (e.g., "review what we just discussed").
-
-### Background vs Blocking
-
-- **blocking** (default): parent waits for result. Use for short tasks or when result is needed immediately.
-- **background**: returns run ID immediately. Use for long-running tasks (refactors, large reviews). Check with `action: "status"`, wait with `action: "wait"`.
-
-## Lifecycle Actions
-
-| Action | Parameters | Description |
-|--------|-----------|-------------|
-| list | — | Show available agents with models and tools |
-| status | `{ id }` | Show run status, output, cost, duration |
-| wait | `{ id }` | Block until background run completes |
-| resume | `{ id, task }` | Send follow-up message to completed/failed run |
-| interrupt | `{ id }` | Cancel a running background agent (SIGTERM) |
-| create | `{ agent, task, prompt }` | Create a new agent definition |
-| update | `{ agent, ... }` | Update agent fields (task, model, prompt) |
-| delete | `{ agent }` | Delete an agent definition |
-
-## Agent Definitions
-
-Agents are markdown files with YAML frontmatter:
-
-```markdown
----
-name: my-agent
-description: What this agent does
-model: openrouter/anthropic/fable-5
-execution: inline
-tools: read, grep, find, ls, bash
----
-
-System prompt for the agent.
-```
-
-### Supported Frontmatter Fields
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| name | yes | Unique identifier |
-| description | yes | What this agent does |
-| model | no | Model for this agent (inherits parent if omitted) |
-| execution | no | `inline` (default) or `subprocess`. Inline uses in-process execution, shared memory. Subprocess for crash isolation. |
-| tools | no | Comma-separated list of allowed tools |
-
-
-
-**Locations:**
-- `~/.pi/agents/*.md` — User-level (always loaded)
-- `agents/*.md` — Project-level (overrides user)
-- `.pi/agents/*.md` — Project-level (alternative location)
-
-## Usage Examples
-
-### Single agent
-```
-Use explore to find all authentication code
-```
-
-### Chain with named outputs
-```
-subagent(chain=[
-  { agent: "explore", task: "Find auth code", as: "auth" },
-  { agent: "reviewer", task: "Review {outputs.auth} for issues" }
-])
-```
-
-### Chain with quality gates
-```
-subagent(chain=[
-  { agent: "worker", task: "Add tests", gate: "npm test", onFail: "retry" },
-  { agent: "reviewer", task: "Review {previous}" }
-])
-```
-
-### Parallel exploration
-```
-Run 2 researchers in parallel: one for OAuth docs, one for session management
-```
-
-### Background with lifecycle
-```
-subagent(agent="worker", task="Refactor auth module", background=true)
-subagent(action="status", id="<run-id>")
-subagent(action="wait", id="<run-id>")
-subagent(action="interrupt", id="<run-id>")  # cancel if needed
-subagent(action="resume", id="<run-id>", task="Now add tests")
-```
-
-### Context fork (inherit parent session)
-```
-subagent(agent="reviewer", task="Review what we just discussed", context="fork")
-```
-
-### Acceptance contract
-```
-subagent(
-  agent="worker",
-  task="Fix the failing test",
-  acceptance={
-    criteria: ["All tests pass", "No new warnings"],
-    verify: ["npm test", "npm run lint"],
-    maxAttempts: 3
-  }
-)
-```
-
-### Agent management
-```
-subagent(action="create", agent="linter", task="Run and fix linting issues", prompt="You are a code linter. Fix all lint issues.", model="openrouter/anthropic/fable-5")
-subagent(action="update", agent="worker", model="openrouter/anthropic/fable-5")
-subagent(action="delete", agent="old-agent")
-```
-
-## Key Patterns
-
-- **Context isolation**: each agent gets fresh context by default (use `context: "fork"` to inherit)
-- **{previous}**: chain steps receive prior step output (empty on first step)
-- **{task}**: chain steps can reference the original request
-- **{outputs.name}**: chain steps can reference named outputs from earlier steps (set `as` on steps)
-- **Quality gates**: shell commands between chain steps, `$SUBAGENT_OUTPUT` has step output
-- **Acceptance contracts**: verify agent output with shell commands, auto-retry on failure
-- **Task-type routing**: agents without explicit model get routed to cost-appropriate tier
-- **Bounded depth**: max 3 levels of nesting
-- **Run persistence**: background runs persist to `~/.pi/agent/subagent-runs.json`, reconciled on startup
-
-## Best Practices
-
-- Prefer specific tasks: `Review auth.ts for null-check gaps` > `Review everything`
-- Use chains for multi-step workflows
-- Use parallel for independent exploration
-- Use `as` on chain steps when later steps need specific earlier output
-- Use acceptance contracts for verifiable tasks (tests pass, lint clean)
-- Use `context: "fork"` when the agent needs to see the conversation so far
-- Keep writes single-threaded unless using parallel reads
+Persistent sessions, background registries, and managed worktrees are future explicit opt-ins, not part of this tool.

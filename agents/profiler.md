@@ -1,7 +1,7 @@
 ---
 name: profiler
 description: Performance specialist — profiles, identifies bottlenecks, recommends optimizations with measured evidence.
-execution: inline
+capability: write
 tools: read, write, bash, grep, find, ls
 ---
 
