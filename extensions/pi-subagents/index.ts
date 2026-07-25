@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import type { Message, Model, StopReason, Usage } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
+import { findEnvKeys, getProviders } from "@earendil-works/pi-ai/compat";
 import {
   CONFIG_DIR_NAME,
   type AgentToolResult,
@@ -69,6 +70,13 @@ const SAFE_ENV_KEYS = new Set([
   "ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "OPENAI_ORG_ID", "OPENROUTER_BASE_URL",
   "AZURE_OPENAI_ENDPOINT", "GOOGLE_APPLICATION_CREDENTIALS", "AWS_PROFILE",
   "AWS_REGION", "AWS_DEFAULT_REGION",
+]);
+
+// These are ambient model configuration values used by providers that do not
+// expose their credentials through findEnvKeys(). They are not application
+// secrets and are safe to pass alongside the standard provider API keys.
+const AMBIENT_MODEL_ENV_KEYS = new Set([
+  "GOOGLE_CLOUD_API_KEY", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "GCLOUD_PROJECT",
 ]);
 
 const activeChildren = new Set<ChildProcess>();
@@ -663,45 +671,84 @@ function passthroughPatternToRegExp(pattern: string): RegExp | undefined {
   }
 }
 
-function collectModelEnvRefs(model?: string): Set<string> {
+const ENV_VAR_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const ENV_VAR_PREFIX = /^[A-Za-z_][A-Za-z0-9_]*/;
+
+/** Match pi's JSONC support while preserving string literals. */
+function stripJsonComments(input: string): string {
+  return input
+    .replace(/"(?:\\.|[^"\\])*"|\/\/[^\n]*/g, (match) => (match[0] === '"' ? match : ""))
+    .replace(/"(?:\\.|[^"\\])*"|,(\s*[}\]])/g, (match, tail) => tail ?? (match[0] === '"' ? match : ""));
+}
+
+function collectConfigEnvRefs(value: unknown, refs: Set<string>): void {
+  if (typeof value === "string") {
+    let index = 0;
+    while (index < value.length) {
+      const dollarIndex = value.indexOf("$", index);
+      if (dollarIndex < 0) return;
+      const next = value[dollarIndex + 1];
+      if (next === "$" || next === "!") {
+        index = dollarIndex + 2;
+        continue;
+      }
+      if (next === "{") {
+        const end = value.indexOf("}", dollarIndex + 2);
+        if (end < 0) {
+          index = dollarIndex + 1;
+          continue;
+        }
+        const name = value.slice(dollarIndex + 2, end);
+        if (ENV_VAR_NAME.test(name)) refs.add(name);
+        index = end + 1;
+        continue;
+      }
+      const match = value.slice(dollarIndex + 1).match(ENV_VAR_PREFIX);
+      if (match) {
+        refs.add(match[0]);
+        index = dollarIndex + 1 + match[0].length;
+      } else {
+        index = dollarIndex + 1;
+      }
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectConfigEnvRefs(item, refs);
+    return;
+  }
+  if (value && typeof value === "object") {
+    for (const item of Object.values(value)) collectConfigEnvRefs(item, refs);
+  }
+}
+
+function collectModelEnvRefs(): Set<string> {
   const refs = new Set<string>();
   try {
     const agentDir = getAgentDir();
     const modelsPath = path.join(agentDir, "models.json");
     const raw = fs.readFileSync(modelsPath, "utf8");
-    const parsed = JSON.parse(raw) as { providers?: Record<string, { apiKey?: string; models?: Array<{ id?: string }> }> };
-    const providerName = model ? model.split("/")[0] : undefined;
-    if (providerName && parsed.providers?.[providerName]) {
-      const provider = parsed.providers[providerName];
-      // Provider may have apiKey like "$OPENROUTER_API_KEY" or "${VAR}"
-      const keysToScan = [provider.apiKey ?? ""];
-      // Also scan model-specific overrides if any
-      for (const m of provider.models ?? []) {
-        if ((m as any).apiKey) keysToScan.push((m as any).apiKey as string);
-      }
-      const dollarRegex = /\$\{?([A-Z][A-Z0-9_]{2,})\}?/g;
-      for (const str of keysToScan) {
-        let match: RegExpExecArray | null;
-        const re = new RegExp(dollarRegex, "g");
-        while ((match = re.exec(str)) !== null) {
-          const name = match[1];
-          if (name && /^[A-Z_][A-Z0-9_]*$/.test(name)) refs.add(name);
-        }
-      }
-      // If we found provider-specific refs, return them (least privilege)
-      if (refs.size > 0) return refs;
-    }
-    // Fallback: scan entire file for $VAR references (covers all providers) - used when model undefined or provider has no apiKey reference
-    const dollarRegexAll = /\$\{?([A-Z][A-Z0-9_]{2,})\}?/g;
-    let match: RegExpExecArray | null;
-    while ((match = dollarRegexAll.exec(raw)) !== null) {
-      const name = match[1];
-      if (name && /^[A-Z_][A-Z0-9_]*$/.test(name)) refs.add(name);
-    }
+    const parsed = JSON.parse(stripJsonComments(raw)) as unknown;
+    collectConfigEnvRefs(parsed, refs);
   } catch {
     // Best-effort; absence of models.json is not fatal
   }
   return refs;
+}
+
+function modelCredentialEnvKeys(): Set<string> {
+  const keys = new Set(AMBIENT_MODEL_ENV_KEYS);
+  const available = Object.fromEntries(
+    Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
+  );
+  try {
+    for (const provider of getProviders()) {
+      for (const key of findEnvKeys(provider, available) ?? []) keys.add(key);
+    }
+  } catch {
+    // A provider catalog failure must not prevent subagent execution.
+  }
+  return keys;
 }
 
 function childEnvironment(
@@ -711,31 +758,24 @@ function childEnvironment(
   childRunId: string,
   budgetRemaining: number,
   cwd: string,
-  model?: string,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const key of SAFE_ENV_KEYS) {
     const value = process.env[key];
     if (value !== undefined) env[key] = value;
   }
-  // Auto-include env vars referenced in ~/.pi/agent/models.json.
-  // If a specific model is known, prefer its provider's var (least privilege),
-  // but also include all model refs so nested subagents with different models work
-  // (parent glm -> child meta would otherwise fail). This is automatic - no manual list.
-  const specificRefs = model ? collectModelEnvRefs(model) : new Set<string>();
-  const allRefs = collectModelEnvRefs();
-  for (const ref of new Set([...specificRefs, ...allRefs])) {
+  // Auto-include env vars referenced in ~/.pi/agent/models.json. This covers
+  // provider keys, custom headers, and nested children using another configured
+  // model without exposing unrelated environment variables.
+  for (const ref of collectModelEnvRefs()) {
     const value = process.env[ref];
     if (value !== undefined) env[ref] = value;
   }
-  // Automatic pass-through of API keys: if parent has *_API_KEY set, child needs it to call models/tools.
-  // This replaces the need for manual PI_SUBAGENT_PASSTHROUGH_ENV="*_API_KEY" and supports nesting.
-  // Still allowlisted - only *_API_KEY and *_TOKEN, not all env.
-  for (const [k, v] of Object.entries(process.env)) {
-    if (v === undefined) continue;
-    if (k.endsWith("_API_KEY") || k.endsWith("_TOKEN") || k === "GMI_API_KEY") {
-      env[k] = v;
-    }
+  // Auto-include only standard model credentials. Tool and application keys
+  // require explicit PI_SUBAGENT_PASSTHROUGH_ENV opt-in.
+  for (const key of modelCredentialEnvKeys()) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
   }
   // Allow the user to explicitly opt in to additional non-standard provider
   // variables without making every ambient environment variable available to
@@ -1046,7 +1086,6 @@ async function runPiProcess(
   reservation: ChildReservation,
   signal: AbortSignal | undefined,
   onEvent: (event: ParsedJsonEvent) => void,
-  model?: string,
 ): Promise<ProcessResult> {
   if (signal?.aborted) return { exitCode: 1, stopReason: "aborted", errorMessage: "Subagent aborted.", stderr: "" };
   const timeoutMs = processTimeoutMs(control.deadlineMs);
@@ -1088,7 +1127,7 @@ async function runPiProcess(
     try {
       child = spawn(invocation.command, invocation.args, {
         cwd,
-        env: childEnvironment(depth + 1, control, parentRunId, childRunId, reservation.budgetRemaining, cwd, model),
+        env: childEnvironment(depth + 1, control, parentRunId, childRunId, reservation.budgetRemaining, cwd),
         shell: false,
         // Keep nested children in the root child's process group. The root
         // child is detached from the host; descendants then die with that
@@ -1347,7 +1386,7 @@ async function runAgent(
         result.errorMessage = eventFailure;
         report(eventFailure);
       }
-    }, result.model);
+    });
 
     result.exitCode = processResult.exitCode;
     result.stopReason = processResult.stopReason ?? result.stopReason ?? (processResult.exitCode === 0 ? "stop" : "error");

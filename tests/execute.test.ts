@@ -34,6 +34,16 @@ printf '%s\\n' '{"type":"message_end","message":{"role":"assistant","content":[{
   fs.chmodSync(script, 0o755);
   return script;
 }
+function writeEnvPi(): string {
+  const directory = tempDir();
+  const script = path.join(directory, "env-pi");
+  fs.writeFileSync(script, `#!/bin/sh
+printf '%s\\n' "$PI_SUBAGENTS_TEST_MODEL_KEY" "$pi_subagents_test_lower" "$OPENAI_API_KEY" "$UNRELATED_API_KEY" "$UNRELATED_TOKEN" > "$0.env"
+printf '%s\\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"env result"}],"model":"fake/model","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":0}}'
+`);
+  fs.chmodSync(script, 0o755);
+  return script;
+}
 function writeEmptyPi(): string {
   const directory = tempDir();
   const script = path.join(directory, "empty-pi");
@@ -221,6 +231,52 @@ describe("subprocess behavior", () => {
     expect(args).toContain("--no-tools");
     expect(args.some((arg) => arg.startsWith("@") && arg.endsWith("/task.md"))).toBe(true);
     expect(args.join(" ")).not.toContain("Task: run");
+  });
+
+  test("forwards parsed model refs without unrelated credentials", async () => {
+    const root = tempDir();
+    const agentDir = tempDir();
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const previousOpenAIKey = process.env.OPENAI_API_KEY;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    process.env.PI_SUBAGENTS_TEST_MODEL_KEY = "model-secret";
+    process.env.pi_subagents_test_lower = "lower-secret";
+    process.env.OPENAI_API_KEY = "standard-model-secret";
+    process.env.UNRELATED_API_KEY = "unrelated-api-secret";
+    process.env.UNRELATED_TOKEN = "unrelated-token-secret";
+    fs.writeFileSync(path.join(agentDir, "models.json"), `{
+  // Pi accepts JSONC model configuration.
+  "providers": {
+    "custom": {
+      "apiKey": "$PI_SUBAGENTS_TEST_MODEL_KEY",
+      "headers": { "x-test": "$pi_subagents_test_lower", },
+      "models": [],
+    },
+  },
+}`);
+    const fake = writeEnvPi();
+    process.env.PI_SUBAGENT_BIN = fake;
+    try {
+      const result = await call(tool, { agent: "worker", task: "run", model: "custom/model" }, ctx(root));
+      expect(result.isError).toBeUndefined();
+      expect(fs.readFileSync(`${fake}.env`, "utf8").split("\n")).toEqual([
+        "model-secret",
+        "lower-secret",
+        "standard-model-secret",
+        "",
+        "",
+        "",
+      ]);
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      delete process.env.PI_SUBAGENTS_TEST_MODEL_KEY;
+      delete process.env.pi_subagents_test_lower;
+      if (previousOpenAIKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousOpenAIKey;
+      delete process.env.UNRELATED_API_KEY;
+      delete process.env.UNRELATED_TOKEN;
+    }
   });
 
   test("keeps full final output separate from bounded message details and handles cumulative updates", async () => {
