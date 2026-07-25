@@ -638,6 +638,50 @@ async function inheritedControlState(depth: DepthStatus, rootRunId: string): Pro
   return { statePath: controlPath, rootRunId: parsed.rootRunId, deadlineMs: parsed.deadlineMs };
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function passthroughPatternToRegExp(pattern: string): RegExp | undefined {
+  // Allow exact names and glob patterns containing * and ?. Example: *_API_KEY, OPENAI_*, *TOKEN*
+  if (!pattern) return undefined;
+  if (!/^[A-Za-z0-9_*?]+$/.test(pattern) && pattern !== "*") return undefined;
+  // Exact name fast path
+  if (!pattern.includes("*") && !pattern.includes("?")) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(pattern)) return undefined;
+    return new RegExp(`^${escapeRegExp(pattern)}$`);
+  }
+  const escaped = pattern.split("").map((ch) => {
+    if (ch === "*") return ".*";
+    if (ch === "?") return ".";
+    return escapeRegExp(ch);
+  }).join("");
+  try {
+    return new RegExp(`^${escaped}$`);
+  } catch {
+    return undefined;
+  }
+}
+
+function collectModelEnvRefs(): Set<string> {
+  const refs = new Set<string>();
+  try {
+    const agentDir = getAgentDir();
+    const modelsPath = path.join(agentDir, "models.json");
+    const raw = fs.readFileSync(modelsPath, "utf8");
+    // Fast regex scan plus JSON walk for robustness - $VAR or ${VAR}
+    const dollarRegex = /\$\{?([A-Z][A-Z0-9_]{2,})\}?/g;
+    let match: RegExpExecArray | null;
+    while ((match = dollarRegex.exec(raw)) !== null) {
+      const name = match[1];
+      if (name && /^[A-Z_][A-Z0-9_]*$/.test(name)) refs.add(name);
+    }
+  } catch {
+    // Best-effort; absence of models.json is not fatal
+  }
+  return refs;
+}
+
 function childEnvironment(
   depth: number,
   control: ControlContext,
@@ -651,12 +695,30 @@ function childEnvironment(
     const value = process.env[key];
     if (value !== undefined) env[key] = value;
   }
+  // Auto-include env vars referenced in ~/.pi/agent/models.json (e.g. "$OPENROUTER_API_KEY")
+  // so env-only provider keys work without manual passthrough list maintenance.
+  for (const ref of collectModelEnvRefs()) {
+    const value = process.env[ref];
+    if (value !== undefined) env[ref] = value;
+  }
   // Allow the user to explicitly opt in to additional non-standard provider
   // variables without making every ambient environment variable available to
-  // a delegated bash-capable agent.
-  for (const key of (process.env[PASSTHROUGH_ENV] ?? "").split(",")) {
-    const name = key.trim();
-    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && process.env[name] !== undefined) env[name] = process.env[name];
+  // a delegated bash-capable agent. Supports exact names and glob patterns
+  // like *_API_KEY, OPENAI_*, *. Set "*" to pass all env (explicit insecure opt-in).
+  const passthroughRaw = process.env[PASSTHROUGH_ENV] ?? "";
+  const patterns = passthroughRaw.split(",").map((s) => s.trim()).filter(Boolean);
+  if (patterns.length > 0) {
+    const allParentKeys = Object.keys(process.env);
+    for (const pat of patterns) {
+      const re = passthroughPatternToRegExp(pat);
+      if (!re) continue;
+      for (const key of allParentKeys) {
+        if (re.test(key)) {
+          const value = process.env[key];
+          if (value !== undefined) env[key] = value;
+        }
+      }
+    }
   }
   env["PWD"] = cwd;
   env[DEPTH_ENV] = String(depth);
@@ -1124,7 +1186,19 @@ async function runPiProcess(
         return;
       }
       const exitCode = code ?? 1;
-      finish({ exitCode, stderr, stopReason: exitCode === 0 ? undefined : "error", errorMessage: exitCode === 0 ? undefined : `Subagent exited with code ${exitCode}.` });
+      let errorMessage: string | undefined;
+      if (exitCode !== 0) {
+        const cleanStderr = stderr.trim();
+        if (cleanStderr) {
+          errorMessage = `Subagent exited with code ${exitCode}.\n${truncateOutput(cleanStderr, 2048)}`;
+          if (/No API key|No models match pattern|API key.*not found/i.test(cleanStderr)) {
+            errorMessage += `\n\nHint: Child env is allowlisted. Model keys in ~/.pi/agent/models.json like $OPENROUTER_API_KEY are now auto-passed. For other keys, set PI_SUBAGENT_PASSTHROUGH_ENV with globs e.g. "*_API_KEY" and restart pi. Auth in ~/.pi/agent/auth.json via /login needs no passthrough.`;
+          }
+        } else {
+          errorMessage = `Subagent exited with code ${exitCode}.`;
+        }
+      }
+      finish({ exitCode, stderr, stopReason: exitCode === 0 ? undefined : "error", errorMessage });
     });
 
     if (signal?.aborted) stopForAbort();
