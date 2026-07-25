@@ -663,16 +663,38 @@ function passthroughPatternToRegExp(pattern: string): RegExp | undefined {
   }
 }
 
-function collectModelEnvRefs(): Set<string> {
+function collectModelEnvRefs(model?: string): Set<string> {
   const refs = new Set<string>();
   try {
     const agentDir = getAgentDir();
     const modelsPath = path.join(agentDir, "models.json");
     const raw = fs.readFileSync(modelsPath, "utf8");
-    // Fast regex scan plus JSON walk for robustness - $VAR or ${VAR}
-    const dollarRegex = /\$\{?([A-Z][A-Z0-9_]{2,})\}?/g;
+    const parsed = JSON.parse(raw) as { providers?: Record<string, { apiKey?: string; models?: Array<{ id?: string }> }> };
+    const providerName = model ? model.split("/")[0] : undefined;
+    if (providerName && parsed.providers?.[providerName]) {
+      const provider = parsed.providers[providerName];
+      // Provider may have apiKey like "$OPENROUTER_API_KEY" or "${VAR}"
+      const keysToScan = [provider.apiKey ?? ""];
+      // Also scan model-specific overrides if any
+      for (const m of provider.models ?? []) {
+        if ((m as any).apiKey) keysToScan.push((m as any).apiKey as string);
+      }
+      const dollarRegex = /\$\{?([A-Z][A-Z0-9_]{2,})\}?/g;
+      for (const str of keysToScan) {
+        let match: RegExpExecArray | null;
+        const re = new RegExp(dollarRegex, "g");
+        while ((match = re.exec(str)) !== null) {
+          const name = match[1];
+          if (name && /^[A-Z_][A-Z0-9_]*$/.test(name)) refs.add(name);
+        }
+      }
+      // If we found provider-specific refs, return them (least privilege)
+      if (refs.size > 0) return refs;
+    }
+    // Fallback: scan entire file for $VAR references (covers all providers) - used when model undefined or provider has no apiKey reference
+    const dollarRegexAll = /\$\{?([A-Z][A-Z0-9_]{2,})\}?/g;
     let match: RegExpExecArray | null;
-    while ((match = dollarRegex.exec(raw)) !== null) {
+    while ((match = dollarRegexAll.exec(raw)) !== null) {
       const name = match[1];
       if (name && /^[A-Z_][A-Z0-9_]*$/.test(name)) refs.add(name);
     }
@@ -689,17 +711,31 @@ function childEnvironment(
   childRunId: string,
   budgetRemaining: number,
   cwd: string,
+  model?: string,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const key of SAFE_ENV_KEYS) {
     const value = process.env[key];
     if (value !== undefined) env[key] = value;
   }
-  // Auto-include env vars referenced in ~/.pi/agent/models.json (e.g. "$OPENROUTER_API_KEY")
-  // so env-only provider keys work without manual passthrough list maintenance.
-  for (const ref of collectModelEnvRefs()) {
+  // Auto-include env vars referenced in ~/.pi/agent/models.json.
+  // If a specific model is known, prefer its provider's var (least privilege),
+  // but also include all model refs so nested subagents with different models work
+  // (parent glm -> child meta would otherwise fail). This is automatic - no manual list.
+  const specificRefs = model ? collectModelEnvRefs(model) : new Set<string>();
+  const allRefs = collectModelEnvRefs();
+  for (const ref of new Set([...specificRefs, ...allRefs])) {
     const value = process.env[ref];
     if (value !== undefined) env[ref] = value;
+  }
+  // Automatic pass-through of API keys: if parent has *_API_KEY set, child needs it to call models/tools.
+  // This replaces the need for manual PI_SUBAGENT_PASSTHROUGH_ENV="*_API_KEY" and supports nesting.
+  // Still allowlisted - only *_API_KEY and *_TOKEN, not all env.
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v === undefined) continue;
+    if (k.endsWith("_API_KEY") || k.endsWith("_TOKEN") || k === "GMI_API_KEY") {
+      env[k] = v;
+    }
   }
   // Allow the user to explicitly opt in to additional non-standard provider
   // variables without making every ambient environment variable available to
@@ -1010,6 +1046,7 @@ async function runPiProcess(
   reservation: ChildReservation,
   signal: AbortSignal | undefined,
   onEvent: (event: ParsedJsonEvent) => void,
+  model?: string,
 ): Promise<ProcessResult> {
   if (signal?.aborted) return { exitCode: 1, stopReason: "aborted", errorMessage: "Subagent aborted.", stderr: "" };
   const timeoutMs = processTimeoutMs(control.deadlineMs);
@@ -1051,7 +1088,7 @@ async function runPiProcess(
     try {
       child = spawn(invocation.command, invocation.args, {
         cwd,
-        env: childEnvironment(depth + 1, control, parentRunId, childRunId, reservation.budgetRemaining, cwd),
+        env: childEnvironment(depth + 1, control, parentRunId, childRunId, reservation.budgetRemaining, cwd, model),
         shell: false,
         // Keep nested children in the root child's process group. The root
         // child is detached from the host; descendants then die with that
@@ -1310,7 +1347,7 @@ async function runAgent(
         result.errorMessage = eventFailure;
         report(eventFailure);
       }
-    });
+    }, result.model);
 
     result.exitCode = processResult.exitCode;
     result.stopReason = processResult.stopReason ?? result.stopReason ?? (processResult.exitCode === 0 ? "stop" : "error");
