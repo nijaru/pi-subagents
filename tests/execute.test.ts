@@ -38,7 +38,7 @@ function writeEnvPi(): string {
   const directory = tempDir();
   const script = path.join(directory, "env-pi");
   fs.writeFileSync(script, `#!/bin/sh
-printf '%s\\n' "$PI_SUBAGENTS_TEST_MODEL_KEY" "$pi_subagents_test_lower" "$OPENAI_API_KEY" "$UNRELATED_API_KEY" "$UNRELATED_TOKEN" > "$0.env"
+printf '%s\\n' "$PI_SUBAGENTS_TEST_MODEL_KEY" "$pi_subagents_test_lower" "$OPENAI_API_KEY" "$UNRELATED_API_KEY" "$UNRELATED_TOKEN" "$UNRELATED_VALUE" > "$0.env"
 printf '%s\\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"env result"}],"model":"fake/model","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":0}}'
 `);
   fs.chmodSync(script, 0o755);
@@ -235,7 +235,7 @@ describe("subprocess behavior", () => {
     expect(args.join(" ")).not.toContain("Task: run");
   });
 
-  test("forwards parsed model refs without unrelated credentials", async () => {
+  test("forwards model refs and credential variables without ambient application values", async () => {
     const root = tempDir();
     const agentDir = tempDir();
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -246,6 +246,7 @@ describe("subprocess behavior", () => {
     process.env.OPENAI_API_KEY = "standard-model-secret";
     process.env.UNRELATED_API_KEY = "unrelated-api-secret";
     process.env.UNRELATED_TOKEN = "unrelated-token-secret";
+    process.env.UNRELATED_VALUE = "unrelated-value";
     fs.writeFileSync(path.join(agentDir, "models.json"), `{
   // Pi accepts JSONC model configuration.
   "providers": {
@@ -265,7 +266,8 @@ describe("subprocess behavior", () => {
         "model-secret",
         "lower-secret",
         "standard-model-secret",
-        "",
+        "unrelated-api-secret",
+        "unrelated-token-secret",
         "",
         "",
       ]);
@@ -278,6 +280,7 @@ describe("subprocess behavior", () => {
       else process.env.OPENAI_API_KEY = previousOpenAIKey;
       delete process.env.UNRELATED_API_KEY;
       delete process.env.UNRELATED_TOKEN;
+      delete process.env.UNRELATED_VALUE;
     }
   });
 

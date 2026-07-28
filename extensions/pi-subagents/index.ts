@@ -771,16 +771,20 @@ function childEnvironment(
     const value = process.env[ref];
     if (value !== undefined) env[ref] = value;
   }
-  // Auto-include only standard model credentials. Tool and application keys
-  // require explicit PI_SUBAGENT_PASSTHROUGH_ENV opt-in.
+  // Inherit credential-shaped variables for configured model and tool
+  // providers. Trusted subagents already run as the same user and need the
+  // parent's Exa, Context7, GitHub, and similar credentials to be useful.
   for (const key of modelCredentialEnvKeys()) {
     const value = process.env[key];
     if (value !== undefined) env[key] = value;
   }
-  // Allow the user to explicitly opt in to additional non-standard provider
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined && (key.endsWith("_API_KEY") || key.endsWith("_TOKEN"))) env[key] = value;
+  }
+  // Allow the user to explicitly opt in to additional non-credential
   // variables without making every ambient environment variable available to
-  // a delegated bash-capable agent. Supports exact names and glob patterns
-  // like *_API_KEY, OPENAI_*, *. Set "*" to pass all env (explicit insecure opt-in).
+  // a delegated bash-capable agent. Supports exact names and glob patterns.
+  // Set "*" to pass all env (explicit insecure opt-in).
   const passthroughRaw = process.env[PASSTHROUGH_ENV] ?? "";
   const patterns = passthroughRaw.split(",").map((s) => s.trim()).filter(Boolean);
   if (patterns.length > 0) {
@@ -1268,7 +1272,7 @@ async function runPiProcess(
         if (cleanStderr) {
           errorMessage = `Subagent exited with code ${exitCode}.\n${truncateOutput(cleanStderr, 2048)}`;
           if (/No API key|No models match pattern|API key.*not found/i.test(cleanStderr)) {
-            errorMessage += `\n\nHint: Child env is allowlisted. Model keys in ~/.pi/agent/models.json like $OPENROUTER_API_KEY are now auto-passed. For other keys, set PI_SUBAGENT_PASSTHROUGH_ENV with globs e.g. "*_API_KEY" and restart pi. Auth in ~/.pi/agent/auth.json via /login needs no passthrough.`;
+            errorMessage += `\n\nHint: Child env passes model refs and *_API_KEY/*_TOKEN credentials automatically. For non-credential variables, set PI_SUBAGENT_PASSTHROUGH_ENV with an exact name or glob and restart Pi. Auth in ~/.pi/agent/auth.json via /login needs no passthrough.`;
           }
         } else {
           errorMessage = `Subagent exited with code ${exitCode}.`;
