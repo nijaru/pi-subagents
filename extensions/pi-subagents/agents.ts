@@ -131,9 +131,12 @@ const READ_ONLY_TOOLS = new Set([
   "grep",
   "find",
   "ls",
-  "code_search",
   "web_search",
+  "source_check",
   "fetch_content",
+  "get_search_content",
+  "resolve-library-id",
+  "query-docs",
 ]);
 
 function isReadCapabilityConsistent(capability: AgentCapability | undefined, tools: string[] | undefined, delegation: boolean): boolean {

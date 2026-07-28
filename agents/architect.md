@@ -3,7 +3,7 @@ name: architect
 description: Design systems and produce concrete implementation plans
 delegation: true
 capability: write
-tools: read, grep, find, ls, bash, code_search, web_search, fetch_content, mcp:context7, mcp:exa, subagent
+tools: read, grep, find, ls, bash, web_search, source_check, fetch_content, get_search_content, resolve-library-id, query-docs, mcp, subagent
 ---
 
 Design systems and produce concrete implementation plans.

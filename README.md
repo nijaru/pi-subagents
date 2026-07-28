@@ -62,8 +62,8 @@ Review the requested code and report concrete findings.
 Frontmatter fields:
 
 - `name` and `description` are required.
-- `tools` is an explicit pi tool allowlist. If omitted, the child gets no tools; it never inherits all tools. Supported pi built-ins include `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`.
-- `capability` is effect metadata for scheduling safety, not a security sandbox. Omitted capability is conservatively treated as potentially mutating for parallel safety. A `read` profile must use only the known read-only tools (`read`, `grep`, `find`, `ls`, `code_search`, `web_search`, or `fetch_content`) and cannot delegate; unknown or mutation-capable tools invalidate the definition.
+- `tools` is an explicit Pi tool allowlist. If omitted, the child gets no tools; it never inherits all tools. Supported Pi built-ins include `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`. Tool names are passed through unchanged, so installed extension names must match exactly. Common current research tools include `web_search`, `source_check`, `fetch_content`, `get_search_content`, `resolve-library-id`, and `query-docs`; `web_search` can use Exa with `provider: "exa"`. The unified `mcp` proxy is also available when `pi-mcp-adapter` is installed.
+- `capability` is effect metadata for scheduling safety, not a security sandbox. Omitted capability is conservatively treated as potentially mutating for parallel safety. A `read` profile must use only the known read-only tools (`read`, `grep`, `find`, `ls`, `web_search`, `source_check`, `fetch_content`, `get_search_content`, `resolve-library-id`, or `query-docs`) and cannot delegate; unknown or mutation-capable tools invalidate the definition.
 - `delegation: true` explicitly permits nested use of `subagent`; it defaults to `false`. Delegation is itself potentially mutating, so delegation-capable profiles must use `capability: write` or omit the capability. The bundled `architect` and `worker` are delegation-capable. Other bundled agents are leaves.
 - `model` is optional and otherwise inherits the parent model.
 
@@ -83,7 +83,7 @@ The model-visible final result and each partial update use one deterministic 50 
 
 `action: "list"` returns the complete agent metadata to the model, while its successful result intentionally renders no body in the interactive TUI to avoid polluting the transcript.
 
-The package targets the current pi CLI/API used by its `@earendil-works/pi-*` 0.80.x development dependencies. It does not add compatibility shims for older pi versions.
+The package targets the current Pi CLI/API used by its `@earendil-works/pi-*` 0.82.1 development dependencies. It does not add compatibility shims for older Pi versions.
 
 ## Relationship to pi-workflows
 

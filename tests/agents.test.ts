@@ -113,6 +113,23 @@ describe("agent discovery", () => {
     expect(loadAgentsFromDir(directory, "user")).toHaveLength(0);
   });
 
+  test("bundled research profiles use current Pi tool names", () => {
+    const agents = loadAgentsFromDir(getBundledAgentsDir(), "bundled");
+    const explore = agents.find((agent) => agent.name === "explore");
+    const architect = agents.find((agent) => agent.name === "architect");
+    const researcher = agents.find((agent) => agent.name === "researcher");
+    expect(explore?.tools).not.toContain("code_search");
+    expect(architect?.tools).toContain("resolve-library-id");
+    expect(architect?.tools).toContain("query-docs");
+    expect(architect?.tools).toContain("mcp");
+    expect(researcher?.tools).toContain("source_check");
+    expect(researcher?.tools).toContain("get_search_content");
+    for (const agent of [architect, researcher]) {
+      expect(agent?.tools).not.toContain("mcp:context7");
+      expect(agent?.tools).not.toContain("mcp:exa");
+    }
+  });
+
   test("skips invalid control metadata instead of broadening policy", () => {
     const directory = tempDir();
     writeAgent(directory, "bad-delegation.md", "bad-delegation", "\ndelegation: yes");

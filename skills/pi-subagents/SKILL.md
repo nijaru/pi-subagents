@@ -28,14 +28,14 @@ Use the top-level `model` to override any mode. Resolution is top-level/item ove
 Definitions are Markdown files with YAML frontmatter. Required: `name`, `description`. Optional: `model`, `tools`, `capability`, and `delegation`.
 
 - `tools` is an explicit allowlist. Missing tools means the child receives `--no-tools`, not pi's defaults.
-- `capability: read` is effect metadata for scheduling safety, not a security sandbox; `capability: write` marks it potentially mutating. Omitted capability is conservatively potentially mutating. A read profile is accepted only with the known read-only tools (`read`, `grep`, `find`, `ls`, `code_search`, `web_search`, or `fetch_content`) and cannot delegate; unknown or mutation-capable tools invalidate the definition.
+- `capability: read` is effect metadata for scheduling safety, not a security sandbox; `capability: write` marks it potentially mutating. Omitted capability is conservatively potentially mutating. A read profile is accepted only with the known read-only tools (`read`, `grep`, `find`, `ls`, `web_search`, `source_check`, `fetch_content`, `get_search_content`, `resolve-library-id`, or `query-docs`) and cannot delegate; unknown or mutation-capable tools invalidate the definition.
 - `delegation: true` is required for nested `subagent` calls and defaults false. Delegation-capable profiles must use `capability: write` or omit the capability. Bundled `architect` and `worker` may delegate; other bundled agents are leaves.
 
 Project agents are repository-controlled prompts. The current pi project must be trusted, UI sessions confirm before using them, and headless calls reject them. Project-agent task `cwd` values must remain inside the trusted project root. Parallel potentially mutating tasks sharing the same canonical cwd are rejected; distinct cwd values may run concurrently. Use a serial chain for shared-worktree writes.
 
 ## Safety and limits
 
-Every delegation starts a fresh `pi --mode json -p --no-session` subprocess. Task and system-prompt contents travel through temporary mode-0600 files, not argv. Cancellation terminates the root process group; normal completion also sweeps surviving descendants.
+Every delegation starts a fresh `pi --mode json -p --no-session` subprocess. Tool names are passed through unchanged; current research profiles use `web_search`/`fetch_content` (with Exa selected by `provider: "exa"`), the exact Context7 names `resolve-library-id`/`query-docs`, and the optional unified `mcp` proxy when `pi-mcp-adapter` is installed. Task and system-prompt contents travel through temporary mode-0600 files, not argv. Cancellation terminates the root process group; normal completion also sweeps surviving descendants.
 
 Nested calls propagate depth, run/parent/root IDs, deadline, timeout, explicit passthrough-env policy, and an ephemeral mode-0600 control state. The root-wide limits are depth 3, 32 total descendants, and four live child processes. These are guardrails rather than a hostile-code sandbox: a Bash-capable child can intentionally launch outside the extension's control file or process group. A full shared semaphore fails fast rather than deadlocking active parents. Each process has a 30-minute hard timeout, configurable up to two hours with `PI_SUBAGENT_TIMEOUT_MS`, and bounded by the root deadline.
 

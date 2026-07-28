@@ -141,6 +141,8 @@ describe("tool contract", () => {
     const root = tempDir();
     const result = await call(tool, { action: "list" }, ctx(root));
     expect(result.content[0].text).toContain("reviewer");
+    expect(result.content[0].text).toContain("tools=read,write,edit,bash,grep,find,ls");
+    expect(result.content[0].text).toContain("query-docs");
     expect(result.details.action).toBe("list");
     expect(result.details.results).toEqual([]);
     const rendered = tool.renderResult(result, { expanded: false }, { fg: (_color: string, text: string) => text, bold: (text: string) => text } as any, {});

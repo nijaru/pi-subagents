@@ -1767,7 +1767,10 @@ export default function (pi: ExtensionAPI) {
         }
         const lines = discovery.agents.map((agent) => {
           const configuredModel = agent.model ? ` [${agent.model}]` : " [parent model]";
-          return `${agent.name}: ${agent.description}${configuredModel} (${agent.source})`;
+          const tools = agent.tools?.length ? agent.tools.join(",") : "none";
+          const capability = agent.capability ?? "unspecified";
+          const delegation = agent.delegation ? "yes" : "no";
+          return `${agent.name}: ${agent.description}${configuredModel} (${agent.source}; capability=${capability}; delegation=${delegation}; tools=${tools})`;
         });
         return toolResult(lines.length ? `Available agents:\n${lines.join("\n")}` : "No agents found.", baseDetails("single", [], "list"));
       }
