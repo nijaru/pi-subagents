@@ -38,9 +38,8 @@ const MAX_DIAGNOSTIC_BYTES = 8 * 1024;
 const MAX_MESSAGE_BYTES = 16 * 1024;
 const MAX_MESSAGES_PER_AGENT = 128;
 const MAX_STDERR_BYTES = 50 * 1024;
-const MAX_STREAM_BYTES = 5 * 1024 * 1024;
-/** Independent protocol cap; logical accounting avoids false positives on cumulative updates. */
-const MAX_RAW_STREAM_BYTES = 64 * 1024 * 1024;
+/** Maximum protocol line retained or parsed from the child stream. */
+const MAX_PROTOCOL_LINE_BYTES = 1024 * 1024;
 const DEFAULT_PROCESS_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_PROCESS_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const MAX_TASK_BYTES = 100 * 1024;
@@ -915,48 +914,6 @@ interface ProcessResult {
   stderr: string;
 }
 
-interface StreamAccounting {
-  messageKey?: string;
-  messageBytes: number;
-  logicalBytes: number;
-}
-
-function streamMessageKey(message: Message): string {
-  const candidate = message as unknown as Record<string, unknown>;
-  return [candidate.role, candidate.timestamp, candidate.toolCallId, candidate.model].map((value) => String(value ?? "")).join("|");
-}
-
-/**
- * Pi's `message_update` event carries a cumulative message, not a delta.
- * Count only growth for the active message so a long response does not look
- * quadratic on the wire. Non-message protocol lines are counted in full.
- */
-function accountStreamEvent(accounting: StreamAccounting, event: ParsedJsonEvent | undefined, lineBytes: number): number {
-  if (!event) return lineBytes;
-  const envelopeBytes = Math.min(lineBytes, 1024);
-  const message = event.streamMessage ?? event.message;
-  if (message) {
-    const bytes = jsonBytes(message);
-    const key = streamMessageKey(message);
-    const growth = key === accounting.messageKey ? Math.max(0, bytes - accounting.messageBytes) : bytes;
-    accounting.messageKey = key;
-    accounting.messageBytes = bytes;
-    return envelopeBytes + growth;
-  }
-  if (event.messages) {
-    let bytes = envelopeBytes;
-    for (const item of event.messages) {
-      const itemBytes = jsonBytes(item);
-      const key = streamMessageKey(item);
-      bytes += key === accounting.messageKey ? Math.max(0, itemBytes - accounting.messageBytes) : itemBytes;
-      accounting.messageKey = key;
-      accounting.messageBytes = itemBytes;
-    }
-    return bytes;
-  }
-  return lineBytes;
-}
-
 function descendantPids(pid: number): number[] {
   if (process.platform === "win32") return [];
   const snapshot = spawnSync("ps", ["-eo", "pid=,ppid="], { encoding: "utf8", timeout: 1000 });
@@ -1099,12 +1056,9 @@ async function runPiProcess(
   return new Promise((resolve) => {
     let settled = false;
     let aborted = false;
-    let outputLimitExceeded = false;
-    let outputLimitMessage = `Subagent logical output exceeded ${MAX_STREAM_BYTES} bytes.`;
-    let rawStreamBytes = 0;
-    const streamAccounting: StreamAccounting = { messageBytes: 0, logicalBytes: 0 };
     let stderr = "";
     let trailing = "";
+    let discardingLine = false;
     let killTimer: ReturnType<typeof setTimeout> | undefined;
     let processTimer: ReturnType<typeof setTimeout> | undefined;
     let timedOut = false;
@@ -1117,7 +1071,7 @@ async function runPiProcess(
       // A nested leader can close before the escalation timer fires while a
       // descendant ignores SIGTERM and does not hold an inherited pipe open.
       // Force the retained tree snapshot before dropping the timer.
-      if (aborted || timedOut || outputLimitExceeded || eventError) {
+      if (aborted || timedOut || eventError) {
         terminateProcessTree(child, "SIGKILL");
       }
       settled = true;
@@ -1186,41 +1140,47 @@ async function runPiProcess(
         }, 5000);
       }
     };
-    const stopForOutputLimit = (message: string) => {
-      if (outputLimitExceeded) return;
-      outputLimitExceeded = true;
-      outputLimitMessage = message;
-      terminateProcessTree(child, "SIGTERM");
-      killTimer = setTimeout(() => {
-        if (!settled) terminateProcessTree(child, "SIGKILL");
-      }, 5000);
-    };
     abortHandler = stopForAbort;
     if (signal) signal.addEventListener("abort", abortHandler, { once: true });
 
-    child.stdout?.on("data", (chunk: Buffer | string) => {
-      if (outputLimitExceeded) return;
-      rawStreamBytes += typeof chunk === "string" ? Buffer.byteLength(chunk, "utf8") : chunk.byteLength;
-      if (rawStreamBytes > MAX_RAW_STREAM_BYTES) {
-        stopForOutputLimit(`Subagent raw stream exceeded ${MAX_RAW_STREAM_BYTES} bytes.`);
-        return;
-      }
-      trailing += decoder.write(chunk);
-      const lines = trailing.split("\n");
-      trailing = lines.pop() ?? "";
-      if (Buffer.byteLength(trailing, "utf8") > MAX_STREAM_BYTES) {
-        stopForOutputLimit(`Subagent logical output exceeded ${MAX_STREAM_BYTES} bytes.`);
-        return;
-      }
-      for (const line of lines) {
-        const event = parseJsonEventLine(line);
-        streamAccounting.logicalBytes += accountStreamEvent(streamAccounting, event, Buffer.byteLength(line, "utf8"));
-        if (streamAccounting.logicalBytes > MAX_STREAM_BYTES) {
-          stopForOutputLimit(`Subagent logical output exceeded ${MAX_STREAM_BYTES} bytes.`);
+    const consumeStdoutText = (text: string) => {
+      let cursor = 0;
+      while (cursor < text.length) {
+        if (discardingLine) {
+          const newline = text.indexOf("\n", cursor);
+          if (newline < 0) return;
+          discardingLine = false;
+          cursor = newline + 1;
+          continue;
+        }
+
+        const newline = text.indexOf("\n", cursor);
+        if (newline < 0) {
+          const segment = text.slice(cursor);
+          if (Buffer.byteLength(trailing, "utf8") + Buffer.byteLength(segment, "utf8") > MAX_PROTOCOL_LINE_BYTES) {
+            // Drop the rest of an oversized unterminated line, but keep reading
+            // until its newline so a later valid event can still complete.
+            trailing = "";
+            discardingLine = true;
+          } else {
+            trailing += segment;
+          }
           return;
         }
-        if (event) deliverEvent(event);
+
+        const segment = text.slice(cursor, newline);
+        const lineBytes = Buffer.byteLength(trailing, "utf8") + Buffer.byteLength(segment, "utf8");
+        if (lineBytes <= MAX_PROTOCOL_LINE_BYTES) {
+          const event = parseJsonEventLine(trailing + segment);
+          if (event) deliverEvent(event);
+        }
+        trailing = "";
+        cursor = newline + 1;
       }
+    };
+
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      consumeStdoutText(decoder.write(chunk));
     });
     child.stderr?.on("data", (chunk: Buffer | string) => {
       stderr = capStderr(stderr, typeof chunk === "string" ? chunk : chunk.toString("utf8"));
@@ -1232,8 +1192,6 @@ async function runPiProcess(
         finish({ exitCode: 1, stopReason: "error", errorMessage: `Subagent event handling failed: ${eventError}`, stderr });
       } else if (timedOut) {
         finish({ exitCode: 1, stopReason: "error", errorMessage: `Subagent timed out after ${timeoutMs} ms.`, stderr });
-      } else if (outputLimitExceeded) {
-        finish({ exitCode: 1, stopReason: "error", errorMessage: outputLimitMessage, stderr });
       } else if (aborted) {
         finish({ exitCode: 1, stopReason: "aborted", errorMessage: "Subagent aborted.", stderr });
       } else {
@@ -1242,12 +1200,11 @@ async function runPiProcess(
     });
     child.on("close", (code) => {
       activeChildren.delete(child);
-      trailing += decoder.end();
-      if (trailing.trim()) {
+      const finalText = decoder.end();
+      if (finalText && !discardingLine) consumeStdoutText(finalText);
+      if (trailing.trim() && !discardingLine && Buffer.byteLength(trailing, "utf8") <= MAX_PROTOCOL_LINE_BYTES) {
         const event = parseJsonEventLine(trailing);
-        streamAccounting.logicalBytes += accountStreamEvent(streamAccounting, event, Buffer.byteLength(trailing, "utf8"));
-        if (streamAccounting.logicalBytes > MAX_STREAM_BYTES) outputLimitMessage = `Subagent logical output exceeded ${MAX_STREAM_BYTES} bytes.`;
-        if (event && !outputLimitExceeded) deliverEvent(event);
+        if (event) deliverEvent(event);
       }
       if (eventError) {
         finish({ exitCode: 1, stopReason: "error", errorMessage: `Subagent event handling failed: ${eventError}`, stderr });
@@ -1255,10 +1212,6 @@ async function runPiProcess(
       }
       if (timedOut) {
         finish({ exitCode: 1, stopReason: "error", errorMessage: `Subagent timed out after ${timeoutMs} ms.`, stderr });
-        return;
-      }
-      if (outputLimitExceeded) {
-        finish({ exitCode: 1, stopReason: "error", errorMessage: outputLimitMessage, stderr });
         return;
       }
       if (aborted || signal?.aborted) {

@@ -64,6 +64,55 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
   fs.chmodSync(script, 0o755);
   return script;
 }
+function writeLargeToolUpdatePi(): string {
+  const directory = tempDir();
+  const script = path.join(directory, "large-tool-update-pi");
+  fs.writeFileSync(script, `#!/usr/bin/env bun
+const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+console.log(JSON.stringify({ type: "tool_execution_update", toolCallId: "call-1", toolName: "read", args: {}, partialResult: "x".repeat(2 * 1024 * 1024) }));
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "final after large tool update" }], model: "fake/model", usage, stopReason: "stop", timestamp: 1 }}));
+`);
+  fs.chmodSync(script, 0o755);
+  return script;
+}
+function writeIgnoredLineFloodPi(): string {
+  const directory = tempDir();
+  const script = path.join(directory, "ignored-line-flood-pi");
+  fs.writeFileSync(script, `#!/usr/bin/env bun
+const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+process.stdout.write("ignored protocol line\\n".repeat(300_000));
+process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "final after ignored traffic" }], model: "fake/model", usage, stopReason: "stop", timestamp: 1 }}) + "\\n");
+`);
+  fs.chmodSync(script, 0o755);
+  return script;
+}
+function writeSplitUtf8Pi(): string {
+  const directory = tempDir();
+  const script = path.join(directory, "split-utf8-pi");
+  fs.writeFileSync(script, `#!/usr/bin/env bun
+const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+const bytes = Buffer.from(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "split 😀漢字" }], model: "fake/model", usage, stopReason: "stop", timestamp: 1 }}) + "\\n");
+const marker = Buffer.from("😀");
+const index = bytes.indexOf(marker);
+process.stdout.write(bytes.subarray(0, index + 1));
+process.stdout.write(bytes.subarray(index + 1, index + 2));
+process.stdout.write(bytes.subarray(index + 2));
+`);
+  fs.chmodSync(script, 0o755);
+  return script;
+}
+function writeOversizedUnterminatedLinePi(): string {
+  const directory = tempDir();
+  const script = path.join(directory, "oversized-unterminated-line-pi");
+  fs.writeFileSync(script, `#!/usr/bin/env bun
+const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+process.stdout.write("x".repeat(2 * 1024 * 1024));
+process.stdout.write("\\n");
+process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "final after oversized line" }], model: "fake/model", usage, stopReason: "stop", timestamp: 1 }}) + "\\n");
+`);
+  fs.chmodSync(script, 0o755);
+  return script;
+}
 function writeLingeringPi(): { script: string; marker: string } {
   const directory = tempDir();
   const script = path.join(directory, "lingering-pi");
@@ -294,6 +343,34 @@ describe("subprocess behavior", () => {
     expect(Buffer.byteLength(result.content[0].text, "utf8")).toBeLessThanOrEqual(50 * 1024);
     expect(result.details.results[0].output.length).toBe(30_000);
     expect(result.details.results[0].messages[0].content[0].text.length).toBeLessThanOrEqual(16 * 1024);
+  });
+
+  test("continues after a large tool update and preserves the final response", async () => {
+    process.env.PI_SUBAGENT_BIN = writeLargeToolUpdatePi();
+    const result = await call(tool, { agent: "worker", task: "run" }, ctx(tempDir()));
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toBe("final after large tool update");
+  });
+
+  test("continues after ignored protocol-line floods", async () => {
+    process.env.PI_SUBAGENT_BIN = writeIgnoredLineFloodPi();
+    const result = await call(tool, { agent: "worker", task: "run" }, ctx(tempDir()));
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toBe("final after ignored traffic");
+  });
+
+  test("preserves UTF-8 characters split across stdout chunks", async () => {
+    process.env.PI_SUBAGENT_BIN = writeSplitUtf8Pi();
+    const result = await call(tool, { agent: "worker", task: "run" }, ctx(tempDir()));
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toBe("split 😀漢字");
+  });
+
+  test("drops an oversized unterminated line and parses the next event", async () => {
+    process.env.PI_SUBAGENT_BIN = writeOversizedUnterminatedLinePi();
+    const result = await call(tool, { agent: "worker", task: "run" }, ctx(tempDir()));
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toBe("final after oversized line");
   });
 
   test("sweeps descendants after a root child exits normally", async () => {
