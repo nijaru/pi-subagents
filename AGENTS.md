@@ -37,7 +37,7 @@ tools: read,grep,find,ls
 ---
 ```
 
-Missing `tools` means `--no-tools`, never all tools. `delegation` defaults false; only `delegation: true` permits the `subagent` tool. `capability` is effect metadata, not a sandbox: `read` or `write`; omission is treated as potentially mutating when parallel tasks share a canonical cwd. A `read` profile must use only the known read-only tools (`read`, `grep`, `find`, `ls`, `web_search`, `source_check`, `fetch_content`, `get_search_content`, `resolve-library-id`, or `query-docs`) and cannot delegate; unknown or mutation-capable tools invalidate the definition. Bundled `architect` and `worker` may delegate; other bundled agents are leaves.
+Missing `tools` means `--no-tools`, never all tools. `delegation` defaults false; only `delegation: true` permits the `subagent` tool. `capability` is effect metadata, not a sandbox: `read` or `write`; omission is treated as potentially mutating when parallel tasks share a canonical cwd. A `read` profile must use only the known read-only tools (`read`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `web_research`, `source_check`, `fetch_content`, `get_search_content`, `resolve-library-id`, or `query-docs`) and cannot delegate; unknown or mutation-capable tools invalidate the definition. Bundled `architect` and `worker` may delegate; other bundled agents are leaves.
 
 Project agents are opt-in, require pi project trust, and receive a confirmation in UI sessions; headless sessions reject them. Their task cwd must remain inside the trusted project root. Delegation always runs in a fresh subprocess with `--no-session`; nested calls are bounded by depth 3, a root-wide 32-descendant budget, a shared four-process limit, and a propagated deadline/control file.
 

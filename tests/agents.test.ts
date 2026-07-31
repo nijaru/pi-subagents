@@ -122,8 +122,10 @@ describe("agent discovery", () => {
     expect(architect?.tools).toContain("resolve-library-id");
     expect(architect?.tools).toContain("query-docs");
     expect(architect?.tools).toContain("mcp");
-    expect(researcher?.tools).toContain("source_check");
-    expect(researcher?.tools).toContain("get_search_content");
+    expect(researcher?.tools).toContain("web_fetch");
+    expect(researcher?.tools).toContain("web_research");
+    expect(researcher?.tools).not.toContain("fetch_content");
+    expect(researcher?.tools).not.toContain("get_search_content");
     for (const agent of [architect, researcher]) {
       expect(agent?.tools).not.toContain("mcp:context7");
       expect(agent?.tools).not.toContain("mcp:exa");

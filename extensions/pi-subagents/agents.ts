@@ -132,6 +132,8 @@ const READ_ONLY_TOOLS = new Set([
   "find",
   "ls",
   "web_search",
+  "web_fetch",
+  "web_research",
   "source_check",
   "fetch_content",
   "get_search_content",
