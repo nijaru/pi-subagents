@@ -48,6 +48,7 @@ const MAX_TASK_BYTES = 100 * 1024;
 const MAX_CHAIN_STEPS = 32;
 const MAX_CHAIN_CONTEXT_BYTES = 50 * 1024;
 const MAX_STRUCTURED_OUTPUT_BYTES = MAX_OUTPUT_BYTES;
+const MAX_DELEGATION_POLICY_BYTES = 16 * 1024;
 const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
 const RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
 const PARENT_ID_ENV = "PI_SUBAGENT_PARENT_ID";
@@ -55,6 +56,7 @@ const ROOT_ID_ENV = "PI_SUBAGENT_ROOT_ID";
 const CONTROL_ENV = "PI_SUBAGENT_CONTROL_FILE";
 const DEADLINE_ENV = "PI_SUBAGENT_DEADLINE_MS";
 const BUDGET_ENV = "PI_SUBAGENT_BUDGET_REMAINING";
+const DELEGATION_POLICY_ENV = "PI_SUBAGENT_DELEGATION_POLICY";
 const TIMEOUT_ENV = "PI_SUBAGENT_TIMEOUT_MS";
 const PASSTHROUGH_ENV = "PI_SUBAGENT_PASSTHROUGH_ENV";
 const SUBAGENT_BIN_ENV = "PI_SUBAGENT_BIN";
@@ -107,6 +109,11 @@ interface ChildReservation {
 
 export type AgentTermination = "completed" | "failed" | "cancelled" | "timed_out";
 
+interface DelegationPolicy {
+  allowedAgents?: string[];
+  remainingDepth?: number;
+}
+
 interface ExecutionContext {
   runId: string;
   parentRunId?: string;
@@ -116,6 +123,7 @@ interface ExecutionContext {
   depth: number;
   deadlineMs: number;
   control: ControlContext;
+  delegationPolicy?: DelegationPolicy;
 }
 
 export interface UsageSummary extends Usage {
@@ -821,6 +829,50 @@ function modelCredentialEnvKeys(): Set<string> {
   return keys;
 }
 
+function readDelegationPolicy(): { policy?: DelegationPolicy; error?: string } {
+  const raw = process.env[DELEGATION_POLICY_ENV];
+  if (raw === undefined) return {};
+  if (Buffer.byteLength(raw, "utf8") > MAX_DELEGATION_POLICY_BYTES) return { error: "Nested delegation policy is too large." };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { error: "Nested delegation policy is not valid JSON." };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { error: "Nested delegation policy is malformed." };
+  const value = parsed as Record<string, unknown>;
+  const allowedAgents = value.allowedAgents;
+  if (allowedAgents !== undefined && (!Array.isArray(allowedAgents) || allowedAgents.some((name) => typeof name !== "string" || !name.trim() || Buffer.byteLength(name, "utf8") > 256))) {
+    return { error: "Nested delegation allowedAgents is malformed." };
+  }
+  const remainingDepth = value.remainingDepth;
+  if (remainingDepth !== undefined && (!Number.isSafeInteger(remainingDepth) || (remainingDepth as number) < 0 || (remainingDepth as number) > MAX_DEPTH)) {
+    return { error: "Nested delegation depth policy is malformed." };
+  }
+  const policy: DelegationPolicy = {
+    allowedAgents: allowedAgents === undefined ? undefined : [...new Set((allowedAgents as string[]).map((name) => name.trim()))],
+    remainingDepth: remainingDepth as number | undefined,
+  };
+  return policy.allowedAgents === undefined && policy.remainingDepth === undefined ? { error: "Nested delegation policy is empty." } : { policy };
+}
+
+function childDelegationPolicy(parent: DelegationPolicy | undefined, agent: AgentConfig): DelegationPolicy | undefined {
+  const parentAllowed = parent?.allowedAgents;
+  const ownAllowed = agent.allowedAgents;
+  const allowedAgents = parentAllowed === undefined
+    ? ownAllowed
+    : ownAllowed === undefined
+      ? parentAllowed
+      : ownAllowed.filter((name) => parentAllowed.includes(name));
+  const parentRemaining = parent?.remainingDepth;
+  const decremented = parentRemaining === undefined ? undefined : Math.max(0, parentRemaining - 1);
+  const remainingDepth = agent.maxDelegationDepth === undefined
+    ? decremented
+    : decremented === undefined ? agent.maxDelegationDepth : Math.min(agent.maxDelegationDepth, decremented);
+  if (allowedAgents === undefined && remainingDepth === undefined) return undefined;
+  return { allowedAgents, remainingDepth };
+}
+
 function childEnvironment(
   depth: number,
   control: ControlContext,
@@ -828,6 +880,7 @@ function childEnvironment(
   childRunId: string,
   budgetRemaining: number,
   cwd: string,
+  delegationPolicy?: DelegationPolicy,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const key of SAFE_ENV_KEYS) {
@@ -878,6 +931,7 @@ function childEnvironment(
   env[CONTROL_ENV] = control.statePath;
   env[DEADLINE_ENV] = String(control.deadlineMs);
   env[BUDGET_ENV] = String(budgetRemaining);
+  if (delegationPolicy) env[DELEGATION_POLICY_ENV] = JSON.stringify(delegationPolicy);
   if (process.env[TIMEOUT_ENV] !== undefined) env[TIMEOUT_ENV] = process.env[TIMEOUT_ENV];
   if (process.env[PASSTHROUGH_ENV] !== undefined) env[PASSTHROUGH_ENV] = process.env[PASSTHROUGH_ENV];
   if (process.env[SUBAGENT_BIN_ENV] !== undefined) env[SUBAGENT_BIN_ENV] = process.env[SUBAGENT_BIN_ENV];
@@ -1160,6 +1214,7 @@ async function runPiProcess(
   reservation: ChildReservation,
   signal: AbortSignal | undefined,
   onEvent: (event: ParsedJsonEvent) => void,
+  delegationPolicy?: DelegationPolicy,
 ): Promise<ProcessResult> {
   if (signal?.aborted) return { exitCode: 1, stopReason: "aborted", termination: "cancelled", errorMessage: "Subagent aborted.", stderr: "" };
   const timeoutMs = processTimeoutMs(control.deadlineMs);
@@ -1198,7 +1253,7 @@ async function runPiProcess(
     try {
       child = spawn(invocation.command, invocation.args, {
         cwd,
-        env: childEnvironment(depth + 1, control, parentRunId, childRunId, reservation.budgetRemaining, cwd),
+        env: childEnvironment(depth + 1, control, parentRunId, childRunId, reservation.budgetRemaining, cwd, delegationPolicy),
         shell: false,
         // Keep nested children in the root child's process group. The root
         // child is detached from the host; descendants then die with that
@@ -1399,6 +1454,7 @@ async function runAgent(
     usage: emptyUsage(),
     model: resolveModel(agent, modelOverride, parentModel),
   };
+  const childPolicy = childDelegationPolicy(execution.delegationPolicy, agent);
   let updateError: string | undefined;
   let eventFailure: string | undefined;
   let terminalOutput: string | undefined;
@@ -1471,7 +1527,7 @@ async function runAgent(
         result.errorMessage = eventFailure;
         report(eventFailure);
       }
-    });
+    }, childPolicy);
 
     const messageTermination = result.termination;
     result.exitCode = processResult.exitCode;
@@ -1837,6 +1893,7 @@ export default function (pi: ExtensionAPI) {
       const parentRunId = process.env[RUN_ID_ENV];
       const inheritedRootRunId = process.env[ROOT_ID_ENV] ?? runId;
       const depth = readDepth();
+      const inheritedDelegation = readDelegationPolicy();
       const inheritedDeadline = Number(process.env[DEADLINE_ENV]);
       let detailRootRunId = inheritedRootRunId;
       let detailDeadline = Number.isSafeInteger(inheritedDeadline) ? inheritedDeadline : 0;
@@ -1862,6 +1919,13 @@ export default function (pi: ExtensionAPI) {
         deadlineMs: detailDeadline,
         results,
       });
+      if (inheritedDelegation.error) {
+        return toolResult(inheritedDelegation.error, baseDetails(modeOf(params), []), true);
+      }
+      const inheritedPolicy = inheritedDelegation.policy;
+      const visibleAgents = inheritedPolicy?.allowedAgents
+        ? discovery.agents.filter((agent) => inheritedPolicy.allowedAgents!.includes(agent.name))
+        : discovery.agents;
       const hasSingleFields = params.agent !== undefined || params.task !== undefined;
       const hasSingle = hasSingleFields;
       const hasParallel = params.tasks !== undefined;
@@ -1877,7 +1941,7 @@ export default function (pi: ExtensionAPI) {
         }
         const listApproval = await confirmProjectAgents(
           ctx,
-          discovery.agents.filter((agent) => agent.source === "project").map((agent) => agent.name),
+          visibleAgents.filter((agent) => agent.source === "project").map((agent) => agent.name),
           discovery.agents,
           discovery.projectAgentsDir,
           trustedProjectRoot,
@@ -1887,20 +1951,22 @@ export default function (pi: ExtensionAPI) {
         if (!listApproval.allowed) {
           return toolResult(listApproval.reason ?? "Project-local agents were not approved.", baseDetails("single", []), true);
         }
-        const lines = discovery.agents.map((agent) => {
+        const lines = visibleAgents.map((agent) => {
           const configuredModel = agent.model ? ` [${agent.model}]` : " [parent model]";
           const tools = agent.tools?.length ? agent.tools.join(",") : "none";
           const capability = agent.capability ?? "unspecified";
           const delegation = agent.delegation ? "yes" : "no";
           const outputSchema = agent.outputSchema ? "yes" : "no";
-          return `${agent.name}: ${agent.description}${configuredModel} (${agent.source}; capability=${capability}; delegation=${delegation}; outputSchema=${outputSchema}; tools=${tools})`;
+          const allowedAgents = agent.allowedAgents?.join(",") || "any";
+          const maxDelegationDepth = agent.maxDelegationDepth === undefined ? "global" : String(agent.maxDelegationDepth);
+          return `${agent.name}: ${agent.description}${configuredModel} (${agent.source}; capability=${capability}; delegation=${delegation}; outputSchema=${outputSchema}; allowedAgents=${allowedAgents}; maxDelegationDepth=${maxDelegationDepth}; tools=${tools})`;
         });
         return toolResult(lines.length ? `Available agents:\n${lines.join("\n")}` : "No agents found.", baseDetails("single", [], "list"));
       }
 
       if (Number(hasSingle) + Number(hasParallel) + Number(hasChain) !== 1) {
         return toolResult(
-          `Invalid parameters. Provide exactly one mode: agent + task, tasks[], or chain[].\nAvailable agents: ${availableText(discovery.agents)}`,
+          `Invalid parameters. Provide exactly one mode: agent + task, tasks[], or chain[].\nAvailable agents: ${availableText(visibleAgents)}`,
           baseDetails(modeOf(params), []),
           true,
         );
@@ -1916,6 +1982,12 @@ export default function (pi: ExtensionAPI) {
       }
       if (!hasValidItems(params)) {
         return toolResult("Agent names and tasks must not be blank.", baseDetails(hasChain ? "chain" : "parallel", []), true);
+      }
+      if (inheritedPolicy?.allowedAgents && requestedAgentNames(params).some((name) => !inheritedPolicy.allowedAgents!.includes(name))) {
+        return toolResult(`Nested delegation is restricted to: ${inheritedPolicy.allowedAgents.join(", ") || "none"}.`, baseDetails(modeOf(params), []), true);
+      }
+      if (inheritedPolicy?.remainingDepth !== undefined && inheritedPolicy.remainingDepth <= 0) {
+        return toolResult("Nested delegation depth policy does not permit another level.", baseDetails(modeOf(params), []), true);
       }
       if (hasBlankModel(params)) {
         return toolResult("Model overrides must not be blank.", baseDetails(modeOf(params), []), true);
@@ -2013,6 +2085,7 @@ export default function (pi: ExtensionAPI) {
         depth: depth.depth,
         deadlineMs: control.deadlineMs,
         control,
+        delegationPolicy: inheritedPolicy,
       };
       let yieldedReservation = false;
       try {

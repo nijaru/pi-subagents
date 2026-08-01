@@ -64,6 +64,19 @@ outputSchema:
 Return the structured report.
 `);
 }
+function writePolicyAgent(root: string, policy: string): void {
+  const directory = path.join(root, ".pi", "agents");
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(path.join(directory, "coordinator.md"), `---
+name: coordinator
+description: Policy test coordinator
+delegation: true
+capability: write
+${policy}
+---
+Delegate only according to the policy.
+`);
+}
 function writeEnvPi(): string {
   const directory = tempDir();
   const script = path.join(directory, "env-pi");
@@ -244,7 +257,7 @@ async function call(tool: Tool, params: any, context: any, signal?: AbortSignal,
 afterEach(() => {
   delete process.env.PI_SUBAGENT_BIN;
   delete process.env.PI_SUBAGENT_DEPTH;
-  for (const key of ["PI_SUBAGENT_RUN_ID", "PI_SUBAGENT_PARENT_ID", "PI_SUBAGENT_ROOT_ID", "PI_SUBAGENT_CONTROL_FILE", "PI_SUBAGENT_DEADLINE_MS", "PI_SUBAGENT_BUDGET_REMAINING", "PI_SUBAGENT_TIMEOUT_MS"]) delete process.env[key];
+  for (const key of ["PI_SUBAGENT_RUN_ID", "PI_SUBAGENT_PARENT_ID", "PI_SUBAGENT_ROOT_ID", "PI_SUBAGENT_CONTROL_FILE", "PI_SUBAGENT_DEADLINE_MS", "PI_SUBAGENT_BUDGET_REMAINING", "PI_SUBAGENT_DELEGATION_POLICY", "PI_SUBAGENT_TIMEOUT_MS"]) delete process.env[key];
   for (const directory of tempDirs.splice(0)) fs.rmSync(directory, { recursive: true, force: true });
 });
 
@@ -281,6 +294,14 @@ describe("tool contract", () => {
     const result = await call(tool, { action: "list", agentScope: "project" }, ctx(root, { hasUI: false }));
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("interactive confirmation");
+  });
+
+  test("filters nested agent listings by inherited allowedAgents", async () => {
+    process.env.PI_SUBAGENT_DELEGATION_POLICY = JSON.stringify({ allowedAgents: ["worker"] });
+    const result = await call(tool, { action: "list" }, ctx(tempDir()));
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("worker:");
+    expect(result.content[0].text).not.toContain("reviewer:");
   });
 
   test("confirms before a project agent runs", async () => {
@@ -603,6 +624,24 @@ describe("subprocess behavior", () => {
     }, ctx(root));
     expect(result.isError).toBeUndefined();
     expect(result.details.results.map((item: any) => item.termination)).toEqual(["completed", "completed", "completed", "completed"]);
+  });
+
+  test("enforces inherited allowedAgents for nested delegation", async () => {
+    const root = tempDir();
+    writePolicyAgent(root, "allowedAgents: [reviewer]");
+    process.env.PI_SUBAGENT_BIN = writeRecursivePi();
+    const result = await call(tool, { agent: "coordinator", task: "run", agentScope: "project" }, ctx(root, { hasUI: true }));
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("restricted to");
+  });
+
+  test("enforces inherited maxDelegationDepth for nested delegation", async () => {
+    const root = tempDir();
+    writePolicyAgent(root, "maxDelegationDepth: 0");
+    process.env.PI_SUBAGENT_BIN = writeRecursivePi();
+    const result = await call(tool, { agent: "coordinator", task: "run", agentScope: "project" }, ctx(root, { hasUI: true }));
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("depth policy");
   });
 
   test("returns a structured failure when an update handler throws", async () => {

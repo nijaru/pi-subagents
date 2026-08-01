@@ -67,6 +67,7 @@ Frontmatter fields:
 - `delegation: true` explicitly permits nested use of `subagent`; it defaults to `false`. Delegation is itself potentially mutating, so delegation-capable profiles must use `capability: write` or omit the capability. The bundled `architect` and `worker` are delegation-capable. Other bundled agents are leaves.
 - `model` is optional and otherwise inherits the parent model.
 - `outputSchema` is an optional bounded TypeBox-compatible JSON Schema. When present, the child is instructed to return raw JSON only; a malformed or non-matching terminal response is a failed delegation. Schemas are limited to 16 KiB and local `$ref` values.
+- `allowedAgents` optionally restricts the exact agent names this definition may invoke through nested delegation. `maxDelegationDepth` optionally limits how many nested levels it may create (`0` disables nested calls; the global maximum is 3). An inherited parent policy can only narrow these limits.
 
 Definitions with invalid control metadata or output schemas are skipped. Project-agent task directories must stay inside the trusted project root. Bundled definitions can be overridden by user or project definitions with the same name.
 
@@ -94,6 +95,22 @@ Return the analysis as JSON matching the schema.
 ```
 
 The parsed value is available as `structuredOutput` in bounded result details. Plain-text agents and existing chain interpolation remain unchanged. JSON must be the complete terminal assistant response; Markdown fences and surrounding prose are rejected.
+
+Nested delegation can be narrowed per agent:
+
+```markdown
+---
+name: coordinator
+description: Coordinate only review work
+delegation: true
+capability: write
+allowedAgents: [reviewer, researcher]
+maxDelegationDepth: 1
+---
+Delegate only the allowed review tasks.
+```
+
+Nested calls outside `allowedAgents` or beyond `maxDelegationDepth` fail before a child starts. The parent policy is intersected with the selected child's policy, so a child cannot broaden its parent's restriction.
 
 ## Models, transport, and limits
 

@@ -138,6 +138,21 @@ Return a structured report.
     expect(loadAgentsFromDir(directory, "user")).toHaveLength(0);
   });
 
+  test("parses nested delegation policy metadata", () => {
+    const directory = tempDir();
+    writeAgent(directory, "policy.md", "policy", "\ndelegation: true\ncapability: write\nallowedAgents: [reviewer, researcher]\nmaxDelegationDepth: 2");
+    const [agent] = loadAgentsFromDir(directory, "user");
+    expect(agent).toMatchObject({ allowedAgents: ["reviewer", "researcher"], maxDelegationDepth: 2 });
+  });
+
+  test("skips malformed nested delegation policies", () => {
+    const directory = tempDir();
+    writeAgent(directory, "bad-names.md", "bad-names", "\nallowedAgents: [reviewer, reviewer]");
+    writeAgent(directory, "bad-depth.md", "bad-depth", "\nmaxDelegationDepth: 4");
+    writeAgent(directory, "bad-type.md", "bad-policy-type", "\nallowedAgents: 42");
+    expect(loadAgentsFromDir(directory, "user")).toHaveLength(0);
+  });
+
   test("skips read profiles with mutation-capable or unknown tools", () => {
     const directory = tempDir();
     writeAgent(directory, "bash.md", "bash", "\ncapability: read\ntools: read, bash");

@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 
 const MAX_AGENT_FILE_BYTES = 256 * 1024;
+const MAX_AGENT_DELEGATION_DEPTH = 3;
 const MAX_OUTPUT_SCHEMA_BYTES = 16 * 1024;
 const MAX_OUTPUT_SCHEMA_NODES = 512;
 const MAX_OUTPUT_SCHEMA_DEPTH = 16;
@@ -29,6 +30,10 @@ export interface AgentConfig {
   capability?: AgentCapability;
   /** Optional TypeBox-compatible JSON Schema for a raw JSON final response. */
   outputSchema?: AgentOutputSchema;
+  /** Exact names this agent may invoke through nested delegation. */
+  allowedAgents?: string[];
+  /** Maximum nested levels this agent may create; zero disables nested calls. */
+  maxDelegationDepth?: number;
   systemPrompt: string;
   source: AgentSource;
   filePath: string;
@@ -118,6 +123,22 @@ function parseTools(value: unknown): string[] | undefined {
     return tools.length > 0 ? tools : undefined;
   }
   return undefined;
+}
+
+function parseAllowedAgents(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined;
+  const names = typeof value === "string"
+    ? value.split(",")
+    : Array.isArray(value) && value.every((name) => typeof name === "string") ? value : undefined;
+  if (!names) return undefined;
+  const trimmed = names.map((name) => name.trim()).filter(Boolean);
+  if (trimmed.length !== new Set(trimmed).size || trimmed.some((name) => Buffer.byteLength(name, "utf8") > MAX_AGENT_NAME_BYTES)) return undefined;
+  return trimmed;
+}
+
+function parseMaxDelegationDepth(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= MAX_AGENT_DELEGATION_DEPTH ? value : undefined;
 }
 
 function parseDelegation(value: unknown): boolean | undefined {
@@ -303,10 +324,14 @@ export function loadAgentsFromDir(directory: string, source: AgentSource): Agent
     const capability = parseCapability(parsed.frontmatter.capability);
     const tools = parseTools(parsed.frontmatter.tools);
     const outputSchema = parseOutputSchema(parsed.frontmatter.outputSchema);
+    const allowedAgents = parseAllowedAgents(parsed.frontmatter.allowedAgents);
+    const maxDelegationDepth = parseMaxDelegationDepth(parsed.frontmatter.maxDelegationDepth);
     // Invalid control metadata is not allowed to silently become a broader
     // policy. The definition is skipped rather than treated as unrestricted.
     if (delegation === undefined || parsed.frontmatter.capability !== undefined && capability === undefined) continue;
     if (parsed.frontmatter.outputSchema !== undefined && outputSchema === undefined) continue;
+    if (parsed.frontmatter.allowedAgents !== undefined && allowedAgents === undefined) continue;
+    if (parsed.frontmatter.maxDelegationDepth !== undefined && maxDelegationDepth === undefined) continue;
     if (!isReadCapabilityConsistent(capability, tools, delegation)) continue;
     agents.push({
       name: name.trim(),
@@ -316,6 +341,8 @@ export function loadAgentsFromDir(directory: string, source: AgentSource): Agent
       delegation,
       capability,
       outputSchema,
+      allowedAgents,
+      maxDelegationDepth,
       systemPrompt: parsed.body,
       source,
       filePath,
