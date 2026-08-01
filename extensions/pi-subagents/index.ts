@@ -1750,13 +1750,13 @@ export default function (pi: ExtensionAPI) {
       "The only action is list. Model-visible output and partial updates share one deterministic 50KB cap per tool call.",
     ].join(" "),
     parameters: SubagentParamsSchema,
-    // The tool owns its own parallel mode and rejects unsafe same-cwd writes.
+    // The tool owns its own parallel mode and rejects unsafe same-project-root writes.
     // Serialize sibling top-level calls so two separate tool calls cannot
     // bypass that per-call mutation guard.
     executionMode: "sequential",
     promptSnippet: "Delegate work to an isolated named subagent (single, parallel, or chain).",
     promptGuidelines: [
-      "Call subagent in parallel only for independent tasks; same-cwd potentially-mutating tasks are rejected.",
+      "Call subagent in parallel only for independent tasks; potentially-mutating tasks sharing a project root are rejected.",
       "Call subagent in a chain when a later agent needs the previous agent's report.",
     ],
 
@@ -1903,7 +1903,7 @@ export default function (pi: ExtensionAPI) {
         for (const [taskCwd, names] of parallelMutators) {
           if (names.length > 1) {
             return toolResult(
-              `Parallel mutation rejected: potentially mutating agents (${names.join(", ")}) share project root ${taskCwd}. Use distinct cwd values or a serial chain.`,
+              `Parallel mutation rejected: potentially mutating agents (${names.join(", ")}) share project root ${taskCwd}. Use distinct project roots or a serial chain.`,
               baseDetails("parallel", []),
               true,
             );

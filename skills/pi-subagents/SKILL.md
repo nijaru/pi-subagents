@@ -31,7 +31,7 @@ Definitions are Markdown files with YAML frontmatter. Required: `name`, `descrip
 - `capability: read` is effect metadata for scheduling safety, not a security sandbox; `capability: write` marks it potentially mutating. Omitted capability is conservatively potentially mutating. A read profile is accepted only with the known read-only tools (`read`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `web_research`, `source_check`, `fetch_content`, `get_search_content`, `resolve-library-id`, or `query-docs`) and cannot delegate; unknown or mutation-capable tools invalidate the definition.
 - `delegation: true` is required for nested `subagent` calls and defaults false. Delegation-capable profiles must use `capability: write` or omit the capability. Bundled `architect` and `worker` may delegate; other bundled agents are leaves.
 
-Project agents are repository-controlled prompts. The current pi project must be trusted, UI sessions confirm before using them, and headless calls reject them. Project-agent task `cwd` values must remain inside the trusted project root. Parallel potentially mutating tasks sharing the same canonical cwd are rejected; distinct cwd values may run concurrently. Use a serial chain for shared-worktree writes.
+Project agents are repository-controlled prompts. The current pi project must be trusted, UI sessions confirm before using them, and headless calls reject them. Project-agent task `cwd` values must remain inside the trusted project root. Parallel potentially mutating tasks sharing the same project root are rejected; distinct project roots may run concurrently. Use a serial chain for shared-worktree writes.
 
 ## Safety and limits
 

@@ -31,7 +31,7 @@ Use exactly one mode per call:
 
 Up to eight tasks are accepted. Execution has a local and root-wide concurrency limit; results remain in input order.
 
-Parallel tasks that may mutate the same canonical `cwd` are rejected. Give read-only agents `capability: read`, use distinct directories, or use a serial chain.
+Parallel tasks that may mutate the same project root are rejected. Give read-only agents `capability: read`, use distinct project roots, or use a serial chain.
 
 ### Sequential chain
 
