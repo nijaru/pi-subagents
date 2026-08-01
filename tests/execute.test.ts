@@ -34,6 +34,36 @@ printf '%s\\n' '{"type":"message_end","message":{"role":"assistant","content":[{
   fs.chmodSync(script, 0o755);
   return script;
 }
+function writeStructuredPi(output: string): string {
+  const directory = tempDir();
+  const script = path.join(directory, "structured-pi");
+  fs.writeFileSync(script, `#!/usr/bin/env bun
+const usage = { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 5, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: ${JSON.stringify(output)} }], model: "fake/model", usage, stopReason: "stop", timestamp: 1 } }));
+`);
+  fs.chmodSync(script, 0o755);
+  return script;
+}
+function writeStructuredAgent(root: string): void {
+  const directory = path.join(root, ".pi", "agents");
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(path.join(directory, "structured.md"), `---
+name: structured
+description: Structured test agent
+outputSchema:
+  type: object
+  properties:
+    summary:
+      type: string
+    count:
+      type: integer
+  required:
+    - summary
+  additionalProperties: false
+---
+Return the structured report.
+`);
+}
 function writeEnvPi(): string {
   const directory = tempDir();
   const script = path.join(directory, "env-pi");
@@ -329,6 +359,32 @@ describe("subprocess behavior", () => {
     expect(args).toContain("--no-tools");
     expect(args.some((arg) => arg.startsWith("@") && arg.endsWith("/task.md"))).toBe(true);
     expect(args.join(" ")).not.toContain("Task: run");
+  });
+
+  test("validates opt-in structured output and exposes the parsed value", async () => {
+    const root = tempDir();
+    writeStructuredAgent(root);
+    process.env.PI_SUBAGENT_BIN = writeStructuredPi(JSON.stringify({ summary: "done", count: 2 }));
+    const result = await call(tool, { agent: "structured", task: "run", agentScope: "project" }, ctx(root, { hasUI: true }));
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toBe(JSON.stringify({ summary: "done", count: 2 }));
+    expect(result.details.results[0].structuredOutput).toEqual({ summary: "done", count: 2 });
+  });
+
+  test("rejects malformed or schema-mismatched structured output", async () => {
+    const root = tempDir();
+    writeStructuredAgent(root);
+    process.env.PI_SUBAGENT_BIN = writeStructuredPi("not json");
+    const malformed = await call(tool, { agent: "structured", task: "run", agentScope: "project" }, ctx(root, { hasUI: true }));
+    expect(malformed.isError).toBe(true);
+    expect(malformed.content[0].text).toContain("valid JSON");
+    expect(malformed.details.results[0].termination).toBe("failed");
+
+    process.env.PI_SUBAGENT_BIN = writeStructuredPi(JSON.stringify({ count: 2 }));
+    const mismatch = await call(tool, { agent: "structured", task: "run", agentScope: "project" }, ctx(root, { hasUI: true }));
+    expect(mismatch.isError).toBe(true);
+    expect(mismatch.content[0].text).toContain("does not match");
+    expect(mismatch.details.results[0].structuredOutput).toBeUndefined();
   });
 
   test("forwards model refs and credential variables without ambient application values", async () => {

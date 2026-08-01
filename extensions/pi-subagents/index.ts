@@ -17,14 +17,16 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
+import { Check, Errors } from "typebox/value";
 import {
   type AgentConfig,
+  type AgentOutputSchema,
   type AgentScope,
   discoverAgents,
   findNearestProjectRoot,
 } from "./agents.ts";
 
-export type { AgentCapability, AgentConfig, AgentDiscoveryResult, AgentScope } from "./agents.ts";
+export type { AgentCapability, AgentConfig, AgentDiscoveryResult, AgentOutputSchema, AgentScope } from "./agents.ts";
 export { discoverAgents, findNearestProjectAgentsDir, findNearestProjectRoot, getBundledAgentsDir, loadAgentsFromDir } from "./agents.ts";
 
 export const MAX_DEPTH = 3;
@@ -45,6 +47,7 @@ const MAX_PROCESS_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const MAX_TASK_BYTES = 100 * 1024;
 const MAX_CHAIN_STEPS = 32;
 const MAX_CHAIN_CONTEXT_BYTES = 50 * 1024;
+const MAX_STRUCTURED_OUTPUT_BYTES = MAX_OUTPUT_BYTES;
 const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
 const RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
 const PARENT_ID_ENV = "PI_SUBAGENT_PARENT_ID";
@@ -125,6 +128,8 @@ export interface AgentResult {
   task: string;
   /** Final assistant text, kept separately from bounded diagnostic messages. */
   output?: string;
+  /** Parsed terminal JSON when the agent definition opts into outputSchema. */
+  structuredOutput?: unknown;
   runId: string;
   parentRunId?: string;
   rootRunId: string;
@@ -348,6 +353,44 @@ function jsonBytes(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value), "utf8");
 }
 
+function boundStructuredOutput(value: unknown, maxBytes = MAX_DIAGNOSTIC_BYTES): unknown {
+  if (value === undefined) return undefined;
+  try {
+    return jsonBytes(value) <= maxBytes ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function structuredOutputPrompt(schema: AgentOutputSchema): string {
+  return [
+    "This agent has an output schema. Your final assistant response must be raw JSON only, with no Markdown fences, commentary, or leading/trailing text.",
+    "The JSON value must validate against this schema:",
+    JSON.stringify(schema),
+    "If you cannot complete the task, still return a JSON value matching the schema rather than a prose error.",
+  ].join("\\n");
+}
+
+function validateStructuredOutput(schema: AgentOutputSchema, raw: string): { value?: unknown; error?: string } {
+  if (Buffer.byteLength(raw, "utf8") > MAX_STRUCTURED_OUTPUT_BYTES) {
+    return { error: `Structured output exceeds the ${MAX_STRUCTURED_OUTPUT_BYTES}-byte limit.` };
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return { error: "Structured output must be valid JSON with no surrounding prose or Markdown fences." };
+  }
+  try {
+    if (Check(schema as any, value)) return { value };
+    const issue = [...Errors(schema as any, value)][0];
+    const location = issue?.instancePath ? ` at ${issue.instancePath}` : "";
+    return { error: `Structured output does not match the agent schema${location}${issue?.message ? `: ${issue.message}` : "."}` };
+  } catch (error) {
+    return { error: `Structured output schema could not be evaluated: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
 /** Keep typed pi messages while bounding the data copied into tool details. */
 function boundMessage(message: Message, maxBytes = MAX_MESSAGE_BYTES): Message {
   if (jsonBytes(message) <= maxBytes) return message;
@@ -405,6 +448,7 @@ function boundAgentResult(result: AgentResult, maxBytes: number): AgentResult {
   let bounded = minimalAgentResult(result);
   if (jsonBytes(bounded) >= maxBytes) return bounded;
   const candidates: Array<[keyof AgentResult, unknown]> = [
+    ["structuredOutput", boundStructuredOutput(result.structuredOutput, Math.min(MAX_DIAGNOSTIC_BYTES, maxBytes))],
     ["output", result.output ? truncateOutput(result.output, Math.min(MAX_OUTPUT_BYTES, maxBytes)) : undefined],
     ["task", truncateOutput(result.task, Math.min(MAX_DIAGNOSTIC_BYTES, maxBytes))],
     ["stderr", truncateOutput(result.stderr, Math.min(MAX_DIAGNOSTIC_BYTES, maxBytes))],
@@ -1357,6 +1401,7 @@ async function runAgent(
   };
   let updateError: string | undefined;
   let eventFailure: string | undefined;
+  let terminalOutput: string | undefined;
   const report = (progress: string, propagate = true) => {
     try {
       emit(result, progress);
@@ -1386,9 +1431,13 @@ async function runAgent(
     if (tools.length > 0) args.push("--tools", tools.join(","));
     else args.push("--no-tools");
     tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
-    if (agent.systemPrompt.trim()) {
+    const systemPrompt = [
+      agent.systemPrompt.trim(),
+      agent.outputSchema ? structuredOutputPrompt(agent.outputSchema) : "",
+    ].filter(Boolean).join("\n\n");
+    if (systemPrompt) {
       const promptPath = path.join(tempDir, "system-prompt.md");
-      await fs.promises.writeFile(promptPath, agent.systemPrompt, { encoding: "utf8", mode: 0o600 });
+      await fs.promises.writeFile(promptPath, systemPrompt, { encoding: "utf8", mode: 0o600 });
       args.push("--append-system-prompt", promptPath);
     }
     const taskPath = path.join(tempDir, "task.md");
@@ -1397,6 +1446,9 @@ async function runAgent(
 
     const processResult = await runPiProcess(args, cwd, execution.depth, execution.control, execution.runId, result.runId, reservation, signal, (event) => {
       if (event.kind === "message" && event.message) {
+        if (event.message.role === "assistant" && (event.message.stopReason === "stop" || event.message.stopReason === "length")) {
+          terminalOutput = textFromMessage(event.message);
+        }
         recordMessage(result, event.message);
         if (eventFailure) {
           result.stopReason = "error";
@@ -1404,7 +1456,12 @@ async function runAgent(
         }
         report(result.output || getFinalOutput(result.messages) || "Subagent is working...");
       } else if (event.kind === "messages" && event.messages && result.messages.length === 0) {
-        for (const message of event.messages) recordMessage(result, message);
+        for (const message of event.messages) {
+          if (message.role === "assistant" && (message.stopReason === "stop" || message.stopReason === "length")) {
+            terminalOutput = textFromMessage(message);
+          }
+          recordMessage(result, message);
+        }
         report(result.output || getFinalOutput(result.messages) || "Subagent finished...");
       } else if (event.kind === "progress") {
         report(event.text || "Subagent is working...");
@@ -1444,6 +1501,17 @@ async function runAgent(
       result.stopReason = "error";
       result.termination = "failed";
       result.errorMessage ??= "Subagent produced no assistant output; a terminal response is required.";
+    }
+    if (agent.outputSchema && result.termination === "completed" && result.output) {
+      const structured = validateStructuredOutput(agent.outputSchema, terminalOutput ?? result.output);
+      if (structured.error) {
+        result.exitCode = 1;
+        result.stopReason = "error";
+        result.termination = "failed";
+        result.errorMessage = truncateOutput(structured.error, MAX_DIAGNOSTIC_BYTES);
+      } else {
+        result.structuredOutput = structured.value;
+      }
     }
     if (result.stopReason === "error" && !result.errorMessage) result.errorMessage = "Subagent failed.";
     report(result.output || result.errorMessage || "(no output)", false);
@@ -1502,6 +1570,7 @@ function isRenderableAgentResult(value: unknown): value is AgentResult {
     && typeof result.agentSource === "string"
     && typeof result.task === "string"
     && (result.output === undefined || typeof result.output === "string")
+    && (result.structuredOutput === undefined || result.structuredOutput === null || ["string", "number", "boolean", "object"].includes(typeof result.structuredOutput))
     && typeof result.runId === "string"
     && typeof result.rootRunId === "string"
     && isFiniteNumber(result.depth)
@@ -1518,7 +1587,10 @@ function resultText(result: AgentResult): string {
 }
 
 function copyResult(result: AgentResult): AgentResult {
-  return { ...result, messages: [...result.messages], usage: { ...result.usage, cost: { ...result.usage.cost } } };
+  const structuredOutput = result.structuredOutput === undefined
+    ? undefined
+    : JSON.parse(JSON.stringify(result.structuredOutput));
+  return { ...result, structuredOutput, messages: [...result.messages], usage: { ...result.usage, cost: { ...result.usage.cost } } };
 }
 
 async function mapWithConcurrency<T>(items: T[], fn: (item: T, index: number) => Promise<AgentResult>): Promise<AgentResult[]> {
@@ -1820,7 +1892,8 @@ export default function (pi: ExtensionAPI) {
           const tools = agent.tools?.length ? agent.tools.join(",") : "none";
           const capability = agent.capability ?? "unspecified";
           const delegation = agent.delegation ? "yes" : "no";
-          return `${agent.name}: ${agent.description}${configuredModel} (${agent.source}; capability=${capability}; delegation=${delegation}; tools=${tools})`;
+          const outputSchema = agent.outputSchema ? "yes" : "no";
+          return `${agent.name}: ${agent.description}${configuredModel} (${agent.source}; capability=${capability}; delegation=${delegation}; outputSchema=${outputSchema}; tools=${tools})`;
         });
         return toolResult(lines.length ? `Available agents:\n${lines.join("\n")}` : "No agents found.", baseDetails("single", [], "list"));
       }

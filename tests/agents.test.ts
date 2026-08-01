@@ -105,6 +105,39 @@ describe("agent discovery", () => {
     expect(agent).toMatchObject({ delegation: true, capability: "write", tools: ["read", "subagent"] });
   });
 
+  test("parses bounded structured output schemas", () => {
+    const directory = tempDir();
+    fs.writeFileSync(path.join(directory, "structured.md"), `---
+name: structured
+description: structured agent
+outputSchema:
+  type: object
+  properties:
+    summary:
+      type: string
+  required:
+    - summary
+  additionalProperties: false
+---
+Return a structured report.
+`);
+    const [agent] = loadAgentsFromDir(directory, "user");
+    expect(agent?.outputSchema).toEqual({
+      type: "object",
+      properties: { summary: { type: "string" } },
+      required: ["summary"],
+      additionalProperties: false,
+    });
+  });
+
+  test("skips invalid structured output schemas instead of disabling validation", () => {
+    const directory = tempDir();
+    writeAgent(directory, "bad-type.md", "bad-type", "\noutputSchema:\n  type: made-up");
+    writeAgent(directory, "bad-properties.md", "bad-properties", "\noutputSchema:\n  type: object\n  properties: invalid");
+    writeAgent(directory, "bad-ref.md", "bad-ref", "\noutputSchema:\n  $ref: https://example.com/schema.json");
+    expect(loadAgentsFromDir(directory, "user")).toHaveLength(0);
+  });
+
   test("skips read profiles with mutation-capable or unknown tools", () => {
     const directory = tempDir();
     writeAgent(directory, "bash.md", "bash", "\ncapability: read\ntools: read, bash");

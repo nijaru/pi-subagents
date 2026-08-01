@@ -4,6 +4,9 @@ import { fileURLToPath } from "node:url";
 import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 
 const MAX_AGENT_FILE_BYTES = 256 * 1024;
+const MAX_OUTPUT_SCHEMA_BYTES = 16 * 1024;
+const MAX_OUTPUT_SCHEMA_NODES = 512;
+const MAX_OUTPUT_SCHEMA_DEPTH = 16;
 const MAX_AGENT_NAME_BYTES = 256;
 const MAX_AGENT_DESCRIPTION_BYTES = 2 * 1024;
 const MAX_AGENT_FILES = 256;
@@ -12,6 +15,7 @@ const MAX_AGENT_DIRECTORY_BYTES = 4 * 1024 * 1024;
 export type AgentScope = "user" | "project" | "both";
 export type AgentSource = "bundled" | "user" | "project";
 export type AgentCapability = "read" | "write";
+export type AgentOutputSchema = Record<string, unknown>;
 
 export interface AgentConfig {
   name: string;
@@ -23,6 +27,8 @@ export interface AgentConfig {
   delegation: boolean;
   /** Missing is classified as potentially mutating by the executor. */
   capability?: AgentCapability;
+  /** Optional TypeBox-compatible JSON Schema for a raw JSON final response. */
+  outputSchema?: AgentOutputSchema;
   systemPrompt: string;
   source: AgentSource;
   filePath: string;
@@ -122,6 +128,103 @@ function parseCapability(value: unknown): AgentCapability | undefined {
   return value === undefined || value === "read" || value === "write" ? value : undefined;
 }
 
+const JSON_SCHEMA_TYPES = new Set(["null", "boolean", "object", "array", "number", "integer", "string"]);
+const SCHEMA_STRING_KEYS = new Set(["$id", "$schema", "$ref", "title", "description", "pattern", "format", "$comment"]);
+const SCHEMA_NUMBER_KEYS = new Set([
+  "minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties",
+  "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+]);
+const SCHEMA_NON_NEGATIVE_INTEGER_KEYS = new Set([
+  "minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties",
+]);
+const SCHEMA_ARRAY_KEYS = new Set(["required", "enum", "anyOf", "oneOf", "allOf"]);
+
+interface SchemaValidationState {
+  nodes: number;
+  seen: Set<object>;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Validate the schema shape before handing it to TypeBox's runtime checker.
+ * TypeBox treats unknown `type` values as an unconstrained schema, which would
+ * silently broaden an agent's contract, so invalid control fields fail closed.
+ */
+function validateOutputSchema(value: unknown, state: SchemaValidationState, depth: number): boolean {
+  if (!isRecord(value) || depth > MAX_OUTPUT_SCHEMA_DEPTH) return false;
+  if (state.seen.has(value)) return false;
+  state.seen.add(value);
+  state.nodes++;
+  if (state.nodes > MAX_OUTPUT_SCHEMA_NODES) return false;
+
+  const type = value.type;
+  if (type !== undefined) {
+    const types = Array.isArray(type) ? type : [type];
+    if (types.length === 0 || types.some((item) => typeof item !== "string" || !JSON_SCHEMA_TYPES.has(item))) return false;
+    if (new Set(types).size !== types.length) return false;
+  }
+  for (const key of SCHEMA_STRING_KEYS) {
+    if (value[key] !== undefined && typeof value[key] !== "string") return false;
+  }
+  for (const key of SCHEMA_NUMBER_KEYS) {
+    const number = value[key];
+    if (number === undefined) continue;
+    if (typeof number !== "number" || !Number.isFinite(number)) return false;
+    if (SCHEMA_NON_NEGATIVE_INTEGER_KEYS.has(key) && (!Number.isInteger(number) || number < 0)) return false;
+    if (key === "multipleOf" && number <= 0) return false;
+  }
+  if (typeof value.pattern === "string") {
+    try {
+      new RegExp(value.pattern);
+    } catch {
+      return false;
+    }
+  }
+  if (value.required !== undefined && (!Array.isArray(value.required) || value.required.some((item) => typeof item !== "string"))) return false;
+  if (value.enum !== undefined && (!Array.isArray(value.enum) || value.enum.length === 0)) return false;
+  if (value.additionalProperties !== undefined && value.additionalProperties !== false && value.additionalProperties !== true && !validateOutputSchema(value.additionalProperties, state, depth + 1)) return false;
+  if (value.unevaluatedProperties !== undefined && value.unevaluatedProperties !== false && value.unevaluatedProperties !== true && !validateOutputSchema(value.unevaluatedProperties, state, depth + 1)) return false;
+
+  for (const key of ["properties", "patternProperties", "dependentSchemas", "$defs", "definitions"]) {
+    if (value[key] === undefined) continue;
+    if (!isRecord(value[key]) || Object.values(value[key]).some((schema) => !validateOutputSchema(schema, state, depth + 1))) return false;
+    if (key === "patternProperties") {
+      try {
+        for (const pattern of Object.keys(value[key])) new RegExp(pattern);
+      } catch {
+        return false;
+      }
+    }
+  }
+  for (const key of ["items", "additionalItems", "contains", "propertyNames", "not", "if", "then", "else", "contentSchema"]) {
+    if (value[key] !== undefined && !validateOutputSchema(value[key], state, depth + 1)) return false;
+  }
+  for (const key of SCHEMA_ARRAY_KEYS) {
+    if (value[key] === undefined) continue;
+    if (!Array.isArray(value[key]) || value[key].length === 0) return false;
+    if (key !== "required" && key !== "enum" && value[key].some((schema) => !validateOutputSchema(schema, state, depth + 1))) return false;
+  }
+  if (value.prefixItems !== undefined && (!Array.isArray(value.prefixItems) || value.prefixItems.some((schema) => !validateOutputSchema(schema, state, depth + 1)))) return false;
+  if (value.$ref !== undefined && (typeof value.$ref !== "string" || !value.$ref.startsWith("#/"))) return false;
+  return true;
+}
+
+function parseOutputSchema(value: unknown): AgentOutputSchema | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) return undefined;
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    return undefined;
+  }
+  if (Buffer.byteLength(serialized, "utf8") > MAX_OUTPUT_SCHEMA_BYTES) return undefined;
+  return validateOutputSchema(value, { nodes: 0, seen: new Set() }, 0) ? value : undefined;
+}
+
 // A read capability is an effect declaration used for parallel-write safety,
 // not a sandbox. Keep the allowlist deliberately small: an unknown extension
 // tool may mutate state and must not be trusted merely because its name looks
@@ -199,9 +302,11 @@ export function loadAgentsFromDir(directory: string, source: AgentSource): Agent
     const delegation = parseDelegation(parsed.frontmatter.delegation);
     const capability = parseCapability(parsed.frontmatter.capability);
     const tools = parseTools(parsed.frontmatter.tools);
+    const outputSchema = parseOutputSchema(parsed.frontmatter.outputSchema);
     // Invalid control metadata is not allowed to silently become a broader
     // policy. The definition is skipped rather than treated as unrestricted.
     if (delegation === undefined || parsed.frontmatter.capability !== undefined && capability === undefined) continue;
+    if (parsed.frontmatter.outputSchema !== undefined && outputSchema === undefined) continue;
     if (!isReadCapabilityConsistent(capability, tools, delegation)) continue;
     agents.push({
       name: name.trim(),
@@ -210,6 +315,7 @@ export function loadAgentsFromDir(directory: string, source: AgentSource): Agent
       tools,
       delegation,
       capability,
+      outputSchema,
       systemPrompt: parsed.body,
       source,
       filePath,

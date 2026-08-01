@@ -66,8 +66,34 @@ Frontmatter fields:
 - `capability` is effect metadata for scheduling safety, not a security sandbox. Omitted capability is conservatively treated as potentially mutating for parallel safety. A `read` profile must use only the known read-only tools (`read`, `grep`, `find`, `ls`, `web_search`, `source_check`, `fetch_content`, `get_search_content`, `resolve-library-id`, or `query-docs`) and cannot delegate; unknown or mutation-capable tools invalidate the definition.
 - `delegation: true` explicitly permits nested use of `subagent`; it defaults to `false`. Delegation is itself potentially mutating, so delegation-capable profiles must use `capability: write` or omit the capability. The bundled `architect` and `worker` are delegation-capable. Other bundled agents are leaves.
 - `model` is optional and otherwise inherits the parent model.
+- `outputSchema` is an optional bounded TypeBox-compatible JSON Schema. When present, the child is instructed to return raw JSON only; a malformed or non-matching terminal response is a failed delegation. Schemas are limited to 16 KiB and local `$ref` values.
 
-Definitions with invalid control metadata are skipped. Project-agent task directories must stay inside the trusted project root. Bundled definitions can be overridden by user or project definitions with the same name.
+Definitions with invalid control metadata or output schemas are skipped. Project-agent task directories must stay inside the trusted project root. Bundled definitions can be overridden by user or project definitions with the same name.
+
+### Structured outputs
+
+Opt in per agent when downstream steps need typed data:
+
+```markdown
+---
+name: analyst
+description: Return a compact analysis
+outputSchema:
+  type: object
+  properties:
+    summary:
+      type: string
+    risks:
+      type: array
+      items:
+        type: string
+  required: [summary, risks]
+  additionalProperties: false
+---
+Return the analysis as JSON matching the schema.
+```
+
+The parsed value is available as `structuredOutput` in bounded result details. Plain-text agents and existing chain interpolation remain unchanged. JSON must be the complete terminal assistant response; Markdown fences and surrounding prose are rejected.
 
 ## Models, transport, and limits
 
@@ -79,7 +105,7 @@ Environment is allowlisted. Children automatically receive standard Pi model cre
 
 A top-level `model` override applies to every mode. A task/chain item may also specify `model`. Resolution is top-level/item override, then agent definition, then the parent pi model. Inheritance passes the parent `provider/id`; runtime-registered providers or credentials are not copied into the child process, so those require child Pi configuration or the explicit environment passthrough policy.
 
-The model-visible final result and each partial update use one deterministic 50 KiB output cap per tool call. Final assistant output is kept separately from bounded 16 KiB diagnostic message records. A result is successful only after a terminal assistant response (`stop` or `length`); tool-use turns alone are failures. Result details expose explicit termination states for completed, failed, cancelled, and timed-out runs. The child stream is framed incrementally with a 1 MiB per-line guard: oversized or ignored protocol lines are skipped so verbose tool traffic cannot reject a later valid final response, while cancellation, timeouts, and child failures still terminate the process. Stream input, stderr, diagnostics, stored messages, and rendering are bounded separately and malformed result details render safely. Thrown tool errors retain pi-agent-core error semantics; pi itself may discard custom `Error` fields, so callers must not depend on structured details surviving an error boundary.
+The model-visible final result and each partial update use one deterministic 50 KiB output cap per tool call. Final assistant output is kept separately from bounded 16 KiB diagnostic message records; valid structured values are included when they fit the bounded result details. A result is successful only after a terminal assistant response (`stop` or `length`); tool-use turns alone are failures. Result details expose explicit termination states for completed, failed, cancelled, and timed-out runs. The child stream is framed incrementally with a 1 MiB per-line guard: oversized or ignored protocol lines are skipped so verbose tool traffic cannot reject a later valid final response, while cancellation, timeouts, and child failures still terminate the process. Stream input, stderr, diagnostics, stored messages, and rendering are bounded separately and malformed result details render safely. Thrown tool errors retain pi-agent-core error semantics; pi itself may discard custom `Error` fields, so callers must not depend on structured details surviving an error boundary.
 
 `action: "list"` returns the complete agent metadata to the model, while its successful result intentionally renders no body in the interactive TUI to avoid polluting the transcript.
 

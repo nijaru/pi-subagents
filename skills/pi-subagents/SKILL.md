@@ -30,6 +30,23 @@ Definitions are Markdown files with YAML frontmatter. Required: `name`, `descrip
 - `tools` is an explicit allowlist. Missing tools means the child receives `--no-tools`, not pi's defaults.
 - `capability: read` is effect metadata for scheduling safety, not a security sandbox; `capability: write` marks it potentially mutating. Omitted capability is conservatively potentially mutating. A read profile is accepted only with the known read-only tools (`read`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `web_research`, `source_check`, `fetch_content`, `get_search_content`, `resolve-library-id`, or `query-docs`) and cannot delegate; unknown or mutation-capable tools invalidate the definition.
 - `delegation: true` is required for nested `subagent` calls and defaults false. Delegation-capable profiles must use `capability: write` or omit the capability. Bundled `architect` and `worker` may delegate; other bundled agents are leaves.
+- `outputSchema` is an optional bounded TypeBox-compatible JSON Schema. The child must return raw JSON matching it; malformed, fenced, or non-matching terminal output fails the delegation. Schemas are limited to 16 KiB and local `$ref` values.
+
+For example:
+
+```markdown
+---
+name: analyst
+description: Return typed analysis
+outputSchema:
+  type: object
+  properties:
+    summary: { type: string }
+  required: [summary]
+  additionalProperties: false
+---
+Return JSON matching the schema.
+```
 
 Project agents are repository-controlled prompts. The current pi project must be trusted, UI sessions confirm before using them, and headless calls reject them. Project-agent task `cwd` values must remain inside the trusted project root. Parallel potentially mutating tasks sharing the same project root are rejected; distinct project roots may run concurrently. Use a serial chain for shared-worktree writes.
 
@@ -41,7 +58,7 @@ Nested calls propagate depth, run/parent/root IDs, deadline, timeout, explicit p
 
 Env is allowlisted. Standard Pi model credentials, all `$VAR` refs from `~/.pi/agent/models.json`, and credential-shaped `*_API_KEY`/`*_TOKEN` variables are passed, including nested model and research-tool credentials. Arbitrary application variables are still excluded by default. For other variables, set `PI_SUBAGENT_PASSTHROUGH_ENV` with exact names or globs. `*` passes all env (insecure). Best: `pi /login` stores credentials in `~/.pi/agent/auth.json` when supported. The model-visible final result and partial updates use one deterministic 50 KiB cap per tool call; final output is separate from bounded message records, and cumulative message updates are charged by logical growth with an independent raw stream cap. Stream data, stderr, diagnostics, stored messages, and rendering are bounded too.
 
-Result details include bounded typed pi messages, usage, stop reasons, explicit termination (`completed`, `failed`, `cancelled`, or `timed_out`), and run/depth IDs where available. A child must emit a terminal assistant response (`stop` or `length`); tool-use turns alone are not successful output. Thrown tool errors preserve pi-agent-core semantics; custom `Error` fields may be dropped by pi, so structured details are not guaranteed on failures. Malformed subprocess JSON and malformed result details are ignored or rendered safely.
+Result details include bounded typed pi messages, usage, stop reasons, explicit termination (`completed`, `failed`, `cancelled`, or `timed_out`), run/depth IDs where available, and a parsed `structuredOutput` value when an agent schema is configured and the value fits the result bound. A child must emit a terminal assistant response (`stop` or `length`); tool-use turns alone are not successful output. Plain-text agents and chain interpolation remain unchanged; structured output must be the complete terminal response with no Markdown fences or surrounding prose. Thrown tool errors preserve pi-agent-core semantics; custom `Error` fields may be dropped by pi, so structured details are not guaranteed on failures. Malformed subprocess JSON and malformed result details are ignored or rendered safely.
 
 `pi-workflows` is a separate orchestration extension with private in-process SDK leaf sessions; it should not invoke this public tool as its worker backend. A future process-isolated workflow adapter, if needed, should be a private leaf runner rather than nested public scheduling.
 
