@@ -56,7 +56,7 @@ const TIMEOUT_ENV = "PI_SUBAGENT_TIMEOUT_MS";
 const PASSTHROUGH_ENV = "PI_SUBAGENT_PASSTHROUGH_ENV";
 const SUBAGENT_BIN_ENV = "PI_SUBAGENT_BIN";
 const PI_BIN_ENV = "PI_BIN";
-const CONTROL_VERSION = 1;
+const CONTROL_VERSION = 2;
 
 // Keep the child useful for configured providers without copying arbitrary
 // shell/session state (SSH sockets, cloud metadata, and unrelated secrets).
@@ -85,6 +85,8 @@ interface ControlState {
   rootRunId: string;
   remaining: number;
   active: number;
+  /** Reservation owners make slot release idempotent and prevent stale releases. */
+  activeRunIds: string[];
   maxConcurrent: number;
   deadlineMs: number;
 }
@@ -100,9 +102,13 @@ interface ChildReservation {
   budgetRemaining: number;
 }
 
+export type AgentTermination = "completed" | "failed" | "cancelled" | "timed_out";
+
 interface ExecutionContext {
   runId: string;
   parentRunId?: string;
+  /** Reservation held by this nested process in its parent's control state. */
+  reservationRunId?: string;
   rootRunId: string;
   depth: number;
   deadlineMs: number;
@@ -126,6 +132,8 @@ export interface AgentResult {
   step?: number;
   exitCode: number;
   stopReason?: StopReason;
+  /** Distinguishes ordinary failure, cancellation, and timeout across the API boundary. */
+  termination?: AgentTermination;
   errorMessage?: string;
   stderr: string;
   messages: Message[];
@@ -384,6 +392,7 @@ function minimalAgentResult(result: AgentResult): AgentResult {
     step: result.step,
     exitCode: result.exitCode,
     stopReason: result.stopReason,
+    termination: result.termination,
     errorMessage: boundedDiagnostic(result.errorMessage, 512),
     stderr: "",
     messages: [],
@@ -521,6 +530,10 @@ function isControlState(value: unknown): value is ControlState {
     && isControlId(state.rootRunId)
     && Number.isSafeInteger(state.remaining) && (state.remaining as number) >= 0 && (state.remaining as number) <= MAX_DESCENDANTS
     && Number.isSafeInteger(state.active) && (state.active as number) >= 0
+    && Array.isArray(state.activeRunIds)
+    && state.activeRunIds.length === state.active
+    && state.activeRunIds.every(isControlId)
+    && new Set(state.activeRunIds).size === state.activeRunIds.length
     && Number.isSafeInteger(state.maxConcurrent) && (state.maxConcurrent as number) > 0 && (state.maxConcurrent as number) <= MAX_CONCURRENCY
     && (state.active as number) <= (state.maxConcurrent as number)
     && Number.isSafeInteger(state.deadlineMs) && (state.deadlineMs as number) > 0;
@@ -567,6 +580,19 @@ async function acquireControlLock(control: ControlContext, signal?: AbortSignal)
   }
 }
 
+async function writeControlState(controlPath: string, state: ControlState): Promise<void> {
+  // Readers intentionally do not take the writer lock: nested child startup can
+  // happen concurrently with a sibling reservation. Publish a complete state
+  // with rename so readers see either the old or the new JSON, never a truncate.
+  const temporaryPath = `${controlPath}.${randomUUID()}.tmp`;
+  try {
+    await fs.promises.writeFile(temporaryPath, JSON.stringify(state), { encoding: "utf8", mode: 0o600 });
+    await fs.promises.rename(temporaryPath, controlPath);
+  } finally {
+    await fs.promises.rm(temporaryPath, { force: true }).catch(() => {});
+  }
+}
+
 async function withControlState<T>(control: ControlContext, update: (state: ControlState) => Promise<T> | T, signal?: AbortSignal): Promise<T> {
   const lockPath = await acquireControlLock(control, signal);
   try {
@@ -581,7 +607,7 @@ async function withControlState<T>(control: ControlContext, update: (state: Cont
       throw new Error("Subagent control state is malformed or belongs to another root run.");
     }
     const result = await update(parsed);
-    await fs.promises.writeFile(control.statePath, JSON.stringify(parsed), { encoding: "utf8", mode: 0o600 });
+    await writeControlState(control.statePath, parsed);
     return result;
   } finally {
     await fs.promises.rm(lockPath, { recursive: true, force: true }).catch(() => {});
@@ -597,6 +623,7 @@ async function createControlState(rootRunId: string): Promise<ControlContext> {
     rootRunId,
     remaining: MAX_DESCENDANTS,
     active: 0,
+    activeRunIds: [],
     maxConcurrent: MAX_CONCURRENCY,
     deadlineMs,
   };
@@ -814,31 +841,63 @@ function childEnvironment(
   return env;
 }
 
-async function reserveChild(control: ControlContext, signal?: AbortSignal): Promise<{ reservation?: ChildReservation; reason?: string }> {
-  try {
-    const result = await withControlState(control, (state) => {
-      if (Date.now() >= state.deadlineMs) return { reason: "Root subagent deadline reached." };
-      if (state.remaining <= 0) return { reason: `Root descendant budget exhausted (maximum ${MAX_DESCENDANTS}).` };
-      // Do not queue here: a full tree may otherwise deadlock when every
-      // active parent is waiting for a nested child. Nested callers fail fast.
-      if (state.active >= state.maxConcurrent) return { reason: `Shared subagent concurrency limit reached (maximum ${state.maxConcurrent}).` };
-      state.remaining--;
-      state.active++;
-      return { reservation: { budgetRemaining: state.remaining } };
-    }, signal);
-    return result;
-  } catch (error) {
-    return { reason: error instanceof Error ? error.message : String(error) };
+interface ReservationResult {
+  reservation?: ChildReservation;
+  reason?: string;
+  termination?: AgentTermination;
+  /** Capacity is temporarily unavailable; retry after another owner releases a slot. */
+  wait?: boolean;
+}
+
+async function reserveChild(
+  control: ControlContext,
+  childRunId: string,
+  signal?: AbortSignal,
+  consumeBudget = true,
+): Promise<ReservationResult> {
+  while (true) {
+    try {
+      const result = await withControlState(control, (state): ReservationResult => {
+        if (consumeBudget && Date.now() >= state.deadlineMs) {
+          return { reason: "Root subagent deadline reached.", termination: "timed_out" };
+        }
+        if (consumeBudget && state.remaining <= 0) {
+          return { reason: `Root descendant budget exhausted (maximum ${MAX_DESCENDANTS}).` };
+        }
+        if (state.activeRunIds.includes(childRunId)) {
+          return { reason: `Subagent reservation already exists for ${childRunId}.` };
+        }
+        if (state.active >= state.maxConcurrent) return { wait: true };
+        if (consumeBudget) state.remaining--;
+        state.active++;
+        state.activeRunIds.push(childRunId);
+        return { reservation: { budgetRemaining: state.remaining } };
+      }, signal);
+      if (!result.wait) return result;
+      if (signal?.aborted) return { reason: "Subagent aborted.", termination: "cancelled" };
+      if (Date.now() >= control.deadlineMs) return { reason: "Root subagent deadline reached.", termination: "timed_out" };
+      await delay(Math.min(25, Math.max(1, control.deadlineMs - Date.now())), signal);
+    } catch (error) {
+      return {
+        reason: error instanceof Error ? error.message : String(error),
+        termination: signal?.aborted ? "cancelled" : Date.now() >= control.deadlineMs ? "timed_out" : "failed",
+      };
+    }
   }
 }
 
-async function releaseChild(control: ControlContext): Promise<void> {
+async function releaseChild(control: ControlContext, childRunId: string): Promise<boolean> {
   try {
-    await withControlState(control, (state) => {
-      state.active = Math.max(0, state.active - 1);
+    return await withControlState(control, (state) => {
+      const index = state.activeRunIds.indexOf(childRunId);
+      if (index < 0) return false;
+      state.activeRunIds.splice(index, 1);
+      state.active = state.activeRunIds.length;
+      return true;
     });
   } catch {
     // The root may already be shutting down and removing its ephemeral state.
+    return false;
   }
 }
 
@@ -910,6 +969,7 @@ export function parseJsonEventLine(line: string): ParsedJsonEvent | undefined {
 interface ProcessResult {
   exitCode: number;
   stopReason?: StopReason;
+  termination: AgentTermination;
   errorMessage?: string;
   stderr: string;
 }
@@ -1029,10 +1089,19 @@ function recordMessage(result: AgentResult, message: Message): void {
   addAssistantUsage(result.usage, message);
   if (message.role !== "assistant") return;
   const output = textFromMessage(message);
-  if (output) result.output = truncateOutput(output, MAX_OUTPUT_BYTES);
   if (typeof message.model === "string" && message.model) result.model = truncateOutput(message.model, 256);
   if (message.stopReason === "stop" || message.stopReason === "length" || message.stopReason === "toolUse" || message.stopReason === "error" || message.stopReason === "aborted") {
     result.stopReason = message.stopReason;
+  }
+  // Only terminal assistant messages are authoritative output. Text attached
+  // to a toolUse turn is progress, not a completed report.
+  if (message.stopReason === "stop" || message.stopReason === "length") {
+    result.termination = "completed";
+    if (output) result.output = truncateOutput(output, MAX_OUTPUT_BYTES);
+  } else if (message.stopReason === "aborted") {
+    result.termination = "cancelled";
+  } else if (message.stopReason === "error") {
+    result.termination = "failed";
   }
   if (typeof message.errorMessage === "string" && message.errorMessage) result.errorMessage = boundedDiagnostic(message.errorMessage);
 }
@@ -1048,9 +1117,9 @@ async function runPiProcess(
   signal: AbortSignal | undefined,
   onEvent: (event: ParsedJsonEvent) => void,
 ): Promise<ProcessResult> {
-  if (signal?.aborted) return { exitCode: 1, stopReason: "aborted", errorMessage: "Subagent aborted.", stderr: "" };
+  if (signal?.aborted) return { exitCode: 1, stopReason: "aborted", termination: "cancelled", errorMessage: "Subagent aborted.", stderr: "" };
   const timeoutMs = processTimeoutMs(control.deadlineMs);
-  if (control.deadlineMs <= Date.now()) return { exitCode: 1, stopReason: "error", errorMessage: "Root subagent deadline reached.", stderr: "" };
+  if (control.deadlineMs <= Date.now()) return { exitCode: 1, stopReason: "error", termination: "timed_out", errorMessage: "Root subagent deadline reached.", stderr: "" };
 
   const invocation = getPiInvocation(args);
   return new Promise((resolve) => {
@@ -1107,7 +1176,7 @@ async function runPiProcess(
       child.once("close", sweepRoot);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      finish({ exitCode: 1, stopReason: "error", errorMessage: message, stderr });
+      finish({ exitCode: 1, stopReason: "error", termination: "failed", errorMessage: message, stderr });
       return;
     }
 
@@ -1189,13 +1258,13 @@ async function runPiProcess(
       activeChildren.delete(child);
       const message = error instanceof Error ? error.message : String(error);
       if (eventError) {
-        finish({ exitCode: 1, stopReason: "error", errorMessage: `Subagent event handling failed: ${eventError}`, stderr });
+        finish({ exitCode: 1, stopReason: "error", termination: "failed", errorMessage: `Subagent event handling failed: ${eventError}`, stderr });
       } else if (timedOut) {
-        finish({ exitCode: 1, stopReason: "error", errorMessage: `Subagent timed out after ${timeoutMs} ms.`, stderr });
+        finish({ exitCode: 1, stopReason: "error", termination: "timed_out", errorMessage: `Subagent timed out after ${timeoutMs} ms.`, stderr });
       } else if (aborted) {
-        finish({ exitCode: 1, stopReason: "aborted", errorMessage: "Subagent aborted.", stderr });
+        finish({ exitCode: 1, stopReason: "aborted", termination: "cancelled", errorMessage: "Subagent aborted.", stderr });
       } else {
-        finish({ exitCode: 1, stopReason: "error", errorMessage: message, stderr });
+        finish({ exitCode: 1, stopReason: "error", termination: "failed", errorMessage: message, stderr });
       }
     });
     child.on("close", (code) => {
@@ -1207,15 +1276,15 @@ async function runPiProcess(
         if (event) deliverEvent(event);
       }
       if (eventError) {
-        finish({ exitCode: 1, stopReason: "error", errorMessage: `Subagent event handling failed: ${eventError}`, stderr });
+        finish({ exitCode: 1, stopReason: "error", termination: "failed", errorMessage: `Subagent event handling failed: ${eventError}`, stderr });
         return;
       }
       if (timedOut) {
-        finish({ exitCode: 1, stopReason: "error", errorMessage: `Subagent timed out after ${timeoutMs} ms.`, stderr });
+        finish({ exitCode: 1, stopReason: "error", termination: "timed_out", errorMessage: `Subagent timed out after ${timeoutMs} ms.`, stderr });
         return;
       }
       if (aborted || signal?.aborted) {
-        finish({ exitCode: code ?? 1, stopReason: "aborted", errorMessage: "Subagent aborted.", stderr });
+        finish({ exitCode: code ?? 1, stopReason: "aborted", termination: "cancelled", errorMessage: "Subagent aborted.", stderr });
         return;
       }
       const exitCode = code ?? 1;
@@ -1231,7 +1300,7 @@ async function runPiProcess(
           errorMessage = `Subagent exited with code ${exitCode}.`;
         }
       }
-      finish({ exitCode, stderr, stopReason: exitCode === 0 ? undefined : "error", errorMessage });
+      finish({ exitCode, stderr, stopReason: exitCode === 0 ? undefined : "error", termination: exitCode === 0 ? "completed" : "failed", errorMessage });
     });
 
     if (signal?.aborted) stopForAbort();
@@ -1263,6 +1332,7 @@ async function runAgent(
       step,
       exitCode: 1,
       stopReason: "error",
+      termination: "failed",
       errorMessage: truncateOutput(`Unknown agent: "${name}". Available agents: ${agents.map((item) => item.name).join(", ") || "none"}.`, MAX_DIAGNOSTIC_BYTES),
       stderr: "",
       messages: [],
@@ -1300,10 +1370,11 @@ async function runAgent(
   let reservation: ChildReservation | undefined;
   try {
     report(`Starting ${name}...`);
-    const reservationResult = await reserveChild(execution.control, signal);
+    const reservationResult = await reserveChild(execution.control, result.runId, signal);
     if (!reservationResult.reservation) {
       result.exitCode = 1;
-      result.stopReason = signal?.aborted ? "aborted" : "error";
+      result.termination = reservationResult.termination ?? (signal?.aborted ? "cancelled" : "failed");
+      result.stopReason = result.termination === "cancelled" ? "aborted" : "error";
       result.errorMessage = truncateOutput(reservationResult.reason ?? "Subagent child budget unavailable.", MAX_DIAGNOSTIC_BYTES);
       report(result.errorMessage, false);
       return result;
@@ -1345,34 +1416,48 @@ async function runAgent(
       }
     });
 
+    const messageTermination = result.termination;
     result.exitCode = processResult.exitCode;
+    result.termination = processResult.termination;
+    // A protocol-level error/abort must not be hidden by a zero exit code.
+    if (messageTermination === "failed" || messageTermination === "cancelled") result.termination = messageTermination;
     result.stopReason = processResult.stopReason ?? result.stopReason ?? (processResult.exitCode === 0 ? "stop" : "error");
     result.errorMessage = boundedDiagnostic(processResult.errorMessage ?? result.errorMessage);
     result.stderr = truncateOutput(processResult.stderr, MAX_STDERR_BYTES);
     if (eventFailure) {
       result.exitCode = 1;
       result.stopReason = "error";
+      result.termination = "failed";
       result.errorMessage = eventFailure;
     } else if (updateError) {
       result.exitCode = 1;
       result.stopReason = "error";
+      result.termination = "failed";
       result.errorMessage = truncateOutput(`Subagent update failed: ${updateError}`, MAX_DIAGNOSTIC_BYTES);
-    } else if (result.exitCode === 0 && !result.output && !getFinalOutput(result.messages)) {
+    } else if (processResult.termination === "completed" && result.termination !== "completed") {
       result.exitCode = 1;
       result.stopReason = "error";
-      result.errorMessage = "Subagent produced no assistant output.";
+      result.termination = "failed";
+      result.errorMessage ??= "Subagent produced no assistant output; a terminal response is required.";
+    } else if (processResult.termination === "completed" && !result.output) {
+      result.exitCode = 1;
+      result.stopReason = "error";
+      result.termination = "failed";
+      result.errorMessage ??= "Subagent produced no assistant output; a terminal response is required.";
     }
     if (result.stopReason === "error" && !result.errorMessage) result.errorMessage = "Subagent failed.";
-    report(result.output || getFinalOutput(result.messages) || result.errorMessage || "(no output)", false);
+    report(result.output || result.errorMessage || "(no output)", false);
     if (updateError && result.exitCode === 0) {
       result.exitCode = 1;
       result.stopReason = "error";
+      result.termination = "failed";
       result.errorMessage = truncateOutput(`Subagent update failed: ${updateError}`, MAX_DIAGNOSTIC_BYTES);
     }
     return result;
   } catch (error) {
     result.exitCode = 1;
-    result.stopReason = signal?.aborted ? "aborted" : "error";
+    result.termination = signal?.aborted ? "cancelled" : execution.deadlineMs <= Date.now() ? "timed_out" : "failed";
+    result.stopReason = result.termination === "cancelled" ? "aborted" : "error";
     result.errorMessage = boundedDiagnostic(error instanceof Error ? error.message : String(error), MAX_DIAGNOSTIC_BYTES) ?? "Subagent failed.";
     result.stderr = result.errorMessage;
     report(result.errorMessage, false);
@@ -1385,13 +1470,20 @@ async function runAgent(
         // Best-effort cleanup; the prompt contains no secrets beyond the agent definition.
       }
     }
-    if (reservation) await releaseChild(execution.control);
+    if (reservation) await releaseChild(execution.control, result.runId);
   }
 }
 
 function failed(result: AgentResult): boolean {
   // -1 is the live placeholder used by parallel progress updates.
-  return result.exitCode !== -1 && (result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted");
+  return result.exitCode !== -1 && (
+    result.exitCode !== 0
+    || result.stopReason === "error"
+    || result.stopReason === "aborted"
+    || result.termination === "failed"
+    || result.termination === "cancelled"
+    || result.termination === "timed_out"
+  );
 }
 
 function isRenderableUsage(value: unknown): value is UsageSummary {
@@ -1414,6 +1506,7 @@ function isRenderableAgentResult(value: unknown): value is AgentResult {
     && typeof result.rootRunId === "string"
     && isFiniteNumber(result.depth)
     && isFiniteNumber(result.exitCode)
+    && (result.termination === undefined || result.termination === "completed" || result.termination === "failed" || result.termination === "cancelled" || result.termination === "timed_out")
     && typeof result.stderr === "string"
     && Array.isArray(result.messages)
     && isRenderableUsage(result.usage);
@@ -1842,12 +1935,18 @@ export default function (pi: ExtensionAPI) {
       const execution: ExecutionContext = {
         runId,
         parentRunId,
+        reservationRunId: depth.depth > 0 ? process.env[RUN_ID_ENV] : undefined,
         rootRunId: control.rootRunId,
         depth: depth.depth,
         deadlineMs: control.deadlineMs,
         control,
       };
+      let yieldedReservation = false;
       try {
+        if (execution.reservationRunId) {
+          yieldedReservation = await releaseChild(control, execution.reservationRunId);
+          if (!yieldedReservation) throw new Error("Nested subagent reservation is missing; refusing to run without an owned capacity slot.");
+        }
         const parentModel = ctx.model;
         let updateFailure: string | undefined;
       const notify = (text: string, details: SubagentDetails) => {
@@ -1897,6 +1996,7 @@ export default function (pi: ExtensionAPI) {
               step: index + 1,
               exitCode: 1,
               stopReason: "error",
+              termination: "failed",
               errorMessage: truncateOutput(`Working directory does not exist: ${stepCwd}`, MAX_DIAGNOSTIC_BYTES),
               stderr: "",
               messages: [],
@@ -1970,11 +2070,16 @@ export default function (pi: ExtensionAPI) {
       ));
       const successCount = results.filter((result) => !failed(result)).length;
       const summary = results.map((result) => {
-        const status = failed(result) ? `failed${result.stopReason ? ` (${result.stopReason})` : ""}` : "completed";
+        const status = failed(result)
+          ? `failed${result.termination ? ` (${result.termination})` : result.stopReason ? ` (${result.stopReason})` : ""}`
+          : result.termination ?? "completed";
         return `### [${result.agent}] ${status}\n\n${truncateOutput(resultText(result), MAX_DIAGNOSTIC_BYTES)}`;
       }).join("\n\n---\n\n");
       return toolResult(`Parallel: ${successCount}/${results.length} succeeded\n\n${truncateOutput(summary, MAX_OUTPUT_BYTES)}`, baseDetails("parallel", results), successCount !== results.length);
       } finally {
+        if (yieldedReservation && execution.reservationRunId) {
+          await reserveChild(control, execution.reservationRunId, signal, false);
+        }
         if (control.ownerDirectory) await fs.promises.rm(control.ownerDirectory, { recursive: true, force: true }).catch(() => {});
       }
     },
@@ -2030,7 +2135,8 @@ export default function (pi: ExtensionAPI) {
         container.addChild(new Text(`${iconFor(details.results.some(failed) ? details.results.find(failed)! : details.results[0]!)} ${theme.fg("toolTitle", theme.bold(details.mode))}`, 0, 0));
         for (const item of details.results) {
           container.addChild(new Spacer(1));
-          container.addChild(new Text(`${iconFor(item)} ${theme.fg("accent", stripTerminalControls(item.agent))}${theme.fg("muted", ` (${stripTerminalControls(item.agentSource)})`)}${item.stopReason ? theme.fg("dim", ` [${item.stopReason}]`) : ""}`, 0, 0));
+          const status = item.termination ?? item.stopReason;
+          container.addChild(new Text(`${iconFor(item)} ${theme.fg("accent", stripTerminalControls(item.agent))}${theme.fg("muted", ` (${stripTerminalControls(item.agentSource)})`)}${status ? theme.fg("dim", ` [${status}]`) : ""}`, 0, 0));
           container.addChild(new Text(theme.fg("dim", takeRender(truncateChars(item.task, 500))), 0, 0));
           const output = renderOutput(item, true);
           if (output && output !== "(no output)") container.addChild(new Markdown(output.trim(), 0, 0, getMarkdownTheme()));

@@ -51,6 +51,53 @@ function writeEmptyPi(): string {
   fs.chmodSync(script, 0o755);
   return script;
 }
+function writeToolUseOnlyPi(): string {
+  const directory = tempDir();
+  const script = path.join(directory, "tool-use-only-pi");
+  fs.writeFileSync(script, `#!/usr/bin/env bun
+const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "I need a tool" }], model: "fake/model", usage, stopReason: "toolUse", timestamp: 1 } }));
+`);
+  fs.chmodSync(script, 0o755);
+  return script;
+}
+function writeHangingPi(): string {
+  const directory = tempDir();
+  const script = path.join(directory, "hanging-pi");
+  fs.writeFileSync(script, `#!/bin/sh
+trap 'exit 0' TERM INT
+while :; do sleep 1; done
+`);
+  fs.chmodSync(script, 0o755);
+  return script;
+}
+function writeRecursivePi(): string {
+  const directory = tempDir();
+  const script = path.join(directory, "recursive-pi");
+  fs.writeFileSync(script, `#!/usr/bin/env bun
+if (process.env.PI_SUBAGENT_DEPTH === "1") {
+  const extension = await import(${JSON.stringify(EXTENSION)});
+  const tools: any[] = [];
+  extension.default({ registerTool(definition: any) { tools.push(definition); } } as any);
+  const tool = tools.find((candidate) => candidate.name === "subagent");
+  try {
+    const nested = await tool.execute("nested", { agent: "worker", task: "nested" }, undefined, undefined, {
+      cwd: process.cwd(),
+      hasUI: false,
+      model: { provider: "parent", id: "parent-model" },
+    });
+    if (nested?.isError) process.exit(1);
+  } catch (error) {
+    console.error(error);
+    process.exit(1);
+  }
+}
+const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "recursive result" }], model: "fake/model", usage, stopReason: "stop", timestamp: 1 } }));
+`);
+  fs.chmodSync(script, 0o755);
+  return script;
+}
 function writeCumulativePi(): string {
   const directory = tempDir();
   const script = path.join(directory, "cumulative-pi");
@@ -167,7 +214,7 @@ async function call(tool: Tool, params: any, context: any, signal?: AbortSignal,
 afterEach(() => {
   delete process.env.PI_SUBAGENT_BIN;
   delete process.env.PI_SUBAGENT_DEPTH;
-  for (const key of ["PI_SUBAGENT_RUN_ID", "PI_SUBAGENT_PARENT_ID", "PI_SUBAGENT_ROOT_ID", "PI_SUBAGENT_CONTROL_FILE", "PI_SUBAGENT_DEADLINE_MS", "PI_SUBAGENT_BUDGET_REMAINING"]) delete process.env[key];
+  for (const key of ["PI_SUBAGENT_RUN_ID", "PI_SUBAGENT_PARENT_ID", "PI_SUBAGENT_ROOT_ID", "PI_SUBAGENT_CONTROL_FILE", "PI_SUBAGENT_DEADLINE_MS", "PI_SUBAGENT_BUDGET_REMAINING", "PI_SUBAGENT_TIMEOUT_MS"]) delete process.env[key];
   for (const directory of tempDirs.splice(0)) fs.rmSync(directory, { recursive: true, force: true });
 });
 
@@ -457,6 +504,49 @@ describe("subprocess behavior", () => {
     const result = await call(tool, { agent: "worker", task: "run" }, ctx(tempDir()));
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("no assistant output");
+    expect(result.details.results[0].termination).toBe("failed");
+  });
+
+  test("does not treat a tool-use turn as a completed report", async () => {
+    process.env.PI_SUBAGENT_BIN = writeToolUseOnlyPi();
+    const result = await call(tool, { agent: "worker", task: "run" }, ctx(tempDir()));
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("terminal response");
+    expect(result.details.results[0].termination).toBe("failed");
+  });
+
+  test("reports timeouts separately from ordinary failures", async () => {
+    process.env.PI_SUBAGENT_TIMEOUT_MS = "25";
+    process.env.PI_SUBAGENT_BIN = writeHangingPi();
+    const result = await call(tool, { agent: "worker", task: "run" }, ctx(tempDir()));
+    expect(result.isError).toBe(true);
+    expect(result.details.results[0].termination).toBe("timed_out");
+    expect(result.content[0].text).toContain("timed out");
+  });
+
+  test("reports cancellation separately from timeout", async () => {
+    process.env.PI_SUBAGENT_BIN = writeHangingPi();
+    const controller = new AbortController();
+    const pending = call(tool, { agent: "worker", task: "run" }, ctx(tempDir()), controller.signal);
+    setTimeout(() => controller.abort(), 25);
+    const result = await pending;
+    expect(result.isError).toBe(true);
+    expect(result.details.results[0].termination).toBe("cancelled");
+  });
+
+  test("queues nested delegation without starving a full sibling fan-out", async () => {
+    const root = tempDir();
+    const cwds = ["one", "two", "three", "four"].map((name) => {
+      const cwd = path.join(root, name);
+      fs.mkdirSync(cwd);
+      return cwd;
+    });
+    process.env.PI_SUBAGENT_BIN = writeRecursivePi();
+    const result = await call(tool, {
+      tasks: cwds.map((cwd) => ({ agent: "worker", task: "run", cwd })),
+    }, ctx(root));
+    expect(result.isError).toBeUndefined();
+    expect(result.details.results.map((item: any) => item.termination)).toEqual(["completed", "completed", "completed", "completed"]);
   });
 
   test("returns a structured failure when an update handler throws", async () => {
