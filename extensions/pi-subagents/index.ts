@@ -426,9 +426,23 @@ function boundMessage(message: Message, maxBytes = MAX_MESSAGE_BYTES): Message {
 
 function boundMessages(messages: Message[], maxBytes = MAX_OUTPUT_BYTES): Message[] {
   const bounded = messages.slice(-MAX_MESSAGES_PER_AGENT).map((message) => boundMessage(message));
-  while (bounded.length > 0 && jsonBytes(bounded) > maxBytes) bounded.shift();
-  if (bounded.length === 1 && jsonBytes(bounded) > maxBytes) return [boundMessage(bounded[0]!, Math.max(512, maxBytes - 32))];
-  return bounded;
+  if (bounded.length === 0 || maxBytes <= 0) return [];
+
+  // JSON.stringify(array) is exactly the sum of its item encodings plus the
+  // brackets and commas. Compute the suffix size once instead of repeatedly
+  // serializing the whole shrinking array in a shift() loop.
+  const itemBytes = bounded.map(jsonBytes);
+  let totalBytes = 2 + itemBytes.reduce((sum, bytes) => sum + bytes, 0) + Math.max(0, bounded.length - 1);
+  let first = 0;
+  while (first < bounded.length && totalBytes > maxBytes && bounded.length - first > 1) {
+    totalBytes -= itemBytes[first]! + 1;
+    first++;
+  }
+  const result = bounded.slice(first);
+  if (result.length === 1 && totalBytes > maxBytes) {
+    return [boundMessage(result[0]!, Math.max(512, maxBytes - 32))];
+  }
+  return result;
 }
 
 function minimalAgentResult(result: AgentResult): AgentResult {
@@ -455,16 +469,19 @@ function minimalAgentResult(result: AgentResult): AgentResult {
 function boundAgentResult(result: AgentResult, maxBytes: number): AgentResult {
   let bounded = minimalAgentResult(result);
   if (jsonBytes(bounded) >= maxBytes) return bounded;
-  const candidates: Array<[keyof AgentResult, unknown]> = [
-    ["structuredOutput", boundStructuredOutput(result.structuredOutput, Math.min(MAX_DIAGNOSTIC_BYTES, maxBytes))],
-    ["output", result.output ? truncateOutput(result.output, Math.min(MAX_OUTPUT_BYTES, maxBytes)) : undefined],
-    ["task", truncateOutput(result.task, Math.min(MAX_DIAGNOSTIC_BYTES, maxBytes))],
-    ["stderr", truncateOutput(result.stderr, Math.min(MAX_DIAGNOSTIC_BYTES, maxBytes))],
-    ["messages", boundMessages(result.messages, Math.min(MAX_MESSAGE_BYTES * 2, maxBytes))],
-  ];
-  for (const [key, value] of candidates) {
+  const addCandidate = (key: keyof AgentResult, value: unknown): void => {
     const next = { ...bounded, [key]: value } as AgentResult;
     if (jsonBytes(next) <= maxBytes) bounded = next;
+  };
+  addCandidate("structuredOutput", boundStructuredOutput(result.structuredOutput, Math.min(MAX_DIAGNOSTIC_BYTES, maxBytes)));
+  addCandidate("output", result.output ? truncateOutput(result.output, Math.min(MAX_OUTPUT_BYTES, maxBytes)) : undefined);
+  addCandidate("task", truncateOutput(result.task, Math.min(MAX_DIAGNOSTIC_BYTES, maxBytes)));
+  addCandidate("stderr", truncateOutput(result.stderr, Math.min(MAX_DIAGNOSTIC_BYTES, maxBytes)));
+  // Message histories are the largest and most expensive candidate. Do not
+  // build or serialize one when the higher-value fields already fill the
+  // result budget, which is common for a completed report.
+  if (jsonBytes(bounded) < maxBytes) {
+    addCandidate("messages", boundMessages(result.messages, Math.min(MAX_MESSAGE_BYTES * 2, maxBytes)));
   }
   return bounded;
 }
@@ -484,6 +501,14 @@ function boundDetails(details: SubagentDetails, maxBytes = MAX_OUTPUT_BYTES): Su
     bounded.results[index] = minimalResults[index]!;
   }
   return bounded;
+}
+
+/** Drop transcript history from partial tool updates; keep it only in the final result. */
+function progressDetails(details: SubagentDetails): SubagentDetails {
+  return {
+    ...details,
+    results: details.results.map((result) => ({ ...result, messages: [], stderr: "" })),
+  };
 }
 
 function modelName(model: Model<any> | undefined): string | undefined {
@@ -1020,7 +1045,7 @@ export interface ParsedJsonEvent {
   kind: "message" | "messages" | "progress" | "error";
   message?: Message;
   messages?: Message[];
-  /** Cumulative message carried by Pi's message_update event for stream accounting. */
+  /** Kept for callers that inspect parser results; cumulative updates are ignored. */
   streamMessage?: Message;
   text?: string;
   errorMessage?: string;
@@ -1029,6 +1054,10 @@ export interface ParsedJsonEvent {
 /** Parse one JSON-mode line; malformed/non-event lines are safely ignored. */
 export function parseJsonEventLine(line: string): ParsedJsonEvent | undefined {
   if (!line.trim()) return undefined;
+  // Pi 0.83 JSON mode writes a full cumulative assistant snapshot on every
+  // token. Avoid parsing those potentially large lines at all; message_end and
+  // agent_end remain the authoritative events for this subprocess consumer.
+  if (/^\s*\{"type":"message_update"/.test(line)) return undefined;
   let event: unknown;
   try {
     event = JSON.parse(line);
@@ -1048,9 +1077,11 @@ export function parseJsonEventLine(line: string): ParsedJsonEvent | undefined {
     const messages = candidate.messages.filter(isFinalMessage);
     return messages.length > 0 ? { kind: "messages", messages } : undefined;
   }
-  if (candidate.type === "message_update" && isMessage(candidate.message)) {
-    return { kind: "progress", text: textFromMessage(candidate.message), streamMessage: candidate.message };
-  }
+  // Pi's JSON mode 0.83 emits the complete cumulative assistant snapshot on
+  // every token. Treating those events as tool progress makes the parent
+  // serialize and render the same growing transcript once per token. Final
+  // message_end/agent_end events still carry the authoritative result.
+  if (candidate.type === "message_update") return undefined;
   if (candidate.type === "tool_execution_start" || candidate.type === "tool_execution_update") {
     const toolName = typeof candidate.toolName === "string" ? candidate.toolName : "tool";
     return { kind: "progress", text: `Running ${truncateOutput(toolName, 256)}...` };
@@ -1907,7 +1938,7 @@ export default function (pi: ExtensionAPI) {
       // child. This avoids approving one project and executing in another.
       const discovery = discoverAgents(rootCwd ?? effectiveCwd, agentScope);
       const projectRoot = findNearestProjectRoot(rootCwd ?? effectiveCwd) ?? (rootCwd ?? effectiveCwd);
-      const baseDetails = (mode: SubagentDetails["mode"], results: AgentResult[], action?: SubagentDetails["action"]): SubagentDetails => boundDetails({
+      const baseDetails = (mode: SubagentDetails["mode"], results: AgentResult[], action?: SubagentDetails["action"]): SubagentDetails => ({
         action,
         mode,
         agentScope,
@@ -2097,7 +2128,7 @@ export default function (pi: ExtensionAPI) {
         let updateFailure: string | undefined;
       const notify = (text: string, details: SubagentDetails) => {
         try {
-          onUpdate?.({ content: [{ type: "text", text: truncateOutput(text, MAX_OUTPUT_BYTES) }], details: boundDetails(details) });
+          onUpdate?.({ content: [{ type: "text", text: truncateOutput(text, MAX_OUTPUT_BYTES) }], details: boundDetails(progressDetails(details)) });
         } catch (error) {
           updateFailure = error instanceof Error ? error.message : String(error);
           throw error;

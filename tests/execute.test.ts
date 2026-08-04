@@ -461,8 +461,12 @@ describe("subprocess behavior", () => {
     const root = tempDir();
     writeAgent(root);
     process.env.PI_SUBAGENT_BIN = writeCumulativePi();
-    const result = await call(tool, { agent: "test-agent", task: "run", agentScope: "project" }, ctx(root, { hasUI: true }));
+    const updates: string[] = [];
+    const result = await call(tool, { agent: "test-agent", task: "run", agentScope: "project" }, ctx(root, { hasUI: true }), undefined, (update) => {
+      updates.push(update.content[0].text);
+    });
     expect(result.isError).toBeUndefined();
+    expect(updates.length).toBeLessThan(10);
     expect(result.content[0].text.length).toBeGreaterThan(16 * 1024);
     expect(Buffer.byteLength(result.content[0].text, "utf8")).toBeLessThanOrEqual(50 * 1024);
     expect(result.details.results[0].output.length).toBe(30_000);

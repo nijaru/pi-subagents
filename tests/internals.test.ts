@@ -35,6 +35,11 @@ describe("JSON subprocess parsing", () => {
     expect(progress).toEqual({ kind: "progress", text: "Running read..." });
     const finished = parseJsonEventLine(JSON.stringify({ type: "tool_execution_end", toolName: "read" }));
     expect(finished).toEqual({ kind: "progress", text: "Finished read." });
+    expect(parseJsonEventLine(JSON.stringify({
+      type: "message_update",
+      message: { role: "assistant", content: [{ type: "text", text: "partial" }] },
+    }))).toBeUndefined();
+    expect(parseJsonEventLine(`{"type":"message_update","message":{"role":"assistant","content":[{"type":"text","text":"${"x".repeat(100_000)}"}]}}`)).toBeUndefined();
   });
 
   test("preserves typed agent_end messages as a fallback", () => {
