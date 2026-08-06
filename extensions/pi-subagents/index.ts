@@ -473,7 +473,10 @@ function boundAgentResult(result: AgentResult, maxBytes: number): AgentResult {
     const next = { ...bounded, [key]: value } as AgentResult;
     if (jsonBytes(next) <= maxBytes) bounded = next;
   };
-  addCandidate("structuredOutput", boundStructuredOutput(result.structuredOutput, Math.min(MAX_DIAGNOSTIC_BYTES, maxBytes)));
+  // Structured output is the machine-readable contract for opted-in agents;
+  // do not impose the diagnostic 8 KiB cap when the shared result budget can
+  // retain a larger valid value.
+  addCandidate("structuredOutput", boundStructuredOutput(result.structuredOutput, maxBytes));
   addCandidate("output", result.output ? truncateOutput(result.output, Math.min(MAX_OUTPUT_BYTES, maxBytes)) : undefined);
   addCandidate("task", truncateOutput(result.task, Math.min(MAX_DIAGNOSTIC_BYTES, maxBytes)));
   addCandidate("stderr", truncateOutput(result.stderr, Math.min(MAX_DIAGNOSTIC_BYTES, maxBytes)));
@@ -626,6 +629,55 @@ async function delay(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+interface ControlLockOwner {
+  pid: number;
+  startedAt: number;
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    // EPERM means the process exists but is not signalable by this process.
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+  if (process.platform === "win32") return true;
+  // A reparented child can remain a zombie until its new parent reaps it;
+  // kill(pid, 0) still succeeds for that interval, but it cannot own a lock.
+  const status = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8", timeout: 1000 });
+  return !(status.status === 0 && typeof status.stdout === "string" && /^\s*Z/.test(status.stdout));
+}
+
+async function removeStaleControlLock(lockPath: string): Promise<void> {
+  try {
+    const stat = await fs.promises.lstat(lockPath);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || Date.now() - stat.mtimeMs <= 5_000) return;
+    let ownerAlive = false;
+    try {
+      const raw = await fs.promises.readFile(path.join(lockPath, "owner"), "utf8");
+      const owner = JSON.parse(raw) as Partial<ControlLockOwner>;
+      ownerAlive = Number.isSafeInteger(owner.pid) && (owner.pid as number) > 0 && processIsAlive(owner.pid as number);
+    } catch {
+      // Locks from an interrupted acquisition may have no owner marker. They
+      // are recoverable once stale, while a fresh marker-less lock is retained
+      // by the age check above.
+    }
+    if (ownerAlive) return;
+
+    // Rename before removing. A releaser or another waiter can race with this
+    // check, but neither can be confused with the quarantined lock path.
+    const quarantinePath = `${lockPath}.stale-${randomUUID()}`;
+    try {
+      await fs.promises.rename(lockPath, quarantinePath);
+    } catch {
+      return;
+    }
+    await fs.promises.rm(quarantinePath, { recursive: true, force: true });
+  } catch {
+    // The owner may have released the lock between stat and cleanup.
+  }
+}
+
 async function acquireControlLock(control: ControlContext, signal?: AbortSignal): Promise<string> {
   const lockPath = `${control.statePath}.lock`;
   const started = Date.now();
@@ -633,16 +685,21 @@ async function acquireControlLock(control: ControlContext, signal?: AbortSignal)
     if (signal?.aborted) throw new Error("Subagent aborted.");
     try {
       await fs.promises.mkdir(lockPath, { mode: 0o700 });
+      try {
+        await fs.promises.writeFile(
+          path.join(lockPath, "owner"),
+          JSON.stringify({ pid: process.pid, startedAt: Date.now() } satisfies ControlLockOwner),
+          { encoding: "utf8", mode: 0o600 },
+        );
+      } catch (error) {
+        await fs.promises.rm(lockPath, { recursive: true, force: true }).catch(() => {});
+        throw error;
+      }
       return lockPath;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "EEXIST") throw error;
-      try {
-        const stat = await fs.promises.stat(lockPath);
-        if (Date.now() - stat.mtimeMs > 5_000) await fs.promises.rm(lockPath, { recursive: true, force: true });
-      } catch {
-        // The owner may have released the lock between stat and cleanup.
-      }
+      await removeStaleControlLock(lockPath);
       if (Date.now() - started > 10_000) throw new Error("Timed out acquiring subagent control state lock.");
       await delay(25, signal);
     }

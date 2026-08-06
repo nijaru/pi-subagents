@@ -203,6 +203,25 @@ process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "ass
   fs.chmodSync(script, 0o755);
   return script;
 }
+function writeStaleLockHolderPi(): { script: string; marker: string } {
+  const directory = tempDir();
+  const script = path.join(directory, "stale-lock-holder-pi");
+  const marker = path.join(directory, "lock-check");
+  fs.writeFileSync(script, `#!/usr/bin/env bun
+import * as fs from "node:fs";
+const lockPath = process.env.PI_SUBAGENT_CONTROL_FILE + ".lock";
+const marker = ${JSON.stringify(marker)};
+await fs.promises.mkdir(lockPath);
+const holder = Bun.spawn(["sh", "-c", 'sleep 1; if [ -d "$1" ]; then printf safe > "$2"; else printf raced > "$2"; fi', "holder", lockPath, marker], { detached: true, stdio: ["ignore", "ignore", "ignore"] });
+await fs.promises.writeFile(lockPath + "/owner", JSON.stringify({ pid: holder.pid, startedAt: Date.now() }));
+const old = new Date(Date.now() - 10_000);
+await fs.promises.utimes(lockPath, old, old);
+const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "lock holder result" }], model: "fake/model", usage, stopReason: "stop", timestamp: 1 }}));
+`);
+  fs.chmodSync(script, 0o755);
+  return { script, marker };
+}
 function writeLingeringPi(): { script: string; marker: string } {
   const directory = tempDir();
   const script = path.join(directory, "lingering-pi");
@@ -392,6 +411,17 @@ describe("subprocess behavior", () => {
     expect(result.details.results[0].structuredOutput).toEqual({ summary: "done", count: 2 });
   });
 
+  test("retains valid structured output larger than the diagnostic bound", async () => {
+    const root = tempDir();
+    writeStructuredAgent(root);
+    const summary = "x".repeat(12 * 1024);
+    process.env.PI_SUBAGENT_BIN = writeStructuredPi(JSON.stringify({ summary, count: 2 }));
+    const result = await call(tool, { agent: "structured", task: "run", agentScope: "project" }, ctx(root, { hasUI: true }));
+    expect(result.isError).toBeUndefined();
+    expect(result.details.results[0].structuredOutput).toEqual({ summary, count: 2 });
+    expect(Buffer.byteLength(JSON.stringify(result.details), "utf8")).toBeLessThanOrEqual(50 * 1024);
+  });
+
   test("rejects malformed or schema-mismatched structured output", async () => {
     const root = tempDir();
     writeStructuredAgent(root);
@@ -511,6 +541,18 @@ describe("subprocess behavior", () => {
     expect(result.isError).toBeUndefined();
     await waitForFile(lingering.marker);
     expect(fs.existsSync(lingering.marker)).toBe(true);
+  });
+
+  test("does not remove a stale lock while its recorded owner is alive", async () => {
+    if (process.platform === "win32") return;
+    const root = tempDir();
+    writeAgent(root);
+    const staleLock = writeStaleLockHolderPi();
+    process.env.PI_SUBAGENT_BIN = staleLock.script;
+    const result = await call(tool, { agent: "test-agent", task: "run", agentScope: "project" }, ctx(root, { hasUI: true }));
+    expect(result.isError).toBeUndefined();
+    await waitForFile(staleLock.marker, 2_000);
+    expect(fs.readFileSync(staleLock.marker, "utf8")).toBe("safe");
   });
 
   test("adds subagent only for an explicitly delegation-capable agent", async () => {
