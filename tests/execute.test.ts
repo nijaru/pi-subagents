@@ -44,6 +44,16 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
   fs.chmodSync(script, 0o755);
   return script;
 }
+function writeLargeMetadataPi(): string {
+  const directory = tempDir();
+  const script = path.join(directory, "large-metadata-pi");
+  fs.writeFileSync(script, `#!/usr/bin/env bun
+const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "metadata result" }], model: "fake/model", usage, stopReason: "stop", timestamp: 1, providerMetadata: "x".repeat(20 * 1024) } }));
+`);
+  fs.chmodSync(script, 0o755);
+  return script;
+}
 function writeStructuredAgent(root: string): void {
   const directory = path.join(root, ".pi", "agents");
   fs.mkdirSync(directory, { recursive: true });
@@ -411,6 +421,14 @@ describe("subprocess behavior", () => {
     expect(result.details.results[0].structuredOutput).toEqual({ summary: "done", count: 2 });
   });
 
+  test("does not retain oversized provider metadata in message history", async () => {
+    process.env.PI_SUBAGENT_BIN = writeLargeMetadataPi();
+    const result = await call(tool, { agent: "worker", task: "run" }, ctx(tempDir()));
+    expect(result.isError).toBeUndefined();
+    expect(result.details.results[0].output).toBe("metadata result");
+    expect(result.details.results[0].messages).toHaveLength(0);
+  });
+
   test("retains valid structured output larger than the diagnostic bound", async () => {
     const root = tempDir();
     writeStructuredAgent(root);
@@ -680,6 +698,16 @@ describe("subprocess behavior", () => {
     const result = await call(tool, { agent: "coordinator", task: "run", agentScope: "project" }, ctx(root, { hasUI: true }));
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("restricted to");
+  });
+
+  test("transports large nested policies through a private file", async () => {
+    const root = tempDir();
+    const names = ["worker", ...Array.from({ length: 100 }, (_, index) => `unused-${index}-${"x".repeat(200)}`)];
+    writePolicyAgent(root, `allowedAgents: [${names.join(", ")}]`);
+    process.env.PI_SUBAGENT_BIN = writeRecursivePi();
+    const result = await call(tool, { agent: "coordinator", task: "run", agentScope: "project" }, ctx(root, { hasUI: true }));
+    expect(result.isError).toBeUndefined();
+    expect(result.details.results[0].termination).toBe("completed");
   });
 
   test("enforces inherited maxDelegationDepth for nested delegation", async () => {

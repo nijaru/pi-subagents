@@ -31,7 +31,7 @@ export { discoverAgents, findNearestProjectAgentsDir, findNearestProjectRoot, ge
 
 export const MAX_DEPTH = 3;
 const MAX_PARALLEL_TASKS = 8;
-/** Maximum live pi subprocesses across an entire recursive delegation tree. */
+/** Maximum active child reservations across an entire recursive delegation tree. */
 export const MAX_CONCURRENCY = 4;
 /** Total child processes a root delegation may ever create. */
 export const MAX_DESCENDANTS = 32;
@@ -48,7 +48,9 @@ const MAX_TASK_BYTES = 100 * 1024;
 const MAX_CHAIN_STEPS = 32;
 const MAX_CHAIN_CONTEXT_BYTES = 50 * 1024;
 const MAX_STRUCTURED_OUTPUT_BYTES = MAX_OUTPUT_BYTES;
-const MAX_DELEGATION_POLICY_BYTES = 16 * 1024;
+const MAX_DELEGATION_POLICY_BYTES = 128 * 1024;
+const CONTROL_LOCK_STALE_MS = 5_000;
+const CONTROL_LOCK_WAIT_MS = 10_000;
 const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
 const RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
 const PARENT_ID_ENV = "PI_SUBAGENT_PARENT_ID";
@@ -57,6 +59,7 @@ const CONTROL_ENV = "PI_SUBAGENT_CONTROL_FILE";
 const DEADLINE_ENV = "PI_SUBAGENT_DEADLINE_MS";
 const BUDGET_ENV = "PI_SUBAGENT_BUDGET_REMAINING";
 const DELEGATION_POLICY_ENV = "PI_SUBAGENT_DELEGATION_POLICY";
+const DELEGATION_POLICY_FILE_ENV = "PI_SUBAGENT_DELEGATION_POLICY_FILE";
 const TIMEOUT_ENV = "PI_SUBAGENT_TIMEOUT_MS";
 const PASSTHROUGH_ENV = "PI_SUBAGENT_PASSTHROUGH_ENV";
 const SUBAGENT_BIN_ENV = "PI_SUBAGENT_BIN";
@@ -90,7 +93,7 @@ interface ControlState {
   rootRunId: string;
   remaining: number;
   active: number;
-  /** Reservation owners make slot release idempotent and prevent stale releases. */
+  /** Active child reservations; nested callers yield a slot while waiting. */
   activeRunIds: string[];
   maxConcurrent: number;
   deadlineMs: number;
@@ -651,7 +654,7 @@ function processIsAlive(pid: number): boolean {
 async function removeStaleControlLock(lockPath: string): Promise<void> {
   try {
     const stat = await fs.promises.lstat(lockPath);
-    if (!stat.isDirectory() || stat.isSymbolicLink() || Date.now() - stat.mtimeMs <= 5_000) return;
+    if (!stat.isDirectory() || stat.isSymbolicLink() || Date.now() - stat.mtimeMs <= CONTROL_LOCK_STALE_MS) return;
     let ownerAlive = false;
     try {
       const raw = await fs.promises.readFile(path.join(lockPath, "owner"), "utf8");
@@ -681,8 +684,10 @@ async function removeStaleControlLock(lockPath: string): Promise<void> {
 async function acquireControlLock(control: ControlContext, signal?: AbortSignal): Promise<string> {
   const lockPath = `${control.statePath}.lock`;
   const started = Date.now();
+  const waitDeadline = Math.min(started + CONTROL_LOCK_WAIT_MS, control.deadlineMs);
   while (true) {
     if (signal?.aborted) throw new Error("Subagent aborted.");
+    if (Date.now() >= waitDeadline) throw new Error("Timed out acquiring subagent control state lock.");
     try {
       await fs.promises.mkdir(lockPath, { mode: 0o700 });
       try {
@@ -700,8 +705,9 @@ async function acquireControlLock(control: ControlContext, signal?: AbortSignal)
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "EEXIST") throw error;
       await removeStaleControlLock(lockPath);
-      if (Date.now() - started > 10_000) throw new Error("Timed out acquiring subagent control state lock.");
-      await delay(25, signal);
+      const remaining = waitDeadline - Date.now();
+      if (remaining <= 0) throw new Error("Timed out acquiring subagent control state lock.");
+      await delay(Math.min(25, remaining), signal);
     }
   }
 }
@@ -904,7 +910,20 @@ function modelCredentialEnvKeys(): Set<string> {
 }
 
 function readDelegationPolicy(): { policy?: DelegationPolicy; error?: string } {
-  const raw = process.env[DELEGATION_POLICY_ENV];
+  const policyFile = process.env[DELEGATION_POLICY_FILE_ENV];
+  let raw = process.env[DELEGATION_POLICY_ENV];
+  if (policyFile !== undefined) {
+    if (!path.isAbsolute(policyFile)) return { error: "Nested delegation policy file path is malformed." };
+    try {
+      const stat = fs.lstatSync(policyFile);
+      if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) {
+        return { error: "Nested delegation policy file must be a private regular file." };
+      }
+      raw = fs.readFileSync(policyFile, "utf8");
+    } catch {
+      return { error: "Nested delegation policy file could not be read." };
+    }
+  }
   if (raw === undefined) return {};
   if (Buffer.byteLength(raw, "utf8") > MAX_DELEGATION_POLICY_BYTES) return { error: "Nested delegation policy is too large." };
   let parsed: unknown;
@@ -916,7 +935,9 @@ function readDelegationPolicy(): { policy?: DelegationPolicy; error?: string } {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { error: "Nested delegation policy is malformed." };
   const value = parsed as Record<string, unknown>;
   const allowedAgents = value.allowedAgents;
-  if (allowedAgents !== undefined && (!Array.isArray(allowedAgents) || allowedAgents.some((name) => typeof name !== "string" || !name.trim() || Buffer.byteLength(name, "utf8") > 256))) {
+  if (allowedAgents !== undefined && (!Array.isArray(allowedAgents)
+    || allowedAgents.length > 256
+    || allowedAgents.some((name) => typeof name !== "string" || !name.trim() || Buffer.byteLength(name, "utf8") > 256))) {
     return { error: "Nested delegation allowedAgents is malformed." };
   }
   const remainingDepth = value.remainingDepth;
@@ -954,7 +975,7 @@ function childEnvironment(
   childRunId: string,
   budgetRemaining: number,
   cwd: string,
-  delegationPolicy?: DelegationPolicy,
+  delegationPolicyPath?: string,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const key of SAFE_ENV_KEYS) {
@@ -1005,7 +1026,7 @@ function childEnvironment(
   env[CONTROL_ENV] = control.statePath;
   env[DEADLINE_ENV] = String(control.deadlineMs);
   env[BUDGET_ENV] = String(budgetRemaining);
-  if (delegationPolicy) env[DELEGATION_POLICY_ENV] = JSON.stringify(delegationPolicy);
+  if (delegationPolicyPath) env[DELEGATION_POLICY_FILE_ENV] = delegationPolicyPath;
   if (process.env[TIMEOUT_ENV] !== undefined) env[TIMEOUT_ENV] = process.env[TIMEOUT_ENV];
   if (process.env[PASSTHROUGH_ENV] !== undefined) env[PASSTHROUGH_ENV] = process.env[PASSTHROUGH_ENV];
   if (process.env[SUBAGENT_BIN_ENV] !== undefined) env[SUBAGENT_BIN_ENV] = process.env[SUBAGENT_BIN_ENV];
@@ -1262,8 +1283,14 @@ function addAssistantUsage(usage: UsageSummary, message: Message): void {
 }
 
 function recordMessage(result: AgentResult, message: Message): void {
-  result.messages.push(boundMessage(message));
-  if (result.messages.length > MAX_MESSAGES_PER_AGENT) result.messages.shift();
+  const bounded = boundMessage(message);
+  // A provider may attach arbitrary metadata outside the typed message fields.
+  // Never retain a record that still exceeds the per-message budget; final
+  // assistant text and usage are tracked separately below.
+  if (jsonBytes(bounded) <= MAX_MESSAGE_BYTES) {
+    result.messages.push(bounded);
+    if (result.messages.length > MAX_MESSAGES_PER_AGENT) result.messages.shift();
+  }
   addAssistantUsage(result.usage, message);
   if (message.role !== "assistant") return;
   const output = textFromMessage(message);
@@ -1294,7 +1321,7 @@ async function runPiProcess(
   reservation: ChildReservation,
   signal: AbortSignal | undefined,
   onEvent: (event: ParsedJsonEvent) => void,
-  delegationPolicy?: DelegationPolicy,
+  delegationPolicyPath?: string,
 ): Promise<ProcessResult> {
   if (signal?.aborted) return { exitCode: 1, stopReason: "aborted", termination: "cancelled", errorMessage: "Subagent aborted.", stderr: "" };
   const timeoutMs = processTimeoutMs(control.deadlineMs);
@@ -1333,7 +1360,7 @@ async function runPiProcess(
     try {
       child = spawn(invocation.command, invocation.args, {
         cwd,
-        env: childEnvironment(depth + 1, control, parentRunId, childRunId, reservation.budgetRemaining, cwd, delegationPolicy),
+        env: childEnvironment(depth + 1, control, parentRunId, childRunId, reservation.budgetRemaining, cwd, delegationPolicyPath),
         shell: false,
         // Keep nested children in the root child's process group. The root
         // child is detached from the host; descendants then die with that
@@ -1548,6 +1575,7 @@ async function runAgent(
   };
 
   let tempDir: string | undefined;
+  let delegationPolicyPath: string | undefined;
   let reservation: ChildReservation | undefined;
   try {
     report(`Starting ${name}...`);
@@ -1579,6 +1607,10 @@ async function runAgent(
     const taskPath = path.join(tempDir, "task.md");
     await fs.promises.writeFile(taskPath, `Task:\n${task}`, { encoding: "utf8", mode: 0o600 });
     args.push(`@${taskPath}`);
+    if (childPolicy) {
+      delegationPolicyPath = path.join(tempDir, "delegation-policy.json");
+      await fs.promises.writeFile(delegationPolicyPath, JSON.stringify(childPolicy), { encoding: "utf8", mode: 0o600 });
+    }
 
     const processResult = await runPiProcess(args, cwd, execution.depth, execution.control, execution.runId, result.runId, reservation, signal, (event) => {
       if (event.kind === "message" && event.message) {
@@ -1607,7 +1639,7 @@ async function runAgent(
         result.errorMessage = eventFailure;
         report(eventFailure);
       }
-    }, childPolicy);
+    }, delegationPolicyPath);
 
     const messageTermination = result.termination;
     result.exitCode = processResult.exitCode;

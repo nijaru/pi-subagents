@@ -132,7 +132,9 @@ function parseAllowedAgents(value: unknown): string[] | undefined {
     : Array.isArray(value) && value.every((name) => typeof name === "string") ? value : undefined;
   if (!names) return undefined;
   const trimmed = names.map((name) => name.trim()).filter(Boolean);
-  if (trimmed.length !== new Set(trimmed).size || trimmed.some((name) => Buffer.byteLength(name, "utf8") > MAX_AGENT_NAME_BYTES)) return undefined;
+  if (trimmed.length > MAX_AGENT_FILES
+    || trimmed.length !== new Set(trimmed).size
+    || trimmed.some((name) => Buffer.byteLength(name, "utf8") > MAX_AGENT_NAME_BYTES)) return undefined;
   return trimmed;
 }
 
@@ -272,11 +274,37 @@ function isReadCapabilityConsistent(capability: AgentCapability | undefined, too
 }
 
 export function loadAgentsFromDir(directory: string, source: AgentSource): AgentConfig[] {
-  let entries: fs.Dirent[];
+  const entries: fs.Dirent[] = [];
+  let handle: fs.Dir | undefined;
   try {
-    entries = fs.readdirSync(directory, { withFileTypes: true });
+    handle = fs.opendirSync(directory);
+    while (true) {
+      const entry = handle.readSync();
+      if (entry === null) break;
+      if (!entry.name.endsWith(".md") || (!entry.isFile() && !entry.isSymbolicLink())) continue;
+      if (source === "project" && entry.isSymbolicLink()) continue;
+      // Keep the lexicographically smallest bounded candidate set without
+      // materializing an unbounded directory listing.
+      let low = 0;
+      let high = entries.length;
+      while (low < high) {
+        const middle = Math.floor((low + high) / 2);
+        if (entries[middle]!.name.localeCompare(entry.name) < 0) low = middle + 1;
+        else high = middle;
+      }
+      if (low < MAX_AGENT_FILES) {
+        entries.splice(low, 0, entry);
+        if (entries.length > MAX_AGENT_FILES) entries.pop();
+      }
+    }
   } catch {
     return [];
+  } finally {
+    try {
+      handle?.closeSync();
+    } catch {
+      // Discovery remains best-effort if the directory closes during a read.
+    }
   }
 
   const agents: AgentConfig[] = [];
