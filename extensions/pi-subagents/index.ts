@@ -503,14 +503,6 @@ function boundDetails(details: SubagentDetails, maxBytes = MAX_OUTPUT_BYTES): Su
   return bounded;
 }
 
-/** Drop transcript history from partial tool updates; keep it only in the final result. */
-function progressDetails(details: SubagentDetails): SubagentDetails {
-  return {
-    ...details,
-    results: details.results.map((result) => ({ ...result, messages: [], stderr: "" })),
-  };
-}
-
 function modelName(model: Model<any> | undefined): string | undefined {
   return model ? `${model.provider}/${model.id}` : undefined;
 }
@@ -1045,8 +1037,6 @@ export interface ParsedJsonEvent {
   kind: "message" | "messages" | "progress" | "error";
   message?: Message;
   messages?: Message[];
-  /** Kept for callers that inspect parser results; cumulative updates are ignored. */
-  streamMessage?: Message;
   text?: string;
   errorMessage?: string;
 }
@@ -1054,10 +1044,6 @@ export interface ParsedJsonEvent {
 /** Parse one JSON-mode line; malformed/non-event lines are safely ignored. */
 export function parseJsonEventLine(line: string): ParsedJsonEvent | undefined {
   if (!line.trim()) return undefined;
-  // Pi 0.83 JSON mode writes a full cumulative assistant snapshot on every
-  // token. Avoid parsing those potentially large lines at all; message_end and
-  // agent_end remain the authoritative events for this subprocess consumer.
-  if (/^\s*\{"type":"message_update"/.test(line)) return undefined;
   let event: unknown;
   try {
     event = JSON.parse(line);
@@ -1077,11 +1063,17 @@ export function parseJsonEventLine(line: string): ParsedJsonEvent | undefined {
     const messages = candidate.messages.filter(isFinalMessage);
     return messages.length > 0 ? { kind: "messages", messages } : undefined;
   }
-  // Pi's JSON mode 0.83 emits the complete cumulative assistant snapshot on
-  // every token. Treating those events as tool progress makes the parent
-  // serialize and render the same growing transcript once per token. Final
-  // message_end/agent_end events still carry the authoritative result.
-  if (candidate.type === "message_update") return undefined;
+  if (candidate.type === "message_update") {
+    const update = candidate.assistantMessageEvent;
+    if (!update || typeof update !== "object" || Array.isArray(update)) return undefined;
+    const updateType = (update as Record<string, unknown>).type;
+    if (updateType === "text_delta" && typeof (update as Record<string, unknown>).delta === "string") {
+      return { kind: "progress", text: truncateOutput((update as Record<string, unknown>).delta as string, 256) };
+    }
+    if (updateType === "thinking_delta") return { kind: "progress", text: "Thinking..." };
+    if (updateType === "toolcall_delta") return { kind: "progress", text: "Preparing tool..." };
+    return undefined;
+  }
   if (candidate.type === "tool_execution_start" || candidate.type === "tool_execution_update") {
     const toolName = typeof candidate.toolName === "string" ? candidate.toolName : "tool";
     return { kind: "progress", text: `Running ${truncateOutput(toolName, 256)}...` };
@@ -2128,7 +2120,7 @@ export default function (pi: ExtensionAPI) {
         let updateFailure: string | undefined;
       const notify = (text: string, details: SubagentDetails) => {
         try {
-          onUpdate?.({ content: [{ type: "text", text: truncateOutput(text, MAX_OUTPUT_BYTES) }], details: boundDetails(progressDetails(details)) });
+          onUpdate?.({ content: [{ type: "text", text: truncateOutput(text, MAX_OUTPUT_BYTES) }], details: boundDetails(details) });
         } catch (error) {
           updateFailure = error instanceof Error ? error.message : String(error);
           throw error;

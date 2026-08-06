@@ -126,7 +126,7 @@ The model-visible final result and each partial update use one deterministic 50 
 
 `action: "list"` returns the complete agent metadata to the model, while its successful result intentionally renders no body in the interactive TUI to avoid polluting the transcript.
 
-The package targets the current Pi CLI/API used by its `@earendil-works/pi-*` 0.83.0 development dependencies. It does not add compatibility shims for older Pi versions.
+The package targets the current Pi CLI/API used by its `@earendil-works/pi-*` 0.84.0 development dependencies. It does not add compatibility shims for older Pi versions.
 
 ## Relationship to pi-workflows
 

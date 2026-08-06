@@ -37,9 +37,16 @@ describe("JSON subprocess parsing", () => {
     expect(finished).toEqual({ kind: "progress", text: "Finished read." });
     expect(parseJsonEventLine(JSON.stringify({
       type: "message_update",
-      message: { role: "assistant", content: [{ type: "text", text: "partial" }] },
+      assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "partial" },
+    }))).toEqual({ kind: "progress", text: "partial" });
+    expect(parseJsonEventLine(JSON.stringify({
+      type: "message_update",
+      assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "reasoning" },
+    }))).toEqual({ kind: "progress", text: "Thinking..." });
+    expect(parseJsonEventLine(JSON.stringify({
+      type: "message_update",
+      message: { role: "assistant", content: [{ type: "text", text: "legacy cumulative snapshot" }] },
     }))).toBeUndefined();
-    expect(parseJsonEventLine(`{"type":"message_update","message":{"role":"assistant","content":[{"type":"text","text":"${"x".repeat(100_000)}"}]}}`)).toBeUndefined();
   });
 
   test("preserves typed agent_end messages as a fallback", () => {

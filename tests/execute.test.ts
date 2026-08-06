@@ -141,13 +141,13 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
   fs.chmodSync(script, 0o755);
   return script;
 }
-function writeCumulativePi(): string {
+function writeDeltaPi(): string {
   const directory = tempDir();
-  const script = path.join(directory, "cumulative-pi");
+  const script = path.join(directory, "delta-pi");
   fs.writeFileSync(script, `#!/usr/bin/env bun
 const usage = { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 5, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
-for (let size = 500; size <= 30000; size += 500) {
-  console.log(JSON.stringify({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text: "x".repeat(size) }], model: "fake/model", timestamp: 1 } }));
+for (let index = 0; index < 60; index++) {
+  console.log(JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x".repeat(500) } }));
 }
 console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "x".repeat(30000) }], model: "fake/model", usage, stopReason: "stop", timestamp: 1 }}));
 `);
@@ -457,16 +457,17 @@ describe("subprocess behavior", () => {
     }
   });
 
-  test("keeps full final output separate from bounded message details and handles cumulative updates", async () => {
+  test("handles Pi 0.84 delta updates without changing final output bounds", async () => {
     const root = tempDir();
     writeAgent(root);
-    process.env.PI_SUBAGENT_BIN = writeCumulativePi();
+    process.env.PI_SUBAGENT_BIN = writeDeltaPi();
     const updates: string[] = [];
     const result = await call(tool, { agent: "test-agent", task: "run", agentScope: "project" }, ctx(root, { hasUI: true }), undefined, (update) => {
       updates.push(update.content[0].text);
     });
     expect(result.isError).toBeUndefined();
-    expect(updates.length).toBeLessThan(10);
+    expect(updates.length).toBeGreaterThan(1);
+    expect(updates.length).toBeLessThan(100);
     expect(result.content[0].text.length).toBeGreaterThan(16 * 1024);
     expect(Buffer.byteLength(result.content[0].text, "utf8")).toBeLessThanOrEqual(50 * 1024);
     expect(result.details.results[0].output.length).toBe(30_000);
