@@ -2196,8 +2196,7 @@ export default function (pi: ExtensionAPI) {
     name: "subagent",
     label: "Subagent",
     description: [
-      "Delegate bounded work to isolated named child agents. Use single for one task, parallel only for independent non-overlapping tasks, chain when later steps need earlier output, workflow for explicit bounded branching, and background for long-running top-level work.",
-      "Children start with fresh context, so include relevant decisions, constraints, paths, and expected checks in the task.",
+      "Delegate bounded work to isolated named child agents. Children start with fresh context.",
       `Bundled agents are always available. User agents come from ${path.join(getAgentDir(), "agents")}; project agents come from ${CONFIG_DIR_NAME}/agents and require pi trust plus interactive confirmation.`,
       "All modes share lifecycle, resource, and cleanup limits; potentially mutating parallel tasks sharing a project root are rejected.",
     ].join(" "),
@@ -2206,13 +2205,11 @@ export default function (pi: ExtensionAPI) {
     // Serialize sibling top-level calls so two separate tool calls cannot
     // bypass that per-call mutation guard.
     executionMode: "sequential",
-    promptSnippet: "Delegate bounded work to an isolated child; prefer single unless tasks are clearly independent.",
+    promptSnippet: "Delegate bounded work; prefer one child unless scopes are clearly independent.",
     promptGuidelines: [
-      "Prefer single for one coherent task or question.",
-      "Use parallel only when tasks have distinct scopes and can run independently; do not repeat the same investigation.",
-      "Include relevant decisions, constraints, file paths, and expected checks because children start with fresh context.",
-      "Use chain when a later step needs an earlier result; use workflow only for explicit bounded branching.",
-      "Use background only for long-running top-level work that does not need immediate interaction.",
+      "Use subagent for one coherent task; use parallel only for independent, non-overlapping scopes, not duplicate investigations.",
+      "Give subagent the decisions, constraints, paths, and checks it needs because children start fresh.",
+      "Use subagent chains/workflows for explicit dependencies or branching; use subagent background mode only for long-running top-level work.",
     ],
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
