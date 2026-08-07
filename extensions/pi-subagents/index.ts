@@ -1531,18 +1531,22 @@ async function runPiProcess(
   });
 }
 
-async function executeChild(
-  agents: AgentConfig[],
-  name: string,
-  task: string,
-  cwd: string,
-  execution: ExecutionContext,
-  parentModel: Model<any> | undefined,
-  modelOverride: string | undefined,
-  step: number | undefined,
-  signal: AbortSignal | undefined,
-  emit: (result: AgentResult, progress?: string) => void,
-): Promise<AgentResult> {
+class SubprocessChildSupervisor implements ChildSupervisor {
+  constructor(
+    private readonly agents: AgentConfig[],
+    private readonly execution: ExecutionContext,
+    private readonly parentModel: Model<any> | undefined,
+  ) {}
+
+  /**
+   * Own the full child lifecycle: admission, prompt-file setup, process
+   * execution, result reporting, and release. Future workflow modes must call
+   * this boundary rather than creating a second scheduler or bypassing the
+   * root-wide control state.
+   */
+  async run(request: ChildRunRequest): Promise<AgentResult> {
+    const { name, task, cwd, modelOverride, step, signal, emit } = request;
+    const { agents, execution, parentModel } = this;
   const agent = agents.find((candidate) => candidate.name === name);
   if (!agent) {
     return {
@@ -1726,28 +1730,6 @@ async function executeChild(
     }
     if (reservation) await releaseChild(execution.control, result.runId);
   }
-}
-
-class SubprocessChildSupervisor implements ChildSupervisor {
-  constructor(
-    private readonly agents: AgentConfig[],
-    private readonly execution: ExecutionContext,
-    private readonly parentModel: Model<any> | undefined,
-  ) {}
-
-  run(request: ChildRunRequest): Promise<AgentResult> {
-    return executeChild(
-      this.agents,
-      request.name,
-      request.task,
-      request.cwd,
-      this.execution,
-      this.parentModel,
-      request.modelOverride,
-      request.step,
-      request.signal,
-      request.emit,
-    );
   }
 }
 
