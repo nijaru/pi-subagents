@@ -1,7 +1,7 @@
 ---
 name: pi-subagents
 description: |
-  Delegate work to specialized agents with single-agent, parallel, and sequential-chain workflows.
+  Delegate work to specialized agents with single-agent, parallel, sequential-chain, and bounded workflow modes.
   Use for review, implementation handoffs, and bounded recursive delegation.
 ---
 
@@ -18,8 +18,9 @@ The tool accepts exactly one mode:
 | Single | `{ agent, task }` | Run one agent and return its final output |
 | Parallel | `{ tasks: [{ agent, task, model?, cwd? }] }` | Run up to 8 tasks with bounded concurrency |
 | Chain | `{ chain: [{ agent, task, model?, cwd? }] }` | Run steps serially; `{previous}` is the preceding final output |
+| Workflow | `{ workflow: { start?, steps: [{ id, agent, task, onSuccess?, onFailure? }] } }` | Follow bounded success/failure branches serially; `{previous}` is the prior result |
 
-Use the top-level `model` to override any mode. Resolution is top-level/item override → agent definition → parent pi model. `cwd` defaults to the current project directory. A chain stops at its first failed step.
+Use the top-level `model` to override any mode. Resolution is top-level/item override → agent definition → parent pi model. `cwd` defaults to the current project directory. A chain stops at its first failed step; a workflow can branch on success or failure and may loop only within the root descendant budget. Use parallel for independent fan-out.
 
 `action: "list"` is the only action and cannot be combined with a delegation mode. Its successful metadata result is available to the model but intentionally renders no body in the interactive TUI.
 
@@ -55,7 +56,7 @@ Project agents are repository-controlled prompts. The current pi project must be
 
 Every delegation starts a fresh `pi --mode json -p --no-session` subprocess. Tool names are passed through unchanged; current research profiles use `web_search` (native/default), `web_fetch`, and `web_research`, the exact Context7 names `resolve-library-id`/`query-docs`, and the optional unified `mcp` proxy when `pi-mcp-adapter` is installed. Metered providers are explicit rather than default. Task and system-prompt contents travel through temporary mode-0600 files, not argv. Cancellation terminates the root process group; normal completion also sweeps surviving descendants.
 
-Nested calls propagate depth, run/parent/root IDs, deadline, timeout, explicit passthrough-env policy, and ephemeral mode-0600 control/policy files. The root-wide limits are depth 3, 32 total descendants, four active child slots, and a 128 KiB nested-policy bound. Nested callers temporarily yield their parent slot while waiting for descendants, so recursive delegation does not starve behind a full sibling fan-out; active slots are work capacity, not a guarantee that waiting ancestor processes consume no memory. These are guardrails rather than a hostile-code sandbox: a Bash-capable child can intentionally launch outside the extension's control file or process group. Each process has a 30-minute hard timeout, configurable up to two hours with `PI_SUBAGENT_TIMEOUT_MS`, and bounded by the root deadline.
+Nested calls propagate depth, run/parent/root IDs, deadline, timeout, explicit passthrough-env policy, and ephemeral mode-0600 control/policy files. The root-wide limits are depth 3, 32 total descendants, four active child slots, at most 16 declared workflow nodes, and a 128 KiB nested-policy bound. Nested callers temporarily yield their parent slot while waiting for descendants, so recursive delegation does not starve behind a full sibling fan-out; active slots are work capacity, not a guarantee that waiting ancestor processes consume no memory. These are guardrails rather than a hostile-code sandbox: a Bash-capable child can intentionally launch outside the extension's control file or process group. Each process has a 30-minute hard timeout, configurable up to two hours with `PI_SUBAGENT_TIMEOUT_MS`, and bounded by the root deadline.
 
 Env is allowlisted. Standard Pi model credentials, all `$VAR` refs from `~/.pi/agent/models.json`, and credential-shaped `*_API_KEY`/`*_TOKEN` variables are passed, including nested model and research-tool credentials. Arbitrary application variables are still excluded by default. For other variables, set `PI_SUBAGENT_PASSTHROUGH_ENV` with exact names or globs. `*` passes all env (insecure). Best: `pi /login` stores credentials in `~/.pi/agent/auth.json` when supported. The model-visible final result and partial updates use one deterministic 50 KiB cap per tool call; final output is separate from bounded message records, and Pi 0.84 JSON message updates are delta-only. Stream data, stderr, diagnostics, stored messages, and rendering are bounded too.
 

@@ -34,6 +34,19 @@ printf '%s\\n' '{"type":"message_end","message":{"role":"assistant","content":[{
   fs.chmodSync(script, 0o755);
   return script;
 }
+function writeWorkflowBranchPi(): string {
+  const directory = tempDir();
+  const script = path.join(directory, "workflow-branch-pi");
+  fs.writeFileSync(script, `#!/bin/sh
+if [ ! -f "$0.first" ]; then
+  touch "$0.first"
+  exit 1
+fi
+printf '%s\\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"workflow fallback"}],"model":"fake/model","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":0}}'
+`);
+  fs.chmodSync(script, 0o755);
+  return script;
+}
 function writeStructuredPi(output: string): string {
   const directory = tempDir();
   const script = path.join(directory, "structured-pi");
@@ -300,6 +313,7 @@ describe("tool contract", () => {
     expect(names).toContain("model");
     expect(names).toContain("tasks");
     expect(names).toContain("chain");
+    expect(names).toContain("workflow");
     for (const removed of ["background", "execution", "context", "acceptance", "gate", "prompt", "concurrency", "id"]) {
       expect(names).not.toContain(removed);
     }
@@ -763,6 +777,60 @@ describe("subprocess behavior", () => {
     }, ctx(root, { hasUI: false }));
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("trusted project cwd");
+  });
+
+  test("supports bounded workflow branches through the shared supervisor", async () => {
+    const root = tempDir();
+    writeAgent(root);
+    process.env.PI_SUBAGENT_BIN = writeFakePi();
+    const result = await call(tool, {
+      workflow: {
+        start: "review",
+        steps: [
+          { id: "review", agent: "test-agent", task: "review", onSuccess: "finish" },
+          { id: "finish", agent: "test-agent", task: "finish using {previous}" },
+        ],
+      },
+      agentScope: "project",
+    }, ctx(root, { hasUI: true }));
+    expect(result.isError).toBeUndefined();
+    expect(result.details.mode).toBe("workflow");
+    expect(result.details.results).toHaveLength(2);
+    expect(result.content[0].text).toBe("fake result");
+  });
+
+  test("follows workflow failure branches through the shared supervisor", async () => {
+    const root = tempDir();
+    writeAgent(root);
+    process.env.PI_SUBAGENT_BIN = writeWorkflowBranchPi();
+    const result = await call(tool, {
+      workflow: {
+        steps: [
+          { id: "review", agent: "test-agent", task: "review", onFailure: "fallback" },
+          { id: "fallback", agent: "test-agent", task: "recover using {previous}" },
+        ],
+      },
+      agentScope: "project",
+    }, ctx(root, { hasUI: true }));
+    expect(result.isError).toBeUndefined();
+    expect(result.details.mode).toBe("workflow");
+    expect(result.details.results).toHaveLength(2);
+    expect(result.details.results[0].termination).toBe("failed");
+    expect(result.content[0].text).toBe("workflow fallback");
+  });
+
+  test("rejects workflow edges to unknown nodes before spawning", async () => {
+    const root = tempDir();
+    writeAgent(root);
+    const result = await call(tool, {
+      workflow: {
+        steps: [{ id: "review", agent: "test-agent", task: "review", onSuccess: "missing" }],
+      },
+      agentScope: "project",
+    }, ctx(root, { hasUI: true }));
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("references missing node");
+    expect(result.details.results).toEqual([]);
   });
 
   test("supports parallel and chain modes with model overrides", async () => {

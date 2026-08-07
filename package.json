@@ -2,7 +2,7 @@
   "name": "pi-subagents",
   "version": "0.1.0",
   "type": "module",
-  "description": "Clean declarative agent delegation for pi — define agents, chain them, run them.",
+  "description": "Clean declarative agent delegation for pi — define agents, run bounded batches, and branch workflows.",
   "keywords": [
     "pi-package",
     "pi",
@@ -10,7 +10,8 @@
     "subagents",
     "agents",
     "chain",
-    "parallel"
+    "parallel",
+    "workflow"
   ],
   "license": "MIT",
   "author": "Nick Naru <nick@nijaru.com>",

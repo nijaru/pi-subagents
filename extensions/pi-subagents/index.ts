@@ -46,6 +46,10 @@ const DEFAULT_PROCESS_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_PROCESS_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const MAX_TASK_BYTES = 100 * 1024;
 const MAX_CHAIN_STEPS = 32;
+/** Maximum declared nodes in one opt-in workflow. */
+const MAX_WORKFLOW_STEPS = 16;
+/** Workflow transitions remain bounded by the root descendant budget. */
+const MAX_WORKFLOW_TRANSITIONS = MAX_DESCENDANTS;
 const MAX_CHAIN_CONTEXT_BYTES = 50 * 1024;
 const MAX_STRUCTURED_OUTPUT_BYTES = MAX_OUTPUT_BYTES;
 const MAX_DELEGATION_POLICY_BYTES = 128 * 1024;
@@ -179,7 +183,7 @@ export interface AgentResult {
 export interface SubagentDetails {
   /** Identifies a successful metadata-only action with no user-facing body. */
   action?: "list";
-  mode: "single" | "parallel" | "chain";
+  mode: "single" | "parallel" | "chain" | "workflow";
   agentScope: AgentScope;
   projectAgentsDir: string | null;
   runId: string;
@@ -1862,12 +1866,28 @@ const ChainItem = Type.Object({
   cwd: Type.Optional(Type.String({ description: "Working directory for this step" })),
 }, { additionalProperties: false });
 
+const WorkflowStep = Type.Object({
+  id: Type.String({ description: "Stable workflow node id", minLength: 1, maxLength: 64, pattern: "^[A-Za-z0-9_-]+$" }),
+  agent: Type.String({ description: "Name of the agent to invoke", minLength: 1, maxLength: 256 }),
+  task: Type.String({ description: "Task, with optional {previous} for the preceding output", minLength: 1, maxLength: MAX_TASK_BYTES }),
+  model: Type.Optional(Type.String({ description: "Optional model override for this node" })),
+  cwd: Type.Optional(Type.String({ description: "Working directory for this node" })),
+  onSuccess: Type.Optional(Type.String({ description: "Next node after a successful run", maxLength: 64 })),
+  onFailure: Type.Optional(Type.String({ description: "Next node after a failed run", maxLength: 64 })),
+}, { additionalProperties: false });
+
+const Workflow = Type.Object({
+  start: Type.Optional(Type.String({ description: "Starting node id; defaults to the first node", maxLength: 64 })),
+  steps: Type.Array(WorkflowStep, { description: `Bounded workflow nodes (maximum ${MAX_WORKFLOW_STEPS})`, maxItems: MAX_WORKFLOW_STEPS }),
+}, { additionalProperties: false });
+
 const SubagentParamsSchema = Type.Object({
   action: Type.Optional(StringEnum(["list"] as const, { description: "List available agents" })),
   agent: Type.Optional(Type.String({ description: "Agent name for single mode", minLength: 1, maxLength: 256 })),
   task: Type.Optional(Type.String({ description: "Task for single mode", minLength: 1, maxLength: MAX_TASK_BYTES })),
   tasks: Type.Optional(Type.Array(TaskItem, { description: "Parallel tasks (maximum 8)", maxItems: MAX_PARALLEL_TASKS })),
   chain: Type.Optional(Type.Array(ChainItem, { description: "Sequential steps using {previous}", maxItems: MAX_CHAIN_STEPS })),
+  workflow: Type.Optional(Workflow),
   agentScope: Type.Optional(StringEnum(["user", "project", "both"] as const, { description: "Agent scope; bundled agents are always included" })),
   model: Type.Optional(Type.String({ description: "Model override, provider/model-id; applies to every mode" })),
   cwd: Type.Optional(Type.String({ description: "Working directory for the delegation" })),
@@ -1878,10 +1898,12 @@ function requestedAgentNames(params: SubagentParams): string[] {
   if (params.agent) names.add(params.agent.trim());
   for (const task of params.tasks ?? []) names.add(task.agent.trim());
   for (const step of params.chain ?? []) names.add(step.agent.trim());
+  for (const step of params.workflow?.steps ?? []) names.add(step.agent.trim());
   return [...names];
 }
 
 function modeOf(params: SubagentParams): SubagentDetails["mode"] {
+  if (params.workflow !== undefined) return "workflow";
   if (params.chain !== undefined) return "chain";
   if (params.tasks !== undefined) return "parallel";
   return "single";
@@ -1893,7 +1915,8 @@ function validSingle(params: SubagentParams): boolean {
 
 function hasValidItems(params: SubagentParams): boolean {
   return (params.tasks ?? []).every((item) => item.agent.trim().length > 0 && item.task.trim().length > 0)
-    && (params.chain ?? []).every((item) => item.agent.trim().length > 0 && item.task.trim().length > 0);
+    && (params.chain ?? []).every((item) => item.agent.trim().length > 0 && item.task.trim().length > 0)
+    && (params.workflow?.steps ?? []).every((item) => item.agent.trim().length > 0 && item.task.trim().length > 0);
 }
 
 function hasBlankModel(params: SubagentParams): boolean {
@@ -1901,6 +1924,7 @@ function hasBlankModel(params: SubagentParams): boolean {
     params.model,
     ...(params.tasks ?? []).map((item) => item.model),
     ...(params.chain ?? []).map((item) => item.model),
+    ...(params.workflow?.steps ?? []).map((item) => item.model),
   ].some((model) => model !== undefined && model.trim().length === 0);
 }
 
@@ -2013,7 +2037,7 @@ export default function (pi: ExtensionAPI) {
     name: "subagent",
     label: "Subagent",
     description: [
-      "Delegate to specialized agents using exactly one mode: single (agent + task), parallel (tasks), or sequential chain (chain with {previous}).",
+      "Delegate to specialized agents using exactly one mode: single (agent + task), parallel (tasks), sequential chain (chain with {previous}), or bounded workflow (workflow with success/failure branches).",
       `Bundled agents are always available. User agents come from ${path.join(getAgentDir(), "agents")}; project agents come from ${CONFIG_DIR_NAME}/agents and require pi trust plus interactive confirmation.`,
       "All delegation runs in an isolated subprocess. A top-level model override applies to every mode; otherwise the parent model is inherited.",
       "The only action is list. Model-visible output and partial updates share one deterministic 50KB cap per tool call.",
@@ -2023,7 +2047,7 @@ export default function (pi: ExtensionAPI) {
     // Serialize sibling top-level calls so two separate tool calls cannot
     // bypass that per-call mutation guard.
     executionMode: "sequential",
-    promptSnippet: "Delegate work to an isolated named subagent (single, parallel, or chain).",
+    promptSnippet: "Delegate work to an isolated named subagent (single, parallel, chain, or bounded workflow).",
     promptGuidelines: [
       "Call subagent in parallel only for independent tasks; potentially-mutating tasks sharing a project root are rejected.",
       "Call subagent in a chain when a later agent needs the previous agent's report.",
@@ -2071,8 +2095,9 @@ export default function (pi: ExtensionAPI) {
       const hasSingle = hasSingleFields;
       const hasParallel = params.tasks !== undefined;
       const hasChain = params.chain !== undefined;
+      const hasWorkflow = params.workflow !== undefined;
 
-      if (params.action && (hasSingle || hasParallel || hasChain)) {
+      if (params.action && (hasSingle || hasParallel || hasChain || hasWorkflow)) {
         return toolResult("action=\"list\" cannot be combined with a delegation mode.", baseDetails("single", []), true);
       }
 
@@ -2105,9 +2130,9 @@ export default function (pi: ExtensionAPI) {
         return toolResult(lines.length ? `Available agents:\n${lines.join("\n")}` : "No agents found.", baseDetails("single", [], "list"));
       }
 
-      if (Number(hasSingle) + Number(hasParallel) + Number(hasChain) !== 1) {
+      if (Number(hasSingle) + Number(hasParallel) + Number(hasChain) + Number(hasWorkflow) !== 1) {
         return toolResult(
-          `Invalid parameters. Provide exactly one mode: agent + task, tasks[], or chain[].\nAvailable agents: ${availableText(visibleAgents)}`,
+          `Invalid parameters. Provide exactly one mode: agent + task, tasks[], chain[], or workflow.\nAvailable agents: ${availableText(visibleAgents)}`,
           baseDetails(modeOf(params), []),
           true,
         );
@@ -2121,8 +2146,11 @@ export default function (pi: ExtensionAPI) {
       if (hasChain && params.chain!.length === 0) {
         return toolResult("Chain mode requires at least one step.", baseDetails("chain", []), true);
       }
+      if (hasWorkflow && params.workflow!.steps.length === 0) {
+        return toolResult("Workflow mode requires at least one step.", baseDetails("workflow", []), true);
+      }
       if (!hasValidItems(params)) {
-        return toolResult("Agent names and tasks must not be blank.", baseDetails(hasChain ? "chain" : "parallel", []), true);
+        return toolResult("Agent names and tasks must not be blank.", baseDetails(modeOf(params), []), true);
       }
       if (inheritedPolicy?.allowedAgents && requestedAgentNames(params).some((name) => !inheritedPolicy.allowedAgents!.includes(name))) {
         return toolResult(`Nested delegation is restricted to: ${inheritedPolicy.allowedAgents.join(", ") || "none"}.`, baseDetails(modeOf(params), []), true);
@@ -2139,7 +2167,36 @@ export default function (pi: ExtensionAPI) {
       if (params.chain && params.chain.length > MAX_CHAIN_STEPS) {
         return toolResult(`Too many chain steps (${params.chain.length}). Maximum is ${MAX_CHAIN_STEPS}.`, baseDetails("chain", []), true);
       }
-      const texts = [params.task, ...(params.tasks ?? []).map((item) => item.task), ...(params.chain ?? []).map((item) => item.task)];
+      if (params.workflow && params.workflow.steps.length > MAX_WORKFLOW_STEPS) {
+        return toolResult(`Too many workflow steps (${params.workflow.steps.length}). Maximum is ${MAX_WORKFLOW_STEPS}.`, baseDetails("workflow", []), true);
+      }
+      if (hasWorkflow) {
+        const steps = params.workflow!.steps;
+        const ids = new Set<string>();
+        for (const step of steps) {
+          if (ids.has(step.id)) {
+            return toolResult(`Workflow node ids must be unique: "${step.id}".`, baseDetails("workflow", []), true);
+          }
+          ids.add(step.id);
+        }
+        const start = params.workflow!.start ?? steps[0]?.id;
+        if (!start || !ids.has(start)) {
+          return toolResult(`Workflow start node does not exist: "${start ?? ""}".`, baseDetails("workflow", []), true);
+        }
+        for (const step of steps) {
+          for (const next of [step.onSuccess, step.onFailure]) {
+            if (next !== undefined && !ids.has(next)) {
+              return toolResult(`Workflow node "${step.id}" references missing node "${next}".`, baseDetails("workflow", []), true);
+            }
+          }
+        }
+      }
+      const texts = [
+        params.task,
+        ...(params.tasks ?? []).map((item) => item.task),
+        ...(params.chain ?? []).map((item) => item.task),
+        ...(params.workflow?.steps ?? []).map((item) => item.task),
+      ];
       if (texts.some((text) => text !== undefined && Buffer.byteLength(text, "utf8") > MAX_TASK_BYTES)) {
         return toolResult(`Tasks must be at most ${MAX_TASK_BYTES} bytes.`, baseDetails(modeOf(params), []), true);
       }
@@ -2160,6 +2217,7 @@ export default function (pi: ExtensionAPI) {
       const taskLocations = [
         ...(params.tasks ?? []),
         ...(params.chain ?? []),
+        ...(params.workflow?.steps ?? []),
       ];
       const parallelMutators = new Map<string, string[]>();
       for (const item of taskLocations) {
@@ -2259,6 +2317,64 @@ export default function (pi: ExtensionAPI) {
           emit: (current, progress) => emitSingle("single", [current], current, progress),
         });
         return toolResult(resultText(result), baseDetails("single", [result]), failed(result));
+      }
+
+      if (hasWorkflow) {
+        const workflow = params.workflow!;
+        const steps = new Map(workflow.steps.map((step) => [step.id, step]));
+        const results: AgentResult[] = [];
+        let currentId = workflow.start ?? workflow.steps[0]!.id;
+        let previous = "";
+        for (let transition = 0; transition < MAX_WORKFLOW_TRANSITIONS; transition++) {
+          const step = steps.get(currentId);
+          if (!step) {
+            return toolResult(`Workflow reached missing node "${currentId}".`, baseDetails("workflow", results), true);
+          }
+          const task = interpolatePrevious(step.task, previous, MAX_TASK_BYTES);
+          const stepCwd = existingDirectory(cwdFor(rootCwd, step.cwd));
+          if (!stepCwd) {
+            const errorResult: AgentResult = {
+              agent: step.agent.trim(),
+              agentSource: "unknown",
+              task: truncateOutput(task, MAX_DIAGNOSTIC_BYTES),
+              runId: randomUUID(),
+              parentRunId: execution.runId,
+              rootRunId: execution.rootRunId,
+              depth: execution.depth + 1,
+              step: transition + 1,
+              exitCode: 1,
+              stopReason: "error",
+              termination: "failed",
+              errorMessage: truncateOutput(`Working directory does not exist: ${stepCwd}`, MAX_DIAGNOSTIC_BYTES),
+              stderr: "",
+              messages: [],
+              usage: emptyUsage(),
+            };
+            results.push(errorResult);
+            return toolResult(`Workflow stopped at ${step.id} (${step.agent}): ${resultText(errorResult)}`, baseDetails("workflow", results), true);
+          }
+          const result = await supervisor.run({
+            name: step.agent.trim(),
+            task,
+            cwd: stepCwd,
+            modelOverride: params.model ?? step.model,
+            step: transition + 1,
+            signal,
+            emit: (current, progress) => emitSingle("workflow", [...results, current], current, progress),
+          });
+          results.push(result);
+          const failedRun = failed(result);
+          previous = truncateOutput(result.output || resultText(result), MAX_CHAIN_CONTEXT_BYTES);
+          const next = failedRun ? step.onFailure : step.onSuccess;
+          if (!next) {
+            if (failedRun) {
+              return toolResult(`Workflow stopped at ${step.id} (${step.agent}): ${resultText(result)}`, baseDetails("workflow", results), true);
+            }
+            return toolResult(resultText(result), baseDetails("workflow", results));
+          }
+          currentId = next;
+        }
+        return toolResult(`Workflow exceeded the ${MAX_WORKFLOW_TRANSITIONS}-transition root budget.`, baseDetails("workflow", results), true);
       }
 
       if (hasChain) {
@@ -2365,13 +2481,17 @@ export default function (pi: ExtensionAPI) {
     renderCall(args, theme) {
       if (args.action === "list") return new Text(theme.fg("toolTitle", theme.bold("subagent list")), 0, 0);
       const scope = stripTerminalControls(args.agentScope ?? "user");
-      const label = args.chain?.length
-        ? `chain (${args.chain.length})`
-        : args.tasks?.length
-          ? `parallel (${args.tasks.length})`
-          : stripTerminalControls(args.agent ?? "...");
+      const label = args.workflow?.steps?.length
+        ? `workflow (${args.workflow.steps.length})`
+        : args.chain?.length
+          ? `chain (${args.chain.length})`
+          : args.tasks?.length
+            ? `parallel (${args.tasks.length})`
+            : stripTerminalControls(args.agent ?? "...");
       let text = `${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", label)}${theme.fg("muted", ` [${scope}]`)}`;
-      if (args.chain?.length) {
+      if (args.workflow?.steps?.length) {
+        for (const step of args.workflow.steps.slice(0, 3)) text += `\n  ${theme.fg("accent", stripTerminalControls(step.id))} ${theme.fg("dim", `${stripTerminalControls(step.agent)}: ${truncateChars(stripTerminalControls(step.task.replaceAll("{previous}", "").trim()), 52)}`)}`;
+      } else if (args.chain?.length) {
         for (const [index, step] of args.chain.slice(0, 3).entries()) text += `\n  ${index + 1}. ${theme.fg("accent", stripTerminalControls(step.agent))} ${theme.fg("dim", truncateChars(stripTerminalControls(step.task.replaceAll("{previous}", "").trim()), 60))}`;
       } else if (args.tasks?.length) {
         for (const task of args.tasks.slice(0, 3)) text += `\n  ${theme.fg("accent", stripTerminalControls(task.agent))} ${theme.fg("dim", truncateChars(stripTerminalControls(task.task), 60))}`;
@@ -2390,7 +2510,7 @@ export default function (pi: ExtensionAPI) {
       const fallback = result.content[0]?.type === "text" && typeof result.content[0].text === "string"
         ? stripTerminalControls(truncateOutput(result.content[0].text, MAX_OUTPUT_BYTES))
         : "(no output)";
-      if (!details || !["single", "parallel", "chain"].includes(details.mode) || !Array.isArray(details.results) || details.results.length === 0 || !details.results.every(isRenderableAgentResult)) return new Text(fallback, 0, 0);
+      if (!details || !["single", "parallel", "chain", "workflow"].includes(details.mode) || !Array.isArray(details.results) || details.results.length === 0 || !details.results.every(isRenderableAgentResult)) return new Text(fallback, 0, 0);
 
       const renderBudget = { remaining: MAX_OUTPUT_BYTES };
       const takeRender = (value: string): string => {

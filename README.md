@@ -44,6 +44,19 @@ Parallel tasks that may mutate the same project root are rejected. Give read-onl
 
 `{previous}` is replaced with the preceding final text output. A chain stops at its first failed step.
 
+### Bounded workflow
+
+Use a workflow when the next agent depends on whether the previous run succeeded or failed. Nodes run serially through the same supervisor; `onSuccess` and `onFailure` select the next node, and `{previous}` carries the prior result. A missing next edge ends the workflow. Loops are allowed but bounded by the root descendant budget.
+
+```json
+{"workflow":{"start":"review","steps":[
+  {"id":"review","agent":"reviewer","task":"Review the change.","onSuccess":"implement"},
+  {"id":"implement","agent":"worker","task":"Apply the review:\n\n{previous}"}
+]}}
+```
+
+Use `parallel` for independent fan-out; workflows are for dependent branches and bounded retries.
+
 ## Agent definitions
 
 Bundled agents ship in this package. User definitions live in `~/.pi/agent/agents/*.md`; project definitions live in the nearest `.pi/agents/*.md` and require project trust plus an interactive confirmation.
@@ -116,7 +129,7 @@ Nested calls outside `allowedAgents` or beyond `maxDelegationDepth` fail before 
 
 Every delegation starts a fresh `pi --mode json -p --no-session` subprocess. Task and system-prompt contents are written to temporary mode-0600 files instead of being placed in argv. Cancellation terminates the root process group, and normal completion also sweeps surviving descendants before shutdown.
 
-Nested delegation is bounded by depth 3, a root-wide budget of 32 descendants, a shared limit of four active child slots, and one root deadline. Nested callers temporarily yield their parent slot while waiting for descendants, so recursive delegation does not starve behind a full sibling fan-out; the slot count is active work capacity, not a promise that waiting ancestor processes consume no memory. These are guardrails, not a hostile-code sandbox: a Bash-capable child can intentionally launch processes outside the extension's control file or process group. Controls are propagated through ephemeral mode-0600 files and environment IDs; state publication is atomic, policy transport is bounded to 128 KiB, and malformed control state fails closed. Each child has a 30-minute hard timeout, configurable up to two hours with `PI_SUBAGENT_TIMEOUT_MS` and bounded by the root deadline.
+Nested delegation is bounded by depth 3, a root-wide budget of 32 descendants, a shared limit of four active child slots, at most 16 declared workflow nodes, and one root deadline. Nested callers temporarily yield their parent slot while waiting for descendants, so recursive delegation does not starve behind a full sibling fan-out; the slot count is active work capacity, not a promise that waiting ancestor processes consume no memory. These are guardrails, not a hostile-code sandbox: a Bash-capable child can intentionally launch processes outside the extension's control file or process group. Controls are propagated through ephemeral mode-0600 files and environment IDs; state publication is atomic, policy transport is bounded to 128 KiB, and malformed control state fails closed. Each child has a 30-minute hard timeout, configurable up to two hours with `PI_SUBAGENT_TIMEOUT_MS` and bounded by the root deadline.
 
 Environment is allowlisted. Children automatically receive standard Pi model credential variables, every `$VAR` reference from `~/.pi/agent/models.json`, and credential-shaped `*_API_KEY`/`*_TOKEN` variables. This lets nested agents use model, Exa, Context7, GitHub, and similar credentials without manual setup while still excluding arbitrary application environment. `PI_SUBAGENT_PASSTHROUGH_ENV` supports exact names and globs for non-credential variables; `*` passes all env and is an explicit insecure opt-in. Best practice: store keys via `pi /login` into `~/.pi/agent/auth.json` when supported.
 
