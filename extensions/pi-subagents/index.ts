@@ -2196,20 +2196,23 @@ export default function (pi: ExtensionAPI) {
     name: "subagent",
     label: "Subagent",
     description: [
-      "Delegate to specialized agents using exactly one mode: single (agent + task), parallel (tasks), sequential chain (chain with {previous}), bounded workflow (workflow with success/failure branches), or explicit in-memory background lifecycle (background).",
+      "Delegate bounded work to isolated named child agents. Use single for one task, parallel only for independent non-overlapping tasks, chain when later steps need earlier output, workflow for explicit bounded branching, and background for long-running top-level work.",
+      "Children start with fresh context, so include relevant decisions, constraints, paths, and expected checks in the task.",
       `Bundled agents are always available. User agents come from ${path.join(getAgentDir(), "agents")}; project agents come from ${CONFIG_DIR_NAME}/agents and require pi trust plus interactive confirmation.`,
-      "All delegation runs in an isolated subprocess. A top-level model override applies to every mode; otherwise the parent model is inherited.",
-      "The only top-level action is list; background actions are start, status, result, and stop inside background. Model-visible output and partial updates share one deterministic 50KB cap per tool call.",
+      "All modes share lifecycle, resource, and cleanup limits; potentially mutating parallel tasks sharing a project root are rejected.",
     ].join(" "),
     parameters: SubagentParamsSchema,
     // The tool owns its own parallel mode and rejects unsafe same-project-root writes.
     // Serialize sibling top-level calls so two separate tool calls cannot
     // bypass that per-call mutation guard.
     executionMode: "sequential",
-    promptSnippet: "Delegate work to an isolated named subagent (single, parallel, chain, bounded workflow, or background run).",
+    promptSnippet: "Delegate bounded work to an isolated child; prefer single unless tasks are clearly independent.",
     promptGuidelines: [
-      "Call subagent in parallel only for independent tasks; potentially-mutating tasks sharing a project root are rejected.",
-      "Call subagent in a chain when a later agent needs the previous agent's report.",
+      "Prefer single for one coherent task or question.",
+      "Use parallel only when tasks have distinct scopes and can run independently; do not repeat the same investigation.",
+      "Include relevant decisions, constraints, file paths, and expected checks because children start with fresh context.",
+      "Use chain when a later step needs an earlier result; use workflow only for explicit bounded branching.",
+      "Use background only for long-running top-level work that does not need immediate interaction.",
     ],
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
