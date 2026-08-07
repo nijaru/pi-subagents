@@ -528,8 +528,11 @@ describe("subprocess behavior", () => {
       updates.push(update.content[0].text);
     });
     expect(result.isError).toBeUndefined();
+    // Pi 0.84 emits token-level message_update deltas. They must not become
+    // word-by-word parent previews; only coarse lifecycle and final-result
+    // updates should reach the tool renderer.
     expect(updates.length).toBeGreaterThan(1);
-    expect(updates.length).toBeLessThan(100);
+    expect(updates.length).toBeLessThan(10);
     expect(result.content[0].text.length).toBeGreaterThan(16 * 1024);
     expect(Buffer.byteLength(result.content[0].text, "utf8")).toBeLessThanOrEqual(50 * 1024);
     expect(result.details.results[0].output.length).toBe(30_000);

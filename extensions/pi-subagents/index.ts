@@ -1165,14 +1165,12 @@ export function parseJsonEventLine(line: string): ParsedJsonEvent | undefined {
     return messages.length > 0 ? { kind: "messages", messages } : undefined;
   }
   if (candidate.type === "message_update") {
-    const update = candidate.assistantMessageEvent;
-    if (!update || typeof update !== "object" || Array.isArray(update)) return undefined;
-    const updateType = (update as Record<string, unknown>).type;
-    if (updateType === "text_delta" && typeof (update as Record<string, unknown>).delta === "string") {
-      return { kind: "progress", text: truncateOutput((update as Record<string, unknown>).delta as string, 256) };
-    }
-    if (updateType === "thinking_delta") return { kind: "progress", text: "Thinking..." };
-    if (updateType === "toolcall_delta") return { kind: "progress", text: "Preparing tool..." };
+    // Pi 0.84 emits token-level deltas here. They are useful to a dedicated
+    // streaming transcript, but forwarding each one as a parent tool update
+    // makes the subagent preview flicker word by word and can recreate the
+    // parent-side render/serialization storm this parser is meant to avoid.
+    // message_end remains authoritative; tool lifecycle events below provide
+    // coarse progress without replaying model tokens into the parent preview.
     return undefined;
   }
   if (candidate.type === "tool_execution_start" || candidate.type === "tool_execution_update") {

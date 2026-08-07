@@ -38,11 +38,11 @@ describe("JSON subprocess parsing", () => {
     expect(parseJsonEventLine(JSON.stringify({
       type: "message_update",
       assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "partial" },
-    }))).toEqual({ kind: "progress", text: "partial" });
+    }))).toBeUndefined();
     expect(parseJsonEventLine(JSON.stringify({
       type: "message_update",
       assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "reasoning" },
-    }))).toEqual({ kind: "progress", text: "Thinking..." });
+    }))).toBeUndefined();
     expect(parseJsonEventLine(JSON.stringify({
       type: "message_update",
       message: { role: "assistant", content: [{ type: "text", text: "legacy cumulative snapshot" }] },
