@@ -14,6 +14,10 @@ bun run check
 
 No build step — pi loads the extension directly.
 
+## Integration discipline
+
+Merge only a coherent, independently usable slice: it must be complete as a user-facing capability or behavior-preserving infrastructure with a tested contract that leaves `main` usable. Keep incomplete scaffolding and dependent follow-ups on feature branches. Before merging, run `bun run check` and inspect the complete diff.
+
 ## Key Files
 
 ```
