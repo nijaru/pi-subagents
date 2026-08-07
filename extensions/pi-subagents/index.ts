@@ -129,6 +129,24 @@ interface ExecutionContext {
   delegationPolicy?: DelegationPolicy;
 }
 
+interface ChildRunRequest {
+  name: string;
+  task: string;
+  cwd: string;
+  modelOverride?: string;
+  step?: number;
+  signal?: AbortSignal;
+  emit: (result: AgentResult, progress?: string) => void;
+}
+
+/**
+ * Internal child execution boundary. Public modes and future workflow modes
+ * must use this path so they share subprocess lifecycle and root budgets.
+ */
+interface ChildSupervisor {
+  run(request: ChildRunRequest): Promise<AgentResult>;
+}
+
 export interface UsageSummary extends Usage {
   turns: number;
 }
@@ -1513,7 +1531,7 @@ async function runPiProcess(
   });
 }
 
-async function runAgent(
+async function executeChild(
   agents: AgentConfig[],
   name: string,
   task: string,
@@ -1707,6 +1725,29 @@ async function runAgent(
       }
     }
     if (reservation) await releaseChild(execution.control, result.runId);
+  }
+}
+
+class SubprocessChildSupervisor implements ChildSupervisor {
+  constructor(
+    private readonly agents: AgentConfig[],
+    private readonly execution: ExecutionContext,
+    private readonly parentModel: Model<any> | undefined,
+  ) {}
+
+  run(request: ChildRunRequest): Promise<AgentResult> {
+    return executeChild(
+      this.agents,
+      request.name,
+      request.task,
+      request.cwd,
+      this.execution,
+      this.parentModel,
+      request.modelOverride,
+      request.step,
+      request.signal,
+      request.emit,
+    );
   }
 }
 
@@ -2206,6 +2247,7 @@ export default function (pi: ExtensionAPI) {
           if (!yieldedReservation) throw new Error("Nested subagent reservation is missing; refusing to run without an owned capacity slot.");
         }
         const parentModel = ctx.model;
+        const supervisor: ChildSupervisor = new SubprocessChildSupervisor(discovery.agents, execution, parentModel);
         let updateFailure: string | undefined;
       const notify = (text: string, details: SubagentDetails) => {
         try {
@@ -2220,18 +2262,14 @@ export default function (pi: ExtensionAPI) {
       };
 
       if (hasSingle) {
-        const result = await runAgent(
-          discovery.agents,
-          params.agent!.trim(),
-          params.task!,
-          rootCwd,
-          execution,
-          parentModel,
-          params.model,
-          undefined,
+        const result = await supervisor.run({
+          name: params.agent!.trim(),
+          task: params.task!,
+          cwd: rootCwd,
+          modelOverride: params.model,
           signal,
-          (current, progress) => emitSingle("single", [current], current, progress),
-        );
+          emit: (current, progress) => emitSingle("single", [current], current, progress),
+        });
         return toolResult(resultText(result), baseDetails("single", [result]), failed(result));
       }
 
@@ -2263,18 +2301,15 @@ export default function (pi: ExtensionAPI) {
             results.push(errorResult);
             return toolResult(`Chain stopped at step ${index + 1} (${step.agent}): ${resultText(errorResult)}`, baseDetails("chain", results), true);
           }
-          const result = await runAgent(
-            discovery.agents,
-            step.agent.trim(),
+          const result = await supervisor.run({
+            name: step.agent.trim(),
             task,
-            stepCwd,
-            execution,
-            parentModel,
-            params.model ?? step.model,
-            index + 1,
+            cwd: stepCwd,
+            modelOverride: params.model ?? step.model,
+            step: index + 1,
             signal,
-            (current, progress) => emitSingle("chain", [...results, current], current, progress),
-          );
+            emit: (current, progress) => emitSingle("chain", [...results, current], current, progress),
+          });
           results.push(result);
           if (failed(result)) {
             return toolResult(`Chain stopped at step ${index + 1} (${step.agent}): ${resultText(result)}`, baseDetails("chain", results), true);
@@ -2310,22 +2345,18 @@ export default function (pi: ExtensionAPI) {
       } catch {
         return toolResult(`Subagent update failed: ${updateFailure ?? "unknown update error"}`, baseDetails("parallel", current), true);
       }
-      const results = await mapWithConcurrency(params.tasks!, async (task, index) => runAgent(
-        discovery.agents,
-        task.agent.trim(),
-        task.task,
-        existingDirectory(cwdFor(rootCwd, task.cwd)) ?? cwdFor(rootCwd, task.cwd),
-        execution,
-        parentModel,
-        params.model ?? task.model,
-        undefined,
+      const results = await mapWithConcurrency(params.tasks!, async (task, index) => supervisor.run({
+        name: task.agent.trim(),
+        task: task.task,
+        cwd: existingDirectory(cwdFor(rootCwd, task.cwd)) ?? cwdFor(rootCwd, task.cwd),
+        modelOverride: params.model ?? task.model,
         signal,
-        (result, progress) => {
+        emit: (result, progress) => {
           current[index] = copyResult(result);
           const done = current.filter((item) => item.exitCode !== -1).length;
           notify(progress ?? `Parallel: ${done}/${current.length} done`, baseDetails("parallel", current.map(copyResult)));
         },
-      ));
+      }));
       const successCount = results.filter((result) => !failed(result)).length;
       const summary = results.map((result) => {
         const status = failed(result)
