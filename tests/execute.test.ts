@@ -24,6 +24,16 @@ function writeAgent(root: string, name = "test-agent", source = ".pi/agents") {
   fs.mkdirSync(directory, { recursive: true });
   fs.writeFileSync(path.join(directory, `${name}.md`), `---\nname: ${name}\ndescription: Test agent\ncapability: read\n---\nYou are a test agent.\n`);
 }
+function writeMutatingAgent(root: string, name = "mutator"): void {
+  const directory = path.join(root, ".pi", "agents");
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(path.join(directory, `${name}.md`), `---\nname: ${name}\ndescription: Mutating test agent\ncapability: write\ntools: read\n---\nYou may modify the project.\n`);
+}
+function writeDelegatingAgent(root: string, name = "delegator"): void {
+  const directory = path.join(root, ".pi", "agents");
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(path.join(directory, `${name}.md`), `---\nname: ${name}\ndescription: Delegating test agent\ncapability: write\ndelegation: true\ntools: read, subagent\n---\nYou may delegate.\n`);
+}
 function writeFakePi(): string {
   const directory = tempDir();
   const script = path.join(directory, "fake-pi");
@@ -273,6 +283,21 @@ async function loadTool(): Promise<Tool> {
   if (!tool) throw new Error("subagent was not registered");
   return tool;
 }
+async function loadToolWithShutdown(): Promise<{ tool: Tool; shutdown: () => Promise<void> }> {
+  const tools: Tool[] = [];
+  let shutdown: (() => Promise<void>) | undefined;
+  const api = {
+    registerTool(definition: Tool) { tools.push(definition); },
+    on(event: string, handler: () => Promise<void>) {
+      if (event === "session_shutdown") shutdown = handler;
+    },
+  } as any;
+  const module = await import(`${EXTENSION}?shutdown=${Math.random()}`);
+  module.default(api);
+  const tool = tools.find((candidate) => candidate.name === "subagent");
+  if (!tool || !shutdown) throw new Error("subagent shutdown handler was not registered");
+  return { tool, shutdown };
+}
 function ctx(cwd: string, extra: Record<string, unknown> = {}) {
   return {
     cwd,
@@ -314,7 +339,8 @@ describe("tool contract", () => {
     expect(names).toContain("tasks");
     expect(names).toContain("chain");
     expect(names).toContain("workflow");
-    for (const removed of ["background", "execution", "context", "acceptance", "gate", "prompt", "concurrency", "id"]) {
+    expect(names).toContain("background");
+    for (const removed of ["execution", "context", "acceptance", "gate", "prompt", "concurrency", "id"]) {
       expect(names).not.toContain(removed);
     }
   });
@@ -399,7 +425,10 @@ describe("tool contract", () => {
 
 describe("subprocess behavior", () => {
   let tool: Tool;
-  beforeEach(async () => { tool = await loadTool(); });
+  beforeEach(async () => {
+    for (const key of ["PI_SUBAGENT_DEPTH", "PI_SUBAGENT_RUN_ID", "PI_SUBAGENT_PARENT_ID", "PI_SUBAGENT_ROOT_ID", "PI_SUBAGENT_CONTROL_FILE", "PI_SUBAGENT_DEADLINE_MS", "PI_SUBAGENT_BUDGET_REMAINING", "PI_SUBAGENT_DELEGATION_POLICY", "PI_SUBAGENT_DELEGATION_POLICY_FILE"]) delete process.env[key];
+    tool = await loadTool();
+  });
 
   test("parses typed messages and usage from a real child process", async () => {
     const root = tempDir();
@@ -709,6 +738,81 @@ describe("subprocess behavior", () => {
     expect(result.isError).toBe(true);
     expect(result.details.results).toHaveLength(1);
     expect(result.details.results[0].termination).toBe("cancelled");
+  });
+
+  test("starts, observes, and retrieves an in-memory background run", async () => {
+    const root = tempDir();
+    process.env.PI_SUBAGENT_BIN = writeFakePi();
+    const started = await call(tool, { background: { action: "start", agent: "worker", task: "run" } }, ctx(root));
+    expect(started.isError).toBeUndefined();
+    expect(started.details.action).toBe("start");
+    expect(started.details.background.status).toBe("running");
+    const runId = started.details.background.runId;
+    const status = await call(tool, { background: { action: "status", runId } }, ctx(root));
+    expect(status.isError).toBeUndefined();
+    expect(status.details.background.runId).toBe(runId);
+    let result: any;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      result = await call(tool, { background: { action: "result", runId } }, ctx(root));
+      if (result.content[0].text === "fake result") break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toBe("fake result");
+    expect(result.details.background.status).toBe("completed");
+  });
+
+  test("rejects nested delegation from background starts", async () => {
+    const root = tempDir();
+    writeDelegatingAgent(root);
+    const result = await call(tool, { background: { action: "start", agent: "delegator", task: "run" }, agentScope: "project" }, ctx(root, { hasUI: true }));
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("cannot use delegation-capable agents");
+  });
+
+  test("stops a background run and reports cancellation", async () => {
+    const root = tempDir();
+    process.env.PI_SUBAGENT_BIN = writeHangingPi();
+    const started = await call(tool, { background: { action: "start", agent: "worker", task: "run" } }, ctx(root));
+    const stopped = await call(tool, { background: { action: "stop", runId: started.details.background.runId } }, ctx(root));
+    expect(stopped.isError).toBeUndefined();
+    expect(stopped.details.background.status).toBe("cancelled");
+    expect(stopped.details.results[0].termination).toBe("cancelled");
+  });
+
+  test("session shutdown cancels active background runs", async () => {
+    const root = tempDir();
+    process.env.PI_SUBAGENT_BIN = writeHangingPi();
+    const { tool: shutdownTool, shutdown } = await loadToolWithShutdown();
+    const started = await call(shutdownTool, { background: { action: "start", agent: "worker", task: "run" } }, ctx(root));
+    await shutdown();
+    const status = await call(shutdownTool, { background: { action: "status", runId: started.details.background.runId } }, ctx(root));
+    expect(status.details.background.status).toBe("cancelled");
+  });
+
+  test("caps active background runs", async () => {
+    const root = tempDir();
+    process.env.PI_SUBAGENT_BIN = writeHangingPi();
+    const started: string[] = [];
+    for (let index = 0; index < 4; index++) {
+      const result = await call(tool, { background: { action: "start", agent: "explore", task: `run ${index}` } }, ctx(root));
+      started.push(result.details.background.runId);
+    }
+    const rejected = await call(tool, { background: { action: "start", agent: "explore", task: "run 4" } }, ctx(root));
+    expect(rejected.isError).toBe(true);
+    expect(rejected.content[0].text).toContain("active background runs");
+    for (const runId of started) await call(tool, { background: { action: "stop", runId } }, ctx(root));
+  });
+
+  test("rejects foreground mutation while a background mutator owns the project root", async () => {
+    const root = tempDir();
+    writeMutatingAgent(root);
+    process.env.PI_SUBAGENT_BIN = writeHangingPi();
+    const started = await call(tool, { background: { action: "start", agent: "mutator", task: "run" }, agentScope: "project" }, ctx(root, { hasUI: true }));
+    const rejected = await call(tool, { agent: "mutator", task: "foreground", agentScope: "project" }, ctx(root, { hasUI: true }));
+    expect(rejected.isError).toBe(true);
+    expect(rejected.content[0].text).toContain("Background mutation rejected");
+    await call(tool, { background: { action: "stop", runId: started.details.background.runId } }, ctx(root, { hasUI: true }));
   });
 
   test("queues nested delegation without starving a full sibling fan-out", async () => {

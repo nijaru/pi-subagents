@@ -57,6 +57,19 @@ Use a workflow when the next agent depends on whether the previous run succeeded
 
 Use `parallel` for independent fan-out; workflows are for dependent branches and bounded retries.
 
+### Background runs
+
+Use background mode only when the child should outlive the current tool call. It is an in-memory, session-scoped lifecycle: `start` returns a run id, `status` observes one run or all retained runs, `result` retrieves a completed result, and `stop` cancels a run and waits for cleanup. Background runs do not survive Pi restart and currently support one child at a time, not batches or workflows.
+
+```json
+{"background":{"action":"start","agent":"explore","task":"Run the long investigation."}}
+{"background":{"action":"status","runId":"<run-id>"}}
+{"background":{"action":"result","runId":"<run-id>"}}
+{"background":{"action":"stop","runId":"<run-id>"}}
+```
+
+The registry allows four active and eight retained runs per extension instance. It shares the normal child supervisor, deadline, cancellation, process cleanup, and output bounds; it does not add persistence, worktrees, artifacts, or peer coordination.
+
 ## Agent definitions
 
 Bundled agents ship in this package. User definitions live in `~/.pi/agent/agents/*.md`; project definitions live in the nearest `.pi/agents/*.md` and require project trust plus an interactive confirmation.
@@ -135,7 +148,7 @@ Environment is allowlisted. Children automatically receive standard Pi model cre
 
 A top-level `model` override applies to every mode. A task/chain item may also specify `model`. Resolution is top-level/item override, then agent definition, then the parent pi model. Inheritance passes the parent `provider/id`; runtime-registered providers or credentials are not copied into the child process, so those require child Pi configuration or the explicit environment passthrough policy.
 
-Task inputs are capped at 100 KiB, and agent discovery reads at most 256 Markdown definitions from a bounded streaming directory scan, with 256 KiB per file and 4 MiB of file contents. The model-visible final result and each partial update use one deterministic 50 KiB output cap per tool call. Final assistant output is kept separately from bounded 16 KiB diagnostic message records; oversized provider metadata is omitted from retained message history, and valid structured values are included when they fit the bounded result details. A result is successful only after a terminal assistant response (`stop` or `length`); tool-use turns alone are failures. Result details expose explicit termination states for completed, failed, cancelled, and timed-out runs. The child stream is framed incrementally with a 1 MiB per-line guard: oversized or ignored protocol lines are skipped so verbose tool traffic cannot reject a later valid final response, while cancellation, timeouts, and child failures still terminate the process. Pi 0.84 token-level `message_update` deltas are intentionally ignored for parent previews; `message_end` remains authoritative and tool lifecycle events still provide coarse progress. Stream input, stderr, diagnostics, stored messages, and rendering are bounded separately and malformed result details render safely. Thrown tool errors retain pi-agent-core error semantics; pi itself may discard custom `Error` fields, so callers must not depend on structured details surviving an error boundary.
+Task inputs are capped at 100 KiB, and agent discovery reads at most 256 Markdown definitions from a bounded streaming directory scan, with 256 KiB per file and 4 MiB of file contents. The model-visible final result and each partial update use one deterministic 50 KiB output cap per tool call. Final assistant output is kept separately from bounded 16 KiB diagnostic message records; oversized provider metadata is omitted from retained message history, and valid structured values are included when they fit the bounded result details. A result is successful only after a terminal assistant response (`stop` or `length`); tool-use turns alone are failures. Result details expose explicit termination states for completed, failed, cancelled, and timed-out runs. The child stream is framed incrementally with a 1 MiB per-line guard: oversized or ignored protocol lines are skipped so verbose tool traffic cannot reject a later valid final response, while cancellation, timeouts, and child failures still terminate the process. Pi 0.84 token-level `message_update` deltas are intentionally ignored for parent previews; `message_end` remains authoritative and tool lifecycle events still provide coarse progress. Background runs retain at most four active and eight bounded handles per extension instance, reject same-root foreground/background mutation overlap, and clean their control state on completion, stop, or session shutdown. Stream input, stderr, diagnostics, stored messages, and rendering are bounded separately and malformed result details render safely. Thrown tool errors retain pi-agent-core error semantics; pi itself may discard custom `Error` fields, so callers must not depend on structured details surviving an error boundary.
 
 `action: "list"` returns the complete agent metadata to the model, while its successful result intentionally renders no body in the interactive TUI to avoid polluting the transcript.
 
@@ -147,7 +160,7 @@ The package targets the current Pi CLI/API used by its `@earendil-works/pi-*` 0.
 
 ## Future opt-ins
 
-Persistent sessions, background run registries, and managed worktrees are deliberately not implemented as a subsystem. They can be added later as explicit opt-in features with their own persistence, cleanup, and mutation policies.
+Persistent sessions and managed worktrees are deliberately not implemented as subsystems. They can be added later as explicit opt-in features with their own persistence, cleanup, and mutation policies.
 
 ## Development
 

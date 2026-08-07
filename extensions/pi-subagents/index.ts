@@ -50,6 +50,10 @@ const MAX_CHAIN_STEPS = 32;
 const MAX_WORKFLOW_STEPS = 16;
 /** Workflow transitions remain bounded by the root descendant budget. */
 const MAX_WORKFLOW_TRANSITIONS = MAX_DESCENDANTS;
+/** Maximum concurrently running top-level background children. */
+const MAX_BACKGROUND_ACTIVE = MAX_CONCURRENCY;
+/** Maximum background handles retained by one extension instance. */
+const MAX_BACKGROUND_RUNS = 8;
 const MAX_CHAIN_CONTEXT_BYTES = 50 * 1024;
 const MAX_STRUCTURED_OUTPUT_BYTES = MAX_OUTPUT_BYTES;
 const MAX_DELEGATION_POLICY_BYTES = 128 * 1024;
@@ -152,6 +156,21 @@ interface ChildSupervisor {
   runBatch(requests: ChildRunRequest[]): Promise<AgentResult[]>;
 }
 
+interface BackgroundRun {
+  details: BackgroundRunDetails;
+  task: string;
+  cwd: string;
+  agentScope: AgentScope;
+  projectAgentsDir: string | null;
+  projectRoot: string;
+  mutating: boolean;
+  control: ControlContext;
+  controller: AbortController;
+  result?: AgentResult;
+  promise?: Promise<AgentResult>;
+  cleanedUp: boolean;
+}
+
 export interface UsageSummary extends Usage {
   turns: number;
 }
@@ -180,10 +199,24 @@ export interface AgentResult {
   model?: string;
 }
 
+export type BackgroundRunStatus = "starting" | "running" | "completed" | "failed" | "cancelled" | "timed_out";
+
+export interface BackgroundRunDetails {
+  runId: string;
+  agent: string;
+  status: BackgroundRunStatus;
+  createdAt: number;
+  startedAt?: number;
+  finishedAt?: number;
+  progress?: string;
+}
+
 export interface SubagentDetails {
-  /** Identifies a successful metadata-only action with no user-facing body. */
-  action?: "list";
-  mode: "single" | "parallel" | "chain" | "workflow";
+  /** Identifies the background control action or metadata-only list action. */
+  action?: "list" | "start" | "status" | "result" | "stop";
+  mode: "single" | "parallel" | "chain" | "workflow" | "background";
+  background?: BackgroundRunDetails;
+  backgroundRuns?: BackgroundRunDetails[];
   agentScope: AgentScope;
   projectAgentsDir: string | null;
   runId: string;
@@ -1272,10 +1305,15 @@ function terminateProcessGroup(child: ChildProcess, signal: NodeJS.Signals): voi
 }
 
 /** Sweep only the detached root group after its leader exits. */
-function sweepRootProcessGroup(child: ChildProcess): void {
+async function sweepRootProcessGroup(child: ChildProcess): Promise<void> {
   if (!child.pid) return;
   if (process.platform === "win32") {
-    terminateProcessGroup(child, "SIGTERM");
+    await new Promise<void>((resolve) => {
+      const tree = spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore" });
+      tree.once("error", () => resolve());
+      tree.once("close", () => resolve());
+    });
+    await delay(100);
     return;
   }
   try {
@@ -1285,16 +1323,27 @@ function sweepRootProcessGroup(child: ChildProcess): void {
     // direct-child PID after the leader has already exited.
     return;
   }
-  setTimeout(() => {
+  const groupExists = () => {
     try {
       process.kill(-child.pid!, 0);
-      process.kill(-child.pid!, "SIGKILL");
+      return true;
     } catch {
-      // The group exited during the grace period.
+      return false;
     }
-  }, 5000);
-  // Keep the host alive through the grace period so an unresponsive
-  // descendant cannot outlive the delegation merely because the parent exits.
+  };
+  const waitForGroupExit = async (timeoutMs: number): Promise<void> => {
+    const deadline = Date.now() + timeoutMs;
+    while (groupExists() && Date.now() < deadline) await delay(25);
+  };
+  // Preserve the previous graceful-cleanup window before forcing the group.
+  await waitForGroupExit(5000);
+  if (!groupExists()) return;
+  try {
+    process.kill(-child.pid, "SIGKILL");
+  } catch {
+    return;
+  }
+  await waitForGroupExit(1000);
 }
 
 function addAssistantUsage(usage: UsageSummary, message: Message): void {
@@ -1351,6 +1400,8 @@ async function runPiProcess(
   const invocation = getPiInvocation(args);
   return new Promise((resolve) => {
     let settled = false;
+    let finishing = false;
+    let rootSweepPromise: Promise<void> | undefined;
     let aborted = false;
     let stderr = "";
     let trailing = "";
@@ -1363,18 +1414,22 @@ async function runPiProcess(
     let abortHandler: (() => void) | undefined;
 
     const finish = (result: ProcessResult) => {
-      if (settled) return;
-      // A nested leader can close before the escalation timer fires while a
-      // descendant ignores SIGTERM and does not hold an inherited pipe open.
-      // Force the retained tree snapshot before dropping the timer.
-      if (aborted || timedOut || eventError) {
-        terminateProcessTree(child, "SIGKILL");
-      }
-      settled = true;
-      if (killTimer) clearTimeout(killTimer);
-      if (processTimer) clearTimeout(processTimer);
-      if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
-      resolve({ ...result, stderr: truncateOutput(stderr) });
+      if (settled || finishing) return;
+      finishing = true;
+      void (async () => {
+        // A background run must not release mutation ownership while a
+        // descendant from its detached root group can still be alive.
+        if (rootSweepPromise) await rootSweepPromise;
+        // A nested leader can close before the escalation timer fires while a
+        // descendant ignores SIGTERM and does not hold an inherited pipe open.
+        // Force the retained tree snapshot before dropping the timer.
+        if (aborted || timedOut || eventError) terminateProcessTree(child, "SIGKILL");
+        settled = true;
+        if (killTimer) clearTimeout(killTimer);
+        if (processTimer) clearTimeout(processTimer);
+        if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
+        resolve({ ...result, stderr: truncateOutput(stderr) });
+      })();
     };
 
     let child: ChildProcess;
@@ -1394,7 +1449,7 @@ async function runPiProcess(
       const sweepRoot = () => {
         if (depth !== 0 || rootGroupSwept) return;
         rootGroupSwept = true;
-        sweepRootProcessGroup(child);
+        rootSweepPromise = sweepRootProcessGroup(child);
       };
       // `close` waits for stdio streams; a descendant can keep an inherited
       // pipe open after the leader exits. Sweep on `exit` first so that child
@@ -1798,6 +1853,60 @@ function copyResult(result: AgentResult): AgentResult {
   return { ...result, structuredOutput, messages: [...result.messages], usage: { ...result.usage, cost: { ...result.usage.cost } } };
 }
 
+function backgroundActive(run: BackgroundRun): boolean {
+  return run.details.status === "starting" || run.details.status === "running";
+}
+
+function backgroundStatus(result: AgentResult): BackgroundRunStatus {
+  if (result.termination === "cancelled") return "cancelled";
+  if (result.termination === "timed_out") return "timed_out";
+  return failed(result) ? "failed" : "completed";
+}
+
+function backgroundSummary(run: BackgroundRun): BackgroundRunDetails {
+  return { ...run.details, progress: run.details.progress ? truncateOutput(run.details.progress, MAX_DIAGNOSTIC_BYTES) : undefined };
+}
+
+function pruneBackgroundRuns(runs: Map<string, BackgroundRun>): void {
+  if (runs.size < MAX_BACKGROUND_RUNS) return;
+  const terminal = [...runs.values()]
+    .filter((run) => !backgroundActive(run) && run.cleanedUp)
+    .sort((left, right) => (left.details.finishedAt ?? left.details.createdAt) - (right.details.finishedAt ?? right.details.createdAt));
+  while (runs.size >= MAX_BACKGROUND_RUNS && terminal.length > 0) {
+    const run = terminal.shift()!;
+    runs.delete(run.details.runId);
+  }
+}
+
+function backgroundToolDetails(
+  action: SubagentDetails["action"],
+  run?: BackgroundRun,
+  results: AgentResult[] = [],
+  summaries: BackgroundRunDetails[] = [],
+): SubagentDetails {
+  return {
+    action,
+    mode: "background",
+    background: run ? backgroundSummary(run) : undefined,
+    backgroundRuns: summaries.length > 0
+      ? summaries.slice(-MAX_BACKGROUND_RUNS).map((summary) => ({ ...summary, progress: summary.progress ? truncateOutput(summary.progress, 512) : undefined }))
+      : undefined,
+    agentScope: run?.agentScope ?? "user",
+    projectAgentsDir: run?.projectAgentsDir ?? null,
+    runId: run?.details.runId ?? "background",
+    rootRunId: run?.control.rootRunId ?? "background",
+    depth: 0,
+    deadlineMs: run?.control.deadlineMs ?? 0,
+    results,
+  };
+}
+
+function backgroundText(run: BackgroundRun): string {
+  const status = run.details.status;
+  const progress = run.details.progress ? `\n${truncateOutput(run.details.progress, MAX_DIAGNOSTIC_BYTES)}` : "";
+  return `Background ${status}: ${run.details.agent} (${run.details.runId})${progress}`;
+}
+
 async function mapWithConcurrency<T>(items: T[], fn: (item: T, index: number) => Promise<AgentResult>): Promise<AgentResult[]> {
   const results: AgentResult[] = Array.from({ length: items.length });
   let next = 0;
@@ -1885,6 +1994,13 @@ const Workflow = Type.Object({
   steps: Type.Array(WorkflowStep, { description: `Bounded workflow nodes (maximum ${MAX_WORKFLOW_STEPS})`, maxItems: MAX_WORKFLOW_STEPS }),
 }, { additionalProperties: false });
 
+const Background = Type.Object({
+  action: StringEnum(["start", "status", "result", "stop"] as const, { description: "Background lifecycle action" }),
+  runId: Type.Optional(Type.String({ description: "Background run id for status, result, or stop", minLength: 1, maxLength: 64 })),
+  agent: Type.Optional(Type.String({ description: "Agent name for background start", minLength: 1, maxLength: 256 })),
+  task: Type.Optional(Type.String({ description: "Task for background start", minLength: 1, maxLength: MAX_TASK_BYTES })),
+}, { additionalProperties: false });
+
 const SubagentParamsSchema = Type.Object({
   action: Type.Optional(StringEnum(["list"] as const, { description: "List available agents" })),
   agent: Type.Optional(Type.String({ description: "Agent name for single mode", minLength: 1, maxLength: 256 })),
@@ -1892,6 +2008,7 @@ const SubagentParamsSchema = Type.Object({
   tasks: Type.Optional(Type.Array(TaskItem, { description: "Parallel tasks (maximum 8)", maxItems: MAX_PARALLEL_TASKS })),
   chain: Type.Optional(Type.Array(ChainItem, { description: "Sequential steps using {previous}", maxItems: MAX_CHAIN_STEPS })),
   workflow: Type.Optional(Workflow),
+  background: Type.Optional(Background),
   agentScope: Type.Optional(StringEnum(["user", "project", "both"] as const, { description: "Agent scope; bundled agents are always included" })),
   model: Type.Optional(Type.String({ description: "Model override, provider/model-id; applies to every mode" })),
   cwd: Type.Optional(Type.String({ description: "Working directory for the delegation" })),
@@ -1903,10 +2020,12 @@ function requestedAgentNames(params: SubagentParams): string[] {
   for (const task of params.tasks ?? []) names.add(task.agent.trim());
   for (const step of params.chain ?? []) names.add(step.agent.trim());
   for (const step of params.workflow?.steps ?? []) names.add(step.agent.trim());
+  if (params.background?.action === "start" && params.background.agent) names.add(params.background.agent.trim());
   return [...names];
 }
 
 function modeOf(params: SubagentParams): SubagentDetails["mode"] {
+  if (params.background !== undefined) return "background";
   if (params.workflow !== undefined) return "workflow";
   if (params.chain !== undefined) return "chain";
   if (params.tasks !== undefined) return "parallel";
@@ -2022,10 +2141,46 @@ function waitForChildren(children: ChildProcess[], timeoutMs: number): Promise<v
 }
 
 export default function (pi: ExtensionAPI) {
+  const backgroundRuns = new Map<string, BackgroundRun>();
+  const cleanupBackgroundRun = async (run: BackgroundRun): Promise<void> => {
+    if (run.cleanedUp) return;
+    if (!run.control.ownerDirectory) {
+      run.cleanedUp = true;
+      return;
+    }
+    try {
+      await fs.promises.rm(run.control.ownerDirectory, { recursive: true, force: true });
+      run.cleanedUp = true;
+    } catch {
+      // Retain the pending state so session shutdown can retry cleanup.
+    }
+  };
+  const activeBackgroundRuns = (): BackgroundRun[] => [...backgroundRuns.values()].filter(backgroundActive);
+  const waitForBackgrounds = async (runs: BackgroundRun[]): Promise<void> => {
+    if (runs.length === 0) return;
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout>;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      timer = setTimeout(done, 5000);
+      Promise.allSettled(runs.map((run) => run.promise)).then(done);
+    });
+  };
+
   // A detached process group is used so cancellation cannot kill the parent
   // pi process. Reap groups when the extension/session is shut down as well.
   if (typeof pi.on === "function") {
     pi.on("session_shutdown", async () => {
+      const backgrounds = activeBackgroundRuns();
+      for (const run of backgrounds) run.controller.abort();
+      await waitForBackgrounds(backgrounds);
+      await Promise.all([...backgroundRuns.values()].map((run) => cleanupBackgroundRun(run)));
+
       const children = [...activeChildren];
       if (children.length === 0) return;
       for (const child of children) terminateProcessTree(child, "SIGTERM");
@@ -2041,17 +2196,17 @@ export default function (pi: ExtensionAPI) {
     name: "subagent",
     label: "Subagent",
     description: [
-      "Delegate to specialized agents using exactly one mode: single (agent + task), parallel (tasks), sequential chain (chain with {previous}), or bounded workflow (workflow with success/failure branches).",
+      "Delegate to specialized agents using exactly one mode: single (agent + task), parallel (tasks), sequential chain (chain with {previous}), bounded workflow (workflow with success/failure branches), or explicit in-memory background lifecycle (background).",
       `Bundled agents are always available. User agents come from ${path.join(getAgentDir(), "agents")}; project agents come from ${CONFIG_DIR_NAME}/agents and require pi trust plus interactive confirmation.`,
       "All delegation runs in an isolated subprocess. A top-level model override applies to every mode; otherwise the parent model is inherited.",
-      "The only action is list. Model-visible output and partial updates share one deterministic 50KB cap per tool call.",
+      "The only top-level action is list; background actions are start, status, result, and stop inside background. Model-visible output and partial updates share one deterministic 50KB cap per tool call.",
     ].join(" "),
     parameters: SubagentParamsSchema,
     // The tool owns its own parallel mode and rejects unsafe same-project-root writes.
     // Serialize sibling top-level calls so two separate tool calls cannot
     // bypass that per-call mutation guard.
     executionMode: "sequential",
-    promptSnippet: "Delegate work to an isolated named subagent (single, parallel, chain, or bounded workflow).",
+    promptSnippet: "Delegate work to an isolated named subagent (single, parallel, chain, bounded workflow, or background run).",
     promptGuidelines: [
       "Call subagent in parallel only for independent tasks; potentially-mutating tasks sharing a project root are rejected.",
       "Call subagent in a chain when a later agent needs the previous agent's report.",
@@ -2100,8 +2255,9 @@ export default function (pi: ExtensionAPI) {
       const hasParallel = params.tasks !== undefined;
       const hasChain = params.chain !== undefined;
       const hasWorkflow = params.workflow !== undefined;
+      const hasBackground = params.background !== undefined;
 
-      if (params.action && (hasSingle || hasParallel || hasChain || hasWorkflow)) {
+      if (params.action && (hasSingle || hasParallel || hasChain || hasWorkflow || hasBackground)) {
         return toolResult("action=\"list\" cannot be combined with a delegation mode.", baseDetails("single", []), true);
       }
 
@@ -2134,9 +2290,9 @@ export default function (pi: ExtensionAPI) {
         return toolResult(lines.length ? `Available agents:\n${lines.join("\n")}` : "No agents found.", baseDetails("single", [], "list"));
       }
 
-      if (Number(hasSingle) + Number(hasParallel) + Number(hasChain) + Number(hasWorkflow) !== 1) {
+      if (Number(hasSingle) + Number(hasParallel) + Number(hasChain) + Number(hasWorkflow) + Number(hasBackground) !== 1) {
         return toolResult(
-          `Invalid parameters. Provide exactly one mode: agent + task, tasks[], chain[], or workflow.\nAvailable agents: ${availableText(visibleAgents)}`,
+          `Invalid parameters. Provide exactly one mode: agent + task, tasks[], chain[], workflow, or background.\nAvailable agents: ${availableText(visibleAgents)}`,
           baseDetails(modeOf(params), []),
           true,
         );
@@ -2152,6 +2308,56 @@ export default function (pi: ExtensionAPI) {
       }
       if (hasWorkflow && params.workflow!.steps.length === 0) {
         return toolResult("Workflow mode requires at least one step.", baseDetails("workflow", []), true);
+      }
+      if (hasBackground) {
+        const background = params.background!;
+        if (depth.depth > 0) {
+          return toolResult("Background runs are only available from the top-level Pi session.", baseDetails("background", []), true);
+        }
+        if (background.action === "start") {
+          if (!background.agent?.trim() || !background.task?.trim()) {
+            return toolResult("Background start requires both a non-blank agent and task.", baseDetails("background", []), true);
+          }
+          if (background.runId) {
+            return toolResult("Background start must not include runId.", baseDetails("background", []), true);
+          }
+          const backgroundAgent = discovery.agents.find((agent) => agent.name === background.agent!.trim());
+          if (backgroundAgent?.delegation) {
+            return toolResult("Background runs cannot use delegation-capable agents; start one child without nested delegation.", baseDetails("background", []), true);
+          }
+        } else {
+          if (background.agent !== undefined || background.task !== undefined || params.model !== undefined || params.cwd !== undefined) {
+            return toolResult(`Background ${background.action} accepts only runId.`, baseDetails("background", []), true);
+          }
+          if (!background.runId?.trim()) {
+            if (background.action !== "status") {
+              return toolResult(`Background ${background.action} requires runId.`, baseDetails("background", []), true);
+            }
+            const summaries = [...backgroundRuns.values()].map(backgroundSummary);
+            const text = summaries.length === 0
+              ? "No background runs."
+              : summaries.map((run) => `${run.agent} [${run.status}] (${run.runId})`).join("\n");
+            return toolResult(text, backgroundToolDetails("status", undefined, [], summaries));
+          }
+          const target = backgroundRuns.get(background.runId.trim());
+          if (!target) {
+            return toolResult(`Unknown background run: ${background.runId.trim()}.`, backgroundToolDetails(background.action), true);
+          }
+          if (background.action === "status") {
+            return toolResult(backgroundText(target), backgroundToolDetails("status", target, target.result ? [copyResult(target.result)] : []));
+          }
+          if (background.action === "stop") {
+            if (backgroundActive(target)) {
+              target.controller.abort();
+              if (target.promise) await target.promise;
+            }
+            return toolResult(backgroundText(target), backgroundToolDetails("stop", target, target.result ? [copyResult(target.result)] : []), target.details.status === "failed" || target.details.status === "timed_out");
+          }
+          if (backgroundActive(target)) {
+            return toolResult(`${backgroundText(target)}\nUse background status while it runs, then request result again.`, backgroundToolDetails("result", target, target.result ? [copyResult(target.result)] : []));
+          }
+          return toolResult(resultText(target.result!), backgroundToolDetails("result", target, target.result ? [copyResult(target.result)] : []), target.details.status !== "completed");
+        }
       }
       if (!hasValidItems(params)) {
         return toolResult("Agent names and tasks must not be blank.", baseDetails(modeOf(params), []), true);
@@ -2200,6 +2406,7 @@ export default function (pi: ExtensionAPI) {
         ...(params.tasks ?? []).map((item) => item.task),
         ...(params.chain ?? []).map((item) => item.task),
         ...(params.workflow?.steps ?? []).map((item) => item.task),
+        ...(hasBackground && params.background!.action === "start" ? [params.background!.task] : []),
       ];
       if (texts.some((text) => text !== undefined && Buffer.byteLength(text, "utf8") > MAX_TASK_BYTES)) {
         return toolResult(`Tasks must be at most ${MAX_TASK_BYTES} bytes.`, baseDetails(modeOf(params), []), true);
@@ -2219,10 +2426,13 @@ export default function (pi: ExtensionAPI) {
 
       const projectAgentNames = new Set(requestedProjectAgents(requestedAgentNames(params), discovery.agents).map((agent) => agent.name));
       const taskLocations = [
+        ...(hasSingle ? [{ agent: params.agent!, task: params.task!, cwd: undefined }] : []),
         ...(params.tasks ?? []),
         ...(params.chain ?? []),
         ...(params.workflow?.steps ?? []),
+        ...(hasBackground && params.background!.action === "start" ? [{ agent: params.background!.agent!, task: params.background!.task!, cwd: undefined }] : []),
       ];
+      const activeBackgroundMutationRoots = new Set(activeBackgroundRuns().filter((run) => run.mutating).map((run) => run.projectRoot));
       const parallelMutators = new Map<string, string[]>();
       for (const item of taskLocations) {
         const requestedCwd = cwdFor(rootCwd, item.cwd);
@@ -2232,16 +2442,24 @@ export default function (pi: ExtensionAPI) {
         }
         if (projectAgentNames.has(item.agent.trim()) && !isWithinDirectory(trustedProjectRoot, taskCwd)) {
           return toolResult(
-            `Project agent "${item.agent.trim()}" may only run within the trusted project root: ${trustedProjectRoot}`,
+            `Project agent "${item.agent.trim()}" may only run within the trusted project cwd (project root): ${trustedProjectRoot}`,
             baseDetails(modeOf(params), []),
             true,
           );
         }
-        if (hasParallel && potentiallyMutating(discovery.agents.find((agent) => agent.name === item.agent.trim()))) {
+        const mutating = potentiallyMutating(discovery.agents.find((agent) => agent.name === item.agent.trim()));
+        const conflictRoot = findNearestProjectRoot(taskCwd) ?? taskCwd;
+        if (mutating && activeBackgroundMutationRoots.has(conflictRoot)) {
+          return toolResult(
+            `Background mutation rejected: a background run already owns project root ${conflictRoot}. Stop it or use a distinct project root.`,
+            baseDetails(modeOf(params), []),
+            true,
+          );
+        }
+        if (hasParallel && mutating) {
           // Distinct subdirectories of one repository still share files and
           // Git state. Reject concurrent mutators at the nearest project root,
           // falling back to the canonical cwd outside recognized projects.
-          const conflictRoot = findNearestProjectRoot(taskCwd) ?? taskCwd;
           const names = parallelMutators.get(conflictRoot) ?? [];
           names.push(item.agent.trim());
           parallelMutators.set(conflictRoot, names);
@@ -2291,6 +2509,7 @@ export default function (pi: ExtensionAPI) {
         delegationPolicy: inheritedPolicy,
       };
       let yieldedReservation = false;
+      let backgroundTransferred = false;
       try {
         if (execution.reservationRunId) {
           yieldedReservation = await releaseChild(control, execution.reservationRunId);
@@ -2310,6 +2529,87 @@ export default function (pi: ExtensionAPI) {
       const emitSingle = (mode: SubagentDetails["mode"], results: AgentResult[], result: AgentResult, progress?: string) => {
         notify(progress ?? resultText(result), baseDetails(mode, results.map(copyResult)));
       };
+
+      if (hasBackground) {
+        const background = params.background!;
+        if (background.action !== "start") {
+          throw new Error(`Unsupported background action: ${background.action}`);
+        }
+        await Promise.all([...backgroundRuns.values()]
+          .filter((run) => !backgroundActive(run) && !run.cleanedUp)
+          .map((run) => cleanupBackgroundRun(run)));
+        pruneBackgroundRuns(backgroundRuns);
+        if (activeBackgroundRuns().length >= MAX_BACKGROUND_ACTIVE) {
+          return toolResult(`Too many active background runs. Maximum is ${MAX_BACKGROUND_ACTIVE}.`, backgroundToolDetails("start"), true);
+        }
+        if (backgroundRuns.size >= MAX_BACKGROUND_RUNS) {
+          return toolResult(`Too many retained background runs. Maximum is ${MAX_BACKGROUND_RUNS}. Retrieve or stop an existing run before starting another.`, backgroundToolDetails("start"), true);
+        }
+        const backgroundAgent = background.agent!.trim();
+        const backgroundMutating = potentiallyMutating(discovery.agents.find((agent) => agent.name === backgroundAgent));
+        const backgroundRun: BackgroundRun = {
+          details: {
+            runId: randomUUID(),
+            agent: backgroundAgent,
+            status: "starting",
+            createdAt: Date.now(),
+            startedAt: Date.now(),
+          },
+          task: background.task!,
+          cwd: rootCwd,
+          agentScope,
+          projectAgentsDir: discovery.projectAgentsDir,
+          projectRoot,
+          mutating: backgroundMutating,
+          control,
+          controller: new AbortController(),
+          cleanedUp: false,
+        };
+        backgroundRuns.set(backgroundRun.details.runId, backgroundRun);
+        backgroundTransferred = true;
+        const backgroundPromise = supervisor.run({
+          name: backgroundRun.details.agent,
+          task: backgroundRun.task,
+          cwd: backgroundRun.cwd,
+          modelOverride: params.model,
+          signal: backgroundRun.controller.signal,
+          emit: (current, progress) => {
+            backgroundRun.result = copyResult(current);
+            if (backgroundRun.details.status === "starting") backgroundRun.details.status = "running";
+            if (progress) backgroundRun.details.progress = truncateOutput(progress, MAX_DIAGNOSTIC_BYTES);
+          },
+        }).then((result) => {
+          backgroundRun.result = copyResult(result);
+          backgroundRun.details.status = backgroundStatus(result);
+          backgroundRun.details.finishedAt = Date.now();
+          backgroundRun.details.progress = truncateOutput(resultText(result), MAX_DIAGNOSTIC_BYTES);
+          return result;
+        }).catch((error) => {
+          const result: AgentResult = {
+            agent: backgroundRun.details.agent,
+            agentSource: "unknown",
+            task: truncateOutput(backgroundRun.task, MAX_DIAGNOSTIC_BYTES),
+            runId: backgroundRun.details.runId,
+            parentRunId: undefined,
+            rootRunId: backgroundRun.control.rootRunId,
+            depth: 1,
+            exitCode: 1,
+            stopReason: "error",
+            termination: "failed",
+            errorMessage: truncateOutput(error instanceof Error ? error.message : String(error), MAX_DIAGNOSTIC_BYTES),
+            stderr: "",
+            messages: [],
+            usage: emptyUsage(),
+          };
+          backgroundRun.result = result;
+          backgroundRun.details.status = "failed";
+          backgroundRun.details.finishedAt = Date.now();
+          backgroundRun.details.progress = truncateOutput(result.errorMessage ?? "Background run failed.", MAX_DIAGNOSTIC_BYTES);
+          return result;
+        }).finally(() => cleanupBackgroundRun(backgroundRun));
+        backgroundRun.promise = backgroundPromise;
+        return toolResult(`Started background run ${backgroundRun.details.runId} for ${backgroundRun.details.agent}.`, backgroundToolDetails("start", backgroundRun));
+      }
 
       if (hasSingle) {
         const result = await supervisor.run({
@@ -2481,22 +2781,26 @@ export default function (pi: ExtensionAPI) {
         if (yieldedReservation && execution.reservationRunId) {
           await reserveChild(control, execution.reservationRunId, signal, false);
         }
-        if (control.ownerDirectory) await fs.promises.rm(control.ownerDirectory, { recursive: true, force: true }).catch(() => {});
+        if (!backgroundTransferred && control.ownerDirectory) await fs.promises.rm(control.ownerDirectory, { recursive: true, force: true }).catch(() => {});
       }
     },
 
     renderCall(args, theme) {
       if (args.action === "list") return new Text(theme.fg("toolTitle", theme.bold("subagent list")), 0, 0);
       const scope = stripTerminalControls(args.agentScope ?? "user");
-      const label = args.workflow?.steps?.length
-        ? `workflow (${args.workflow.steps.length})`
-        : args.chain?.length
+      const label = args.background?.action
+        ? `background ${args.background.action}`
+        : args.workflow?.steps?.length
+          ? `workflow (${args.workflow.steps.length})`
+          : args.chain?.length
           ? `chain (${args.chain.length})`
           : args.tasks?.length
             ? `parallel (${args.tasks.length})`
             : stripTerminalControls(args.agent ?? "...");
       let text = `${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", label)}${theme.fg("muted", ` [${scope}]`)}`;
-      if (args.workflow?.steps?.length) {
+      if (args.background?.action === "start") {
+        text += `\n  ${theme.fg("accent", stripTerminalControls(args.background.agent ?? "..."))} ${theme.fg("dim", truncateChars(stripTerminalControls(args.background.task ?? ""), 80))}`;
+      } else if (args.workflow?.steps?.length) {
         for (const step of args.workflow.steps.slice(0, 3)) text += `\n  ${theme.fg("accent", stripTerminalControls(step.id))} ${theme.fg("dim", `${stripTerminalControls(step.agent)}: ${truncateChars(stripTerminalControls(step.task.replaceAll("{previous}", "").trim()), 52)}`)}`;
       } else if (args.chain?.length) {
         for (const [index, step] of args.chain.slice(0, 3).entries()) text += `\n  ${index + 1}. ${theme.fg("accent", stripTerminalControls(step.agent))} ${theme.fg("dim", truncateChars(stripTerminalControls(step.task.replaceAll("{previous}", "").trim()), 60))}`;
@@ -2517,7 +2821,7 @@ export default function (pi: ExtensionAPI) {
       const fallback = result.content[0]?.type === "text" && typeof result.content[0].text === "string"
         ? stripTerminalControls(truncateOutput(result.content[0].text, MAX_OUTPUT_BYTES))
         : "(no output)";
-      if (!details || !["single", "parallel", "chain", "workflow"].includes(details.mode) || !Array.isArray(details.results) || details.results.length === 0 || !details.results.every(isRenderableAgentResult)) return new Text(fallback, 0, 0);
+      if (!details || !["single", "parallel", "chain", "workflow", "background"].includes(details.mode) || !Array.isArray(details.results) || details.results.length === 0 || !details.results.every(isRenderableAgentResult)) return new Text(fallback, 0, 0);
 
       const renderBudget = { remaining: MAX_OUTPUT_BYTES };
       const takeRender = (value: string): string => {

@@ -1,7 +1,7 @@
 ---
 name: pi-subagents
 description: |
-  Delegate work to specialized agents with single-agent, parallel, sequential-chain, and bounded workflow modes.
+  Delegate work to specialized agents with single-agent, parallel, sequential-chain, bounded workflow, and session-scoped background modes.
   Use for review, implementation handoffs, and bounded recursive delegation.
 ---
 
@@ -19,10 +19,11 @@ The tool accepts exactly one mode:
 | Parallel | `{ tasks: [{ agent, task, model?, cwd? }] }` | Run up to 8 tasks with bounded concurrency |
 | Chain | `{ chain: [{ agent, task, model?, cwd? }] }` | Run steps serially; `{previous}` is the preceding final output |
 | Workflow | `{ workflow: { start?, steps: [{ id, agent, task, onSuccess?, onFailure? }] } }` | Follow bounded success/failure branches serially; `{previous}` is the prior result |
+| Background | `{ background: { action: "start"|"status"|"result"|"stop", runId?, agent?, task? } }` | Keep one child alive across tool calls in the current Pi session |
 
 Use the top-level `model` to override any mode. Resolution is top-level/item override → agent definition → parent pi model. `cwd` defaults to the current project directory. A chain stops at its first failed step; a workflow can branch on success or failure and may loop only within the root descendant budget. Use parallel for independent fan-out.
 
-`action: "list"` is the only action and cannot be combined with a delegation mode. Its successful metadata result is available to the model but intentionally renders no body in the interactive TUI.
+`action: "list"` is the only top-level action and cannot be combined with a delegation mode. Background lifecycle actions live inside `background`; `start` accepts one agent/task, `status` accepts an optional runId, and `result`/`stop` require runId. Background runs are in-memory and session-scoped; they do not survive Pi restart.
 
 ## Agent policy
 
@@ -64,4 +65,4 @@ Task input is capped at 100 KiB; discovery keeps at most 256 lexicographically e
 
 `pi-workflows` is a separate orchestration extension with private in-process SDK leaf sessions; it should not invoke this public tool as its worker backend. A future process-isolated workflow adapter, if needed, should be a private leaf runner rather than nested public scheduling.
 
-Persistent sessions, background registries, and managed worktrees are future explicit opt-ins, not part of this tool.
+Background runs are bounded to four active and eight retained handles per extension instance. Persistent sessions, managed worktrees, artifacts, and peer coordination remain future explicit opt-ins, not part of this tool.
