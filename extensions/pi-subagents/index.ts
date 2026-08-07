@@ -2600,7 +2600,6 @@ export default function (pi: ExtensionAPI) {
             agent: backgroundAgent,
             status: "starting",
             createdAt: Date.now(),
-            startedAt: Date.now(),
           },
           task: background.task!,
           cwd: rootCwd,
@@ -2622,13 +2621,15 @@ export default function (pi: ExtensionAPI) {
           signal: backgroundRun.controller.signal,
           emit: (current, progress) => {
             backgroundRun.result = copyResult(current);
+            if (current.startedAt !== undefined) backgroundRun.details.startedAt = current.startedAt;
+            if (current.finishedAt !== undefined) backgroundRun.details.finishedAt = current.finishedAt;
             if (backgroundRun.details.status === "starting") backgroundRun.details.status = "running";
             if (progress) backgroundRun.details.progress = truncateOutput(progress, MAX_DIAGNOSTIC_BYTES);
           },
         }).then((result) => {
           backgroundRun.result = copyResult(result);
           backgroundRun.details.status = backgroundStatus(result);
-          backgroundRun.details.finishedAt = Date.now();
+          backgroundRun.details.finishedAt = result.finishedAt ?? Date.now();
           backgroundRun.details.progress = truncateOutput(resultText(result), MAX_DIAGNOSTIC_BYTES);
           return result;
         }).catch((error) => {
