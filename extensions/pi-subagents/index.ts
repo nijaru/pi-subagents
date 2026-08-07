@@ -145,6 +145,7 @@ interface ChildRunRequest {
  */
 interface ChildSupervisor {
   run(request: ChildRunRequest): Promise<AgentResult>;
+  runBatch(requests: ChildRunRequest[]): Promise<AgentResult[]>;
 }
 
 export interface UsageSummary extends Usage {
@@ -1731,6 +1732,11 @@ class SubprocessChildSupervisor implements ChildSupervisor {
     if (reservation) await releaseChild(execution.control, result.runId);
   }
   }
+
+  /** Run an explicit bounded batch through the same root-wide supervisor. */
+  runBatch(requests: ChildRunRequest[]): Promise<AgentResult[]> {
+    return mapWithConcurrency(requests, (request) => this.run(request));
+  }
 }
 
 function failed(result: AgentResult): boolean {
@@ -2327,7 +2333,7 @@ export default function (pi: ExtensionAPI) {
       } catch {
         return toolResult(`Subagent update failed: ${updateFailure ?? "unknown update error"}`, baseDetails("parallel", current), true);
       }
-      const results = await mapWithConcurrency(params.tasks!, async (task, index) => supervisor.run({
+      const requests = params.tasks!.map((task, index): ChildRunRequest => ({
         name: task.agent.trim(),
         task: task.task,
         cwd: existingDirectory(cwdFor(rootCwd, task.cwd)) ?? cwdFor(rootCwd, task.cwd),
@@ -2339,6 +2345,7 @@ export default function (pi: ExtensionAPI) {
           notify(progress ?? `Parallel: ${done}/${current.length} done`, baseDetails("parallel", current.map(copyResult)));
         },
       }));
+      const results = await supervisor.runBatch(requests);
       const successCount = results.filter((result) => !failed(result)).length;
       const summary = results.map((result) => {
         const status = failed(result)
