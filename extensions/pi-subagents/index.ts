@@ -57,6 +57,7 @@ const MAX_BACKGROUND_RUNS = 8;
 const MAX_CHAIN_CONTEXT_BYTES = 50 * 1024;
 const MAX_STRUCTURED_OUTPUT_BYTES = MAX_OUTPUT_BYTES;
 const MAX_DELEGATION_POLICY_BYTES = 128 * 1024;
+const RUNTIME_UPDATE_INTERVAL_MS = 1_000;
 const CONTROL_LOCK_STALE_MS = 5_000;
 const CONTROL_LOCK_WAIT_MS = 10_000;
 const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
@@ -188,6 +189,9 @@ export interface AgentResult {
   rootRunId: string;
   depth: number;
   step?: number;
+  /** Wall-clock timestamps for user-visible runtime reporting. */
+  startedAt?: number;
+  finishedAt?: number;
   exitCode: number;
   stopReason?: StopReason;
   /** Distinguishes ordinary failure, cancellation, and timeout across the API boundary. */
@@ -514,6 +518,8 @@ function minimalAgentResult(result: AgentResult): AgentResult {
     rootRunId: result.rootRunId,
     depth: result.depth,
     step: result.step,
+    startedAt: result.startedAt,
+    finishedAt: result.finishedAt,
     exitCode: result.exitCode,
     stopReason: result.stopReason,
     termination: result.termination,
@@ -1645,7 +1651,11 @@ class SubprocessChildSupervisor implements ChildSupervisor {
   let updateError: string | undefined;
   let eventFailure: string | undefined;
   let terminalOutput: string | undefined;
+  let runtimeTimer: ReturnType<typeof setInterval> | undefined;
   const report = (progress: string, propagate = true) => {
+    if (result.exitCode !== -1 && result.startedAt !== undefined && result.finishedAt === undefined) {
+      result.finishedAt = Date.now();
+    }
     try {
       emit(result, progress);
     } catch (error) {
@@ -1669,6 +1679,15 @@ class SubprocessChildSupervisor implements ChildSupervisor {
       return result;
     }
     reservation = reservationResult.reservation;
+    result.startedAt = Date.now();
+    report(`Subagent running for ${formatDuration(result.startedAt)}.`);
+    runtimeTimer = setInterval(() => {
+      try {
+        emit(result, `Subagent running for ${formatDuration(result.startedAt)}.`);
+      } catch {
+        // Runtime display updates are best effort and must not fail the child.
+      }
+    }, RUNTIME_UPDATE_INTERVAL_MS);
     const args = ["--mode", "json", "-p", "--no-session"];
     if (result.model) args.push("--model", result.model);
     const tools = effectiveTools(agent);
@@ -1779,6 +1798,8 @@ class SubprocessChildSupervisor implements ChildSupervisor {
     report(result.errorMessage, false);
     return result;
   } finally {
+    if (runtimeTimer) clearInterval(runtimeTimer);
+    if (result.startedAt !== undefined && result.finishedAt === undefined) result.finishedAt = Date.now();
     if (tempDir) {
       try {
         await fs.promises.rm(tempDir, { recursive: true, force: true });
@@ -1834,11 +1855,31 @@ function isRenderableAgentResult(value: unknown): value is AgentResult {
     && typeof result.runId === "string"
     && typeof result.rootRunId === "string"
     && isFiniteNumber(result.depth)
+    && (result.startedAt === undefined || isFiniteNumber(result.startedAt))
+    && (result.finishedAt === undefined || isFiniteNumber(result.finishedAt))
     && isFiniteNumber(result.exitCode)
     && (result.termination === undefined || result.termination === "completed" || result.termination === "failed" || result.termination === "cancelled" || result.termination === "timed_out")
     && typeof result.stderr === "string"
     && Array.isArray(result.messages)
     && isRenderableUsage(result.usage);
+}
+
+function formatDuration(startedAt?: number, finishedAt?: number): string | undefined {
+  if (!isFiniteNumber(startedAt)) return undefined;
+  const end = isFiniteNumber(finishedAt) ? finishedAt : Date.now();
+  const totalSeconds = Math.max(0, Math.floor((end - startedAt) / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) return `${minutes}m ${seconds}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m ${seconds}s`;
+}
+
+function runtimeLabel(result: AgentResult): string {
+  const duration = formatDuration(result.startedAt, result.finishedAt);
+  if (!duration) return "";
+  return `${duration}${result.exitCode === -1 ? " elapsed" : ""}`;
 }
 
 function resultText(result: AgentResult): string {
@@ -1903,8 +1944,10 @@ function backgroundToolDetails(
 
 function backgroundText(run: BackgroundRun): string {
   const status = run.details.status;
+  const duration = formatDuration(run.details.startedAt, run.details.finishedAt);
+  const runtime = duration ? ` [${duration}${backgroundActive(run) ? " elapsed" : ""}]` : "";
   const progress = run.details.progress ? `\n${truncateOutput(run.details.progress, MAX_DIAGNOSTIC_BYTES)}` : "";
-  return `Background ${status}: ${run.details.agent} (${run.details.runId})${progress}`;
+  return `Background ${status}${runtime}: ${run.details.agent} (${run.details.runId})${progress}`;
 }
 
 async function mapWithConcurrency<T>(items: T[], fn: (item: T, index: number) => Promise<AgentResult>): Promise<AgentResult[]> {
@@ -2336,7 +2379,11 @@ export default function (pi: ExtensionAPI) {
             const summaries = [...backgroundRuns.values()].map(backgroundSummary);
             const text = summaries.length === 0
               ? "No background runs."
-              : summaries.map((run) => `${run.agent} [${run.status}] (${run.runId})`).join("\n");
+              : summaries.map((run) => {
+                const duration = formatDuration(run.startedAt, run.finishedAt);
+                const runtime = duration ? ` · ${duration}${run.status === "starting" || run.status === "running" ? " elapsed" : ""}` : "";
+                return `${run.agent} [${run.status}${runtime}] (${run.runId})`;
+              }).join("\n");
             return toolResult(text, backgroundToolDetails("status", undefined, [], summaries));
           }
           const target = backgroundRuns.get(background.runId.trim());
@@ -2848,7 +2895,8 @@ export default function (pi: ExtensionAPI) {
         for (const item of details.results) {
           container.addChild(new Spacer(1));
           const status = item.termination ?? item.stopReason;
-          container.addChild(new Text(`${iconFor(item)} ${theme.fg("accent", stripTerminalControls(item.agent))}${theme.fg("muted", ` (${stripTerminalControls(item.agentSource)})`)}${status ? theme.fg("dim", ` [${status}]`) : ""}`, 0, 0));
+          const runtime = runtimeLabel(item);
+          container.addChild(new Text(`${iconFor(item)} ${theme.fg("accent", stripTerminalControls(item.agent))}${theme.fg("muted", ` (${stripTerminalControls(item.agentSource)})`)}${status ? theme.fg("dim", ` [${status}]`) : ""}${runtime ? theme.fg("dim", ` · ${runtime}`) : ""}`, 0, 0));
           container.addChild(new Text(theme.fg("dim", takeRender(truncateChars(item.task, 500))), 0, 0));
           const output = renderOutput(item, true);
           if (output && output !== "(no output)") container.addChild(new Markdown(output.trim(), 0, 0, getMarkdownTheme()));
@@ -2861,7 +2909,8 @@ export default function (pi: ExtensionAPI) {
 
       let text = `${iconFor(headline)} ${theme.fg("toolTitle", theme.bold(details.mode))}`;
       for (const item of details.results) {
-        text += `\n\n${iconFor(item)} ${theme.fg("accent", stripTerminalControls(item.agent))}${theme.fg("muted", ` (${stripTerminalControls(item.agentSource)})`)}`;
+        const runtime = runtimeLabel(item);
+        text += `\n\n${iconFor(item)} ${theme.fg("accent", stripTerminalControls(item.agent))}${theme.fg("muted", ` (${stripTerminalControls(item.agentSource)})`)}${runtime ? theme.fg("dim", ` · ${runtime}`) : ""}`;
         text += `\n${theme.fg("toolOutput", truncateChars(renderOutput(item, false), 500))}`;
       }
       text += `\n${theme.fg("dim", formatUsage(aggregateUsage(details.results)))}`;

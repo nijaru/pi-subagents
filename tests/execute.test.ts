@@ -44,6 +44,17 @@ printf '%s\\n' '{"type":"message_end","message":{"role":"assistant","content":[{
   fs.chmodSync(script, 0o755);
   return script;
 }
+function writeDelayedPi(delayMs = 2_200): string {
+  const directory = tempDir();
+  const script = path.join(directory, "delayed-pi");
+  fs.writeFileSync(script, `#!/usr/bin/env bun
+await new Promise((resolve) => setTimeout(resolve, ${delayMs}));
+const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "delayed result" }], model: "fake/model", usage, stopReason: "stop", timestamp: 1 } }));
+`);
+  fs.chmodSync(script, 0o755);
+  return script;
+}
 function writeWorkflowBranchPi(): string {
   const directory = tempDir();
   const script = path.join(directory, "workflow-branch-pi");
@@ -958,6 +969,24 @@ describe("subprocess behavior", () => {
     expect(result.details.results).toEqual([]);
   });
 
+  test("reports elapsed runtime while a child is running", async () => {
+    const root = tempDir();
+    writeAgent(root);
+    process.env.PI_SUBAGENT_BIN = writeDelayedPi();
+    const updates: string[] = [];
+    const result = await call(tool, { agent: "test-agent", task: "wait", agentScope: "project" }, ctx(root, { hasUI: true }), undefined, (update) => {
+      const text = update.content?.find((part: any) => part.type === "text")?.text;
+      if (typeof text === "string") updates.push(text);
+    });
+    expect(result.isError).toBeUndefined();
+    const runtimeUpdates = updates.filter((text) => text.startsWith("Subagent running for "));
+    expect(runtimeUpdates.length).toBeGreaterThan(1);
+    expect(new Set(runtimeUpdates).size).toBeGreaterThan(1);
+    expect(result.details.results[0].startedAt).toBeTypeOf("number");
+    expect(result.details.results[0].finishedAt).toBeTypeOf("number");
+    expect(result.details.results[0].finishedAt).toBeGreaterThanOrEqual(result.details.results[0].startedAt);
+  });
+
   test("supports parallel and chain modes with model overrides", async () => {
     const root = tempDir();
     writeAgent(root);
@@ -996,7 +1025,7 @@ describe("rendering", () => {
       agentScope: "user",
       projectAgentsDir: null,
       results: [{
-        agent: "reviewer", agentSource: "bundled", task: "Review this", runId: "run-1", rootRunId: "root-1", depth: 1, exitCode: 0, stopReason: "stop",
+        agent: "reviewer", agentSource: "bundled", task: "Review this", runId: "run-1", rootRunId: "root-1", depth: 1, startedAt: 1_000, finishedAt: 3_000, exitCode: 0, stopReason: "stop",
         stderr: "", messages: [{ role: "assistant", content: [{ type: "text", text: "Done" }], usage: {
           input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
@@ -1006,11 +1035,12 @@ describe("rendering", () => {
     };
     const value = { content: [{ type: "text", text: "Done" }], details };
     expect(tool.renderResult(value, { expanded: false }, theme, {}).render(120).join("\n")).toContain("Done");
+    expect(tool.renderResult(value, { expanded: false }, theme, {}).render(120).join("\n")).toContain("2s");
     expect(tool.renderResult(value, { expanded: true }, theme, {}).render(120).join("\n")).toContain("Done");
     expect(tool.renderResult({ content: [{ type: "text", text: "failed" }], details: {} }, { expanded: false }, theme, {}).render(120).join("\n")).toContain("failed");
     const partial = {
       content: [{ type: "text", text: "Running read..." }],
-      details: { ...details, results: [{ ...details.results[0], exitCode: -1, messages: [] }] },
+      details: { ...details, results: [{ ...details.results[0], exitCode: -1, finishedAt: undefined, messages: [] }] },
     };
     expect(tool.renderResult(partial, { expanded: false }, theme, {}).render(120).join("\n")).toContain("Running read...");
     const recoveredWorkflow = {
