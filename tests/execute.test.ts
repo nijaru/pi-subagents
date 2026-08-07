@@ -690,6 +690,24 @@ describe("subprocess behavior", () => {
     expect(result.details.results[0].termination).toBe("cancelled");
   });
 
+  test("does not branch after workflow cancellation", async () => {
+    process.env.PI_SUBAGENT_BIN = writeHangingPi();
+    const controller = new AbortController();
+    const pending = call(tool, {
+      workflow: {
+        steps: [
+          { id: "run", agent: "worker", task: "run", onFailure: "fallback" },
+          { id: "fallback", agent: "worker", task: "fallback" },
+        ],
+      },
+    }, ctx(tempDir()), controller.signal);
+    setTimeout(() => controller.abort(), 25);
+    const result = await pending;
+    expect(result.isError).toBe(true);
+    expect(result.details.results).toHaveLength(1);
+    expect(result.details.results[0].termination).toBe("cancelled");
+  });
+
   test("queues nested delegation without starving a full sibling fan-out", async () => {
     const root = tempDir();
     const cwds = ["one", "two", "three", "four"].map((name) => {
@@ -871,7 +889,7 @@ describe("rendering", () => {
       agentScope: "user",
       projectAgentsDir: null,
       results: [{
-        agent: "reviewer", agentSource: "bundled", task: "Review this", exitCode: 0, stopReason: "stop",
+        agent: "reviewer", agentSource: "bundled", task: "Review this", runId: "run-1", rootRunId: "root-1", depth: 1, exitCode: 0, stopReason: "stop",
         stderr: "", messages: [{ role: "assistant", content: [{ type: "text", text: "Done" }], usage: {
           input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
@@ -888,5 +906,17 @@ describe("rendering", () => {
       details: { ...details, results: [{ ...details.results[0], exitCode: -1, messages: [] }] },
     };
     expect(tool.renderResult(partial, { expanded: false }, theme, {}).render(120).join("\n")).toContain("Running read...");
+    const recoveredWorkflow = {
+      content: [{ type: "text", text: "Done" }],
+      details: {
+        ...details,
+        mode: "workflow",
+        results: [
+          { ...details.results[0], exitCode: 1, stopReason: "error", termination: "failed", errorMessage: "failed" },
+          details.results[0],
+        ],
+      },
+    };
+    expect(tool.renderResult(recoveredWorkflow, { expanded: false }, theme, {}).render(120).join("\n")).toContain("✓ workflow");
   });
 });

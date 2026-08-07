@@ -1755,6 +1755,12 @@ function failed(result: AgentResult): boolean {
   );
 }
 
+function terminalWorkflowFailure(result: AgentResult, signal?: AbortSignal): boolean {
+  if (signal?.aborted || result.termination === "cancelled" || result.termination === "timed_out") return true;
+  const diagnostic = result.errorMessage ?? "";
+  return /Root (?:descendant budget exhausted|subagent deadline reached)|Timed out acquiring subagent control state lock|reservation is missing|control state is malformed/i.test(diagnostic);
+}
+
 function isRenderableUsage(value: unknown): value is UsageSummary {
   if (!value || typeof value !== "object") return false;
   const usage = value as Record<string, unknown>;
@@ -2365,6 +2371,9 @@ export default function (pi: ExtensionAPI) {
           results.push(result);
           const failedRun = failed(result);
           previous = truncateOutput(result.output || resultText(result), MAX_CHAIN_CONTEXT_BYTES);
+          if (failedRun && terminalWorkflowFailure(result, signal)) {
+            return toolResult(`Workflow stopped at ${step.id} (${step.agent}): ${resultText(result)}`, baseDetails("workflow", results), true);
+          }
           const next = failedRun ? step.onFailure : step.onSuccess;
           if (!next) {
             if (failedRun) {
@@ -2527,10 +2536,13 @@ export default function (pi: ExtensionAPI) {
         }
         return takeRender(full ? output : output.split("\n").slice(0, 5).join("\n"));
       };
+      const headline = details.mode === "workflow"
+        ? details.results[details.results.length - 1]!
+        : details.results.some(failed) ? details.results.find(failed)! : details.results[0]!;
 
       if (expanded) {
         const container = new Container();
-        container.addChild(new Text(`${iconFor(details.results.some(failed) ? details.results.find(failed)! : details.results[0]!)} ${theme.fg("toolTitle", theme.bold(details.mode))}`, 0, 0));
+        container.addChild(new Text(`${iconFor(headline)} ${theme.fg("toolTitle", theme.bold(details.mode))}`, 0, 0));
         for (const item of details.results) {
           container.addChild(new Spacer(1));
           const status = item.termination ?? item.stopReason;
@@ -2545,7 +2557,7 @@ export default function (pi: ExtensionAPI) {
         return container;
       }
 
-      let text = `${iconFor(details.results.some(failed) ? details.results.find(failed)! : details.results[0]!)} ${theme.fg("toolTitle", theme.bold(details.mode))}`;
+      let text = `${iconFor(headline)} ${theme.fg("toolTitle", theme.bold(details.mode))}`;
       for (const item of details.results) {
         text += `\n\n${iconFor(item)} ${theme.fg("accent", stripTerminalControls(item.agent))}${theme.fg("muted", ` (${stripTerminalControls(item.agentSource)})`)}`;
         text += `\n${theme.fg("toolOutput", truncateChars(renderOutput(item, false), 500))}`;
