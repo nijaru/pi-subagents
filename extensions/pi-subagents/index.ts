@@ -1600,6 +1600,7 @@ class SubprocessChildSupervisor implements ChildSupervisor {
     private readonly agents: AgentConfig[],
     private readonly execution: ExecutionContext,
     private readonly parentModel: Model<any> | undefined,
+    private readonly parentThinkingLevel: string | undefined,
   ) {}
 
   /**
@@ -1690,6 +1691,9 @@ class SubprocessChildSupervisor implements ChildSupervisor {
     }, RUNTIME_UPDATE_INTERVAL_MS);
     const args = ["--mode", "json", "-p", "--no-session"];
     if (result.model) args.push("--model", result.model);
+    // Inherit the parent's reasoning effort only when the agent keeps the
+    // parent's model; an overridden model may not support the same levels.
+    if (!agent.model && this.parentThinkingLevel) args.push("--thinking", this.parentThinkingLevel);
     const tools = effectiveTools(agent);
     if (tools.length > 0) args.push("--tools", tools.join(","));
     else args.push("--no-tools");
@@ -2563,7 +2567,7 @@ export default function (pi: ExtensionAPI) {
           if (!yieldedReservation) throw new Error("Nested subagent reservation is missing; refusing to run without an owned capacity slot.");
         }
         const parentModel = ctx.model;
-        const supervisor: ChildSupervisor = new SubprocessChildSupervisor(discovery.agents, execution, parentModel);
+        const supervisor: ChildSupervisor = new SubprocessChildSupervisor(discovery.agents, execution, parentModel, ctx.thinkingLevel);
         let updateFailure: string | undefined;
       const notify = (text: string, details: SubagentDetails) => {
         try {
