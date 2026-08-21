@@ -465,6 +465,24 @@ describe("subprocess behavior", () => {
     expect(args.join(" ")).not.toContain("Task: run");
   });
 
+  test("resolves thinking from frontmatter before the inherited level", async () => {
+    const root = tempDir();
+    const agentsDir = path.join(root, ".pi", "agents");
+    fs.mkdirSync(agentsDir, { recursive: true });
+    fs.writeFileSync(path.join(agentsDir, "test-agent.md"), "---\nname: test-agent\ndescription: Test agent\ncapability: read\nthinking: low\n---\nYou are a test agent.\n");
+    fs.writeFileSync(path.join(agentsDir, "inheriting.md"), "---\nname: inheriting\ndescription: Test agent\ncapability: read\n---\nYou are a test agent.\n");
+    process.env.PI_SUBAGENT_BIN = writeFakePi();
+    const context = ctx(root, { hasUI: true, thinkingLevel: "high" });
+    const readArgs = () => fs.readFileSync(`${process.env.PI_SUBAGENT_BIN}.args`, "utf8").split("\n").filter(Boolean);
+
+    await call(tool, { agent: "test-agent", task: "run", agentScope: "project" }, context);
+    expect(readArgs()).toContain("low");
+    await call(tool, { agent: "inheriting", task: "run", agentScope: "project" }, context);
+    expect(readArgs()).toContain("high");
+    await call(tool, { agent: "test-agent", task: "run", agentScope: "project" }, ctx(root, { hasUI: true }));
+    expect(readArgs()).toContain("low");
+  });
+
   test("validates opt-in structured output and exposes the parsed value", async () => {
     const root = tempDir();
     writeStructuredAgent(root);

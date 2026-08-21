@@ -105,6 +105,15 @@ describe("agent discovery", () => {
     expect(agent).toMatchObject({ delegation: true, capability: "write", tools: ["read", "subagent"] });
   });
 
+  test("parses thinking levels and skips unknown values", () => {
+    const directory = tempDir();
+    writeAgent(directory, "low.md", "low", "\nthinking: low");
+    writeAgent(directory, "bad.md", "bad", "\nthinking: extreme");
+    const agents = loadAgentsFromDir(directory, "user");
+    expect(agents).toHaveLength(1);
+    expect(agents[0]).toMatchObject({ name: "low", thinking: "low" });
+  });
+
   test("parses bounded structured output schemas", () => {
     const directory = tempDir();
     fs.writeFileSync(path.join(directory, "structured.md"), `---

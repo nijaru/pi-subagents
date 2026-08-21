@@ -27,7 +27,7 @@ Use the top-level `model` to override any mode. Resolution is top-level/item ove
 
 ## Agent policy
 
-Definitions are Markdown files with YAML frontmatter. Required: `name`, `description`. Optional: `model`, `tools`, `capability`, and `delegation`.
+Definitions are Markdown files with YAML frontmatter. Required: `name`, `description`. Optional: `model`, `thinking`, `tools`, `capability`, and `delegation`. `thinking` sets an explicit reasoning effort (`minimal`…`max`); without it the child inherits the parent session's level.
 
 - `tools` is an explicit allowlist. Missing tools means the child receives `--no-tools`, not pi's defaults.
 - `capability: read` is effect metadata for scheduling safety, not a security sandbox; `capability: write` marks it potentially mutating. Omitted capability is conservatively potentially mutating. A read profile is accepted only with the known read-only tools (`read`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `web_research`, `source_check`, `fetch_content`, `get_search_content`, `resolve-library-id`, or `query-docs`) and cannot delegate; unknown or mutation-capable tools invalidate the definition.

@@ -30,7 +30,7 @@ tests/                              # deterministic discovery, runner, and tool 
 
 ## Agent Definitions
 
-Markdown + YAML frontmatter in `~/.pi/agent/agents/` (user) or `.pi/agents/` (project). Bundled definitions ship in `agents/`. Required: `name`, `description`. Optional: `model`, explicit `tools`, `delegation`, and `capability`.
+Markdown + YAML frontmatter in `~/.pi/agent/agents/` (user) or `.pi/agents/` (project). Bundled definitions ship in `agents/`. Required: `name`, `description`. Optional: `model`, `thinking`, explicit `tools`, `delegation`, and `capability`.
 
 ```markdown
 ---

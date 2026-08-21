@@ -1691,9 +1691,11 @@ class SubprocessChildSupervisor implements ChildSupervisor {
     }, RUNTIME_UPDATE_INTERVAL_MS);
     const args = ["--mode", "json", "-p", "--no-session"];
     if (result.model) args.push("--model", result.model);
-    // Inherit the parent's reasoning effort only when the agent keeps the
-    // parent's model; an overridden model may not support the same levels.
-    if (!agent.model && this.parentThinkingLevel) args.push("--thinking", this.parentThinkingLevel);
+    // Explicit agent frontmatter wins, then the parent's session level. Pi
+    // maps generic levels per model and drops them for non-reasoning models,
+    // so inheritance is safe across a model override.
+    const thinking = agent.thinking ?? this.parentThinkingLevel;
+    if (thinking) args.push("--thinking", thinking);
     const tools = effectiveTools(agent);
     if (tools.length > 0) args.push("--tools", tools.join(","));
     else args.push("--no-tools");

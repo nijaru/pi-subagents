@@ -18,10 +18,17 @@ export type AgentSource = "bundled" | "user" | "project";
 export type AgentCapability = "read" | "write";
 export type AgentOutputSchema = Record<string, unknown>;
 
+/** Pi's generic thinking-level vocabulary; providers map levels per model. */
+export type AgentThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+const THINKING_LEVELS: readonly AgentThinkingLevel[] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
 export interface AgentConfig {
   name: string;
   description: string;
   model?: string;
+  /** Explicit reasoning effort; overrides inherited parent level. */
+  thinking?: AgentThinkingLevel;
   /** Explicit tool allowlist. Missing means no tools, not all tools. */
   tools?: string[];
   /** Nested delegation is opt-in and defaults to false. */
@@ -348,6 +355,7 @@ export function loadAgentsFromDir(directory: string, source: AgentSource): Agent
     const model = typeof parsed.frontmatter.model === "string" && parsed.frontmatter.model.trim()
       ? parsed.frontmatter.model.trim()
       : undefined;
+    const thinking = THINKING_LEVELS.find((level) => level === parsed.frontmatter.thinking);
     const delegation = parseDelegation(parsed.frontmatter.delegation);
     const capability = parseCapability(parsed.frontmatter.capability);
     const tools = parseTools(parsed.frontmatter.tools);
@@ -357,6 +365,7 @@ export function loadAgentsFromDir(directory: string, source: AgentSource): Agent
     // Invalid control metadata is not allowed to silently become a broader
     // policy. The definition is skipped rather than treated as unrestricted.
     if (delegation === undefined || parsed.frontmatter.capability !== undefined && capability === undefined) continue;
+    if (parsed.frontmatter.thinking !== undefined && thinking === undefined) continue;
     if (parsed.frontmatter.outputSchema !== undefined && outputSchema === undefined) continue;
     if (parsed.frontmatter.allowedAgents !== undefined && allowedAgents === undefined) continue;
     if (parsed.frontmatter.maxDelegationDepth !== undefined && maxDelegationDepth === undefined) continue;
@@ -365,6 +374,7 @@ export function loadAgentsFromDir(directory: string, source: AgentSource): Agent
       name: name.trim(),
       description: description.trim(),
       model,
+      thinking,
       tools,
       delegation,
       capability,
