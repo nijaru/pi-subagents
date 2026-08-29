@@ -987,7 +987,7 @@ describe("subprocess behavior", () => {
     expect(result.details.results).toEqual([]);
   });
 
-  test("reports elapsed runtime while a child is running", async () => {
+  test("reports a live heartbeat while a child is running", async () => {
     const root = tempDir();
     writeAgent(root);
     process.env.PI_SUBAGENT_BIN = writeDelayedPi();
@@ -997,9 +997,8 @@ describe("subprocess behavior", () => {
       if (typeof text === "string") updates.push(text);
     });
     expect(result.isError).toBeUndefined();
-    const runtimeUpdates = updates.filter((text) => text.startsWith("Subagent running for "));
+    const runtimeUpdates = updates.filter((text) => text === "Working...");
     expect(runtimeUpdates.length).toBeGreaterThan(1);
-    expect(new Set(runtimeUpdates).size).toBeGreaterThan(1);
     expect(result.details.results[0].startedAt).toBeTypeOf("number");
     expect(result.details.results[0].finishedAt).toBeTypeOf("number");
     expect(result.details.results[0].finishedAt).toBeGreaterThanOrEqual(result.details.results[0].startedAt);
@@ -1060,7 +1059,34 @@ describe("rendering", () => {
       content: [{ type: "text", text: "Running read..." }],
       details: { ...details, results: [{ ...details.results[0], exitCode: -1, finishedAt: undefined, messages: [] }] },
     };
-    expect(tool.renderResult(partial, { expanded: false }, theme, {}).render(120).join("\n")).toContain("Running read...");
+    const partialText = tool.renderResult(partial, { expanded: false }, theme, {}).render(120).join("\n");
+    expect(partialText).toContain("reviewer (bundled) · ");
+    expect(partialText).toContain("elapsed");
+    expect(partialText).not.toContain("Running read...");
+    const parallelResults = Array.from({ length: 5 }, (_, index) => ({
+      ...details.results[0],
+      agent: `worker-${index + 1}`,
+      runId: `parallel-${index + 1}`,
+      startedAt: index === 0 ? Date.now() - 2_000 : undefined,
+      finishedAt: undefined,
+      exitCode: -1,
+      messages: [],
+      output: undefined,
+    }));
+    const parallelText = tool.renderResult({
+      content: [{ type: "text", text: "Parallel: 0/5 done" }],
+      details: { ...details, mode: "parallel", results: parallelResults },
+    }, { expanded: false }, theme, {}).render(120).join("\n");
+    expect(parallelText).toContain("5 subagents · 1 running · 4 queued");
+    expect(parallelText).not.toContain("worker-1");
+    const smallParallelText = tool.renderResult({
+      content: [{ type: "text", text: "Parallel: 0/3 done" }],
+      details: { ...details, mode: "parallel", results: parallelResults.slice(0, 3) },
+    }, { expanded: false }, theme, {}).render(120).join("\n");
+    expect(smallParallelText.split("\n")).toHaveLength(4);
+    expect(smallParallelText).toContain("worker-1");
+    expect(smallParallelText).toContain("worker-2");
+    expect(smallParallelText).toContain("worker-3");
     const recoveredWorkflow = {
       content: [{ type: "text", text: "Done" }],
       details: {

@@ -58,6 +58,7 @@ const MAX_CHAIN_CONTEXT_BYTES = 50 * 1024;
 const MAX_STRUCTURED_OUTPUT_BYTES = MAX_OUTPUT_BYTES;
 const MAX_DELEGATION_POLICY_BYTES = 128 * 1024;
 const RUNTIME_UPDATE_INTERVAL_MS = 1_000;
+const RUNNING_PROGRESS_TEXT = "Working...";
 const CONTROL_LOCK_STALE_MS = 5_000;
 const CONTROL_LOCK_WAIT_MS = 10_000;
 const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
@@ -1681,10 +1682,10 @@ class SubprocessChildSupervisor implements ChildSupervisor {
     }
     reservation = reservationResult.reservation;
     result.startedAt = Date.now();
-    report(`Subagent running for ${formatDuration(result.startedAt)}.`);
+    report(RUNNING_PROGRESS_TEXT);
     runtimeTimer = setInterval(() => {
       try {
-        emit(result, `Subagent running for ${formatDuration(result.startedAt)}.`);
+        emit(result, RUNNING_PROGRESS_TEXT);
       } catch {
         // Runtime display updates are best effort and must not fail the child.
       }
@@ -2885,6 +2886,10 @@ export default function (pi: ExtensionAPI) {
         return bounded;
       };
       const iconFor = (item: AgentResult) => item.exitCode === -1 ? theme.fg("warning", "⏳") : failed(item) ? theme.fg("error", "✗") : theme.fg("success", "✓");
+      const statusLine = (item: AgentResult): string => {
+        const runtime = runtimeLabel(item);
+        return `${iconFor(item)} ${theme.fg("accent", stripTerminalControls(item.agent))}${theme.fg("muted", ` (${stripTerminalControls(item.agentSource)})`)}${runtime ? theme.fg("dim", ` · ${runtime}`) : ""}`;
+      };
       const renderOutput = (item: AgentResult, full: boolean) => {
         const output = resultText(item);
         if (item.exitCode === -1 && output === "(no output)") {
@@ -2892,9 +2897,12 @@ export default function (pi: ExtensionAPI) {
         }
         return takeRender(full ? output : output.split("\n").slice(0, 5).join("\n"));
       };
-      const headline = details.mode === "workflow"
-        ? details.results[details.results.length - 1]!
-        : details.results.some(failed) ? details.results.find(failed)! : details.results[0]!;
+      const hasActive = details.results.some((item) => item.exitCode === -1);
+      const headline = hasActive
+        ? details.results.find((item) => item.exitCode === -1)!
+        : details.mode === "workflow"
+          ? details.results[details.results.length - 1]!
+          : details.results.some(failed) ? details.results.find(failed)! : details.results[0]!;
 
       if (expanded) {
         const container = new Container();
@@ -2915,9 +2923,38 @@ export default function (pi: ExtensionAPI) {
       }
 
       let text = `${iconFor(headline)} ${theme.fg("toolTitle", theme.bold(details.mode))}`;
+      if (hasActive) {
+        if (details.mode === "parallel") {
+          if (details.results.length <= MAX_CONCURRENCY) {
+            for (const item of details.results) text += `\n${statusLine(item)}`;
+          } else {
+            const active = details.results.filter((item) => item.exitCode === -1);
+            const running = active.filter((item) => isFiniteNumber(item.startedAt)).length;
+            const queued = active.length - running;
+            const complete = details.results.length - active.length;
+            const counts = [`${details.results.length} subagents`, `${running} running`];
+            if (queued) counts.push(`${queued} queued`);
+            if (complete) counts.push(`${complete} complete`);
+            const startedAt = details.results
+              .map((item) => item.startedAt)
+              .filter(isFiniteNumber)
+              .sort((left, right) => left - right)[0];
+            const elapsed = formatDuration(startedAt);
+            text += `\n${theme.fg("warning", "⏳")} ${theme.fg("accent", counts.join(" · "))}${elapsed ? theme.fg("dim", ` · ${elapsed} elapsed`) : ""}`;
+          }
+        } else if (details.mode === "single") {
+          text += `\n${statusLine(headline)}`;
+        } else {
+          const current = details.results.find((item) => item.exitCode === -1) ?? headline;
+          const completed = details.results.filter((item) => item.exitCode !== -1).length;
+          const step = current.step ? theme.fg("dim", ` · step ${current.step}`) : "";
+          const prior = completed ? theme.fg("dim", ` · ${completed} complete`) : "";
+          text += `\n${statusLine(current)}${step}${prior}`;
+        }
+        return new Text(text, 0, 0);
+      }
       for (const item of details.results) {
-        const runtime = runtimeLabel(item);
-        text += `\n\n${iconFor(item)} ${theme.fg("accent", stripTerminalControls(item.agent))}${theme.fg("muted", ` (${stripTerminalControls(item.agentSource)})`)}${runtime ? theme.fg("dim", ` · ${runtime}`) : ""}`;
+        text += `\n\n${statusLine(item)}`;
         text += `\n${theme.fg("toolOutput", truncateChars(renderOutput(item, false), 500))}`;
       }
       text += `\n${theme.fg("dim", formatUsage(aggregateUsage(details.results)))}`;
