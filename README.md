@@ -77,7 +77,7 @@ Bundled agents ship in this package. User definitions live in `~/.pi/agent/agent
 ```markdown
 ---
 name: reviewer
-description: Review code for correctness
+description: Use when a finished change needs independent fresh-context review.
 capability: read
 tools: read, grep, find, ls
 ---
@@ -85,12 +85,14 @@ tools: read, grep, find, ls
 Review the requested code and report concrete findings.
 ```
 
+Pi selects agents from their name, description, and the parent task. Keep descriptions focused on **when to delegate**; put procedure and output detail in the body.
+
 Frontmatter fields:
 
 - `name` and `description` are required.
-- `tools` is an explicit Pi tool allowlist. If omitted, the child gets no tools; it never inherits all tools. Supported Pi built-ins include `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`. Tool names are passed through unchanged, so installed extension names must match exactly. Common current research tools include `web_search`, `source_check`, `fetch_content`, `get_search_content`, `resolve-library-id`, and `query-docs`; `web_search` can use Exa with `provider: "exa"`. The unified `mcp` proxy is also available when `pi-mcp-adapter` is installed.
-- `capability` is effect metadata for scheduling safety, not a security sandbox. Omitted capability is conservatively treated as potentially mutating for parallel safety. A `read` profile must use only the known read-only tools (`read`, `grep`, `find`, `ls`, `web_search`, `source_check`, `fetch_content`, `get_search_content`, `resolve-library-id`, or `query-docs`) and cannot delegate; unknown or mutation-capable tools invalidate the definition.
-- `delegation: true` explicitly permits nested use of `subagent`; it defaults to `false`. Delegation is itself potentially mutating, so delegation-capable profiles must use `capability: write` or omit the capability. The bundled `architect` and `worker` are delegation-capable. Other bundled agents are leaves.
+- `tools` is an explicit Pi tool allowlist. If omitted, the child gets no tools; it never inherits all tools. Supported Pi built-ins include `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`. Tool names are passed through unchanged, so installed extension names must match exactly. Common current research tools include `web_search`, `web_fetch`, `web_research`, `resolve-library-id`, and `query-docs`. The unified `mcp` proxy is also available when `pi-mcp-adapter` is installed.
+- `capability` is effect metadata for scheduling safety, not a security sandbox. Omitted capability is conservatively treated as potentially mutating for parallel safety. A `read` profile must use only the known read-only tools (`read`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `web_research`, `resolve-library-id`, or `query-docs`) and cannot delegate; unknown or mutation-capable tools invalidate the definition.
+- `delegation: true` explicitly permits nested use of `subagent`; it defaults to `false`. Delegation is itself potentially mutating, so delegation-capable profiles must use `capability: write` or omit the capability. Bundled agents are leaves by default; custom definitions can opt into bounded nested delegation when the role genuinely owns coordination.
 - `model` is optional and otherwise inherits the parent model.
 - `thinking` is an optional reasoning effort (`minimal`, `low`, `medium`, `high`, `xhigh`, or `max`). Without it, the child inherits the parent session's thinking level; pi maps generic levels per model and drops them for non-reasoning models, so inheritance is safe across a model override.
 - `outputSchema` is an optional bounded TypeBox-compatible JSON Schema. When present, the child is instructed to return raw JSON only; a malformed or non-matching terminal response is a failed delegation. Schemas are limited to 16 KiB and local `$ref` values.
@@ -105,7 +107,7 @@ Opt in per agent when downstream steps need typed data:
 ```markdown
 ---
 name: analyst
-description: Return a compact analysis
+description: Use when a downstream workflow needs a compact structured analysis.
 outputSchema:
   type: object
   properties:
@@ -128,7 +130,7 @@ Nested delegation can be narrowed per agent:
 ```markdown
 ---
 name: coordinator
-description: Coordinate only review work
+description: Use when one bounded coordinator should delegate only review work.
 delegation: true
 capability: write
 allowedAgents: [reviewer, researcher]
@@ -145,7 +147,7 @@ Every delegation starts a fresh `pi --mode json -p --no-session` subprocess. Tas
 
 Nested delegation is bounded by depth 3, a root-wide budget of 32 descendants, a shared limit of four active child slots, at most 16 declared workflow nodes, and one root deadline. Nested callers temporarily yield their parent slot while waiting for descendants, so recursive delegation does not starve behind a full sibling fan-out; the slot count is active work capacity, not a promise that waiting ancestor processes consume no memory. These are guardrails, not a hostile-code sandbox: a Bash-capable child can intentionally launch processes outside the extension's control file or process group. Controls are propagated through ephemeral mode-0600 files and environment IDs; state publication is atomic, policy transport is bounded to 128 KiB, and malformed control state fails closed. Each child has a 30-minute hard timeout, configurable up to two hours with `PI_SUBAGENT_TIMEOUT_MS` and bounded by the root deadline.
 
-Environment is allowlisted. Children automatically receive standard Pi model credential variables, every `$VAR` reference from `~/.pi/agent/models.json`, and credential-shaped `*_API_KEY`/`*_TOKEN` variables. This lets nested agents use model, Exa, Context7, GitHub, and similar credentials without manual setup while still excluding arbitrary application environment. `PI_SUBAGENT_PASSTHROUGH_ENV` supports exact names and globs for non-credential variables; `*` passes all env and is an explicit insecure opt-in. Best practice: store keys via `pi /login` into `~/.pi/agent/auth.json` when supported.
+Environment is allowlisted. Children automatically receive standard Pi model credential variables, every `$VAR` reference from `~/.pi/agent/models.json`, and credential-shaped `*_API_KEY`/`*_TOKEN` variables. This lets nested agents use model, web research, documentation, GitHub, and similar credentials without manual setup while still excluding arbitrary application environment. `PI_SUBAGENT_PASSTHROUGH_ENV` supports exact names and globs for non-credential variables; `*` passes all env and is an explicit insecure opt-in. Best practice: store keys via `pi /login` into `~/.pi/agent/auth.json` when supported.
 
 A top-level `model` override applies to every mode. A task/chain item may also specify `model`. Resolution is top-level/item override, then agent definition, then the parent pi model. Inheritance passes the parent `provider/id`; runtime-registered providers or credentials are not copied into the child process, so those require child Pi configuration or the explicit environment passthrough policy.
 
