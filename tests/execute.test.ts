@@ -351,7 +351,18 @@ async function call(tool: Tool, params: any, context: any, signal?: AbortSignal,
 afterEach(() => {
   delete process.env.PI_SUBAGENT_BIN;
   delete process.env.PI_SUBAGENT_DEPTH;
-  for (const key of ["PI_SUBAGENT_RUN_ID", "PI_SUBAGENT_PARENT_ID", "PI_SUBAGENT_ROOT_ID", "PI_SUBAGENT_CONTROL_FILE", "PI_SUBAGENT_DEADLINE_MS", "PI_SUBAGENT_BUDGET_REMAINING", "PI_SUBAGENT_DELEGATION_POLICY", "PI_SUBAGENT_TIMEOUT_MS"]) delete process.env[key];
+  for (const key of [
+    "PI_SUBAGENT_RUN_ID",
+    "PI_SUBAGENT_PARENT_ID",
+    "PI_SUBAGENT_ROOT_ID",
+    "PI_SUBAGENT_CONTROL_FILE",
+    "PI_SUBAGENT_DEADLINE_MS",
+    "PI_SUBAGENT_BUDGET_REMAINING",
+    "PI_SUBAGENT_DELEGATION_POLICY",
+    "PI_SUBAGENT_DELEGATION_POLICY_FILE",
+    "PI_SUBAGENT_PASSTHROUGH_ENV",
+    "PI_SUBAGENT_TIMEOUT_MS",
+  ]) delete process.env[key];
   for (const directory of tempDirs.splice(0)) fs.rmSync(directory, { recursive: true, force: true });
 });
 
