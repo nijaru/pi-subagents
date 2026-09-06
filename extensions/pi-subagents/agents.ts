@@ -267,9 +267,6 @@ const READ_ONLY_TOOLS = new Set([
   "web_search",
   "web_fetch",
   "web_research",
-  "source_check",
-  "fetch_content",
-  "get_search_content",
   "resolve-library-id",
   "query-docs",
 ]);
