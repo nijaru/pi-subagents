@@ -178,7 +178,6 @@ Return a structured report.
     expect(explore?.tools).not.toContain("code_search");
     expect(architect?.tools).toContain("resolve-library-id");
     expect(architect?.tools).toContain("query-docs");
-    expect(architect?.tools).toContain("mcp");
     expect(researcher?.tools).toContain("web_fetch");
     expect(researcher?.tools).toContain("web_research");
     expect(researcher?.tools).not.toContain("fetch_content");
@@ -186,6 +185,13 @@ Return a structured report.
     for (const agent of [architect, researcher]) {
       expect(agent?.tools).not.toContain("mcp:context7");
       expect(agent?.tools).not.toContain("mcp:exa");
+    }
+    // 41202ad tightened every bundled profile to a leaf: no nested
+    // delegation, no mcp proxy. Keep this contract from regressing.
+    for (const agent of agents) {
+      expect(agent.delegation).toBe(false);
+      expect(agent.tools).not.toContain("mcp");
+      expect(agent.tools).not.toContain("subagent");
     }
   });
 
