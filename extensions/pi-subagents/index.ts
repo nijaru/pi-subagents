@@ -440,7 +440,7 @@ function structuredOutputPrompt(schema: AgentOutputSchema): string {
     "The JSON value must validate against this schema:",
     JSON.stringify(schema),
     "If you cannot complete the task, still return a JSON value matching the schema rather than a prose error.",
-  ].join("\\n");
+  ].join("\n");
 }
 
 function validateStructuredOutput(schema: AgentOutputSchema, raw: string): { value?: unknown; error?: string } {

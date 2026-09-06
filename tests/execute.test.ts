@@ -71,9 +71,25 @@ printf '%s\\n' '{"type":"message_end","message":{"role":"assistant","content":[{
 function writeStructuredPi(output: string): string {
   const directory = tempDir();
   const script = path.join(directory, "structured-pi");
-  fs.writeFileSync(script, `#!/usr/bin/env bun
-const usage = { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 5, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
-console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: ${JSON.stringify(output)} }], model: "fake/model", usage, stopReason: "stop", timestamp: 1 } }));
+  const event = JSON.stringify({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: output }],
+      model: "fake/model",
+      usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 5, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason: "stop",
+      timestamp: 0,
+    },
+  });
+  fs.writeFileSync(script, `#!/bin/sh
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --append-system-prompt) cat "$2" > "\${0}.sysprompt"; shift 2;;
+    *) shift;;
+  esac
+done
+printf '%s\\n' '${event}'
 `);
   fs.chmodSync(script, 0o755);
   return script;
@@ -491,6 +507,13 @@ describe("subprocess behavior", () => {
     expect(result.isError).toBeUndefined();
     expect(result.content[0].text).toBe(JSON.stringify({ summary: "done", count: 2 }));
     expect(result.details.results[0].structuredOutput).toEqual({ summary: "done", count: 2 });
+    // The structured-output instructions are appended to the agent's system
+    // prompt as a file. They must be real lines, not a literal \n sequence —
+    // a join("\\n") bug once rendered them as one backslash-n blob.
+    const prompt = fs.readFileSync(`${process.env.PI_SUBAGENT_BIN}.sysprompt`, "utf8");
+    expect(prompt).toContain("\nThe JSON value must validate");
+    expect(prompt).not.toContain("\\n");
+    expect(prompt.split("\n").length).toBeGreaterThan(3);
   });
 
   test("does not retain oversized provider metadata in message history", async () => {
