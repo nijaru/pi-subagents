@@ -21,11 +21,21 @@ Merge only a coherent, independently usable slice: it must be complete as a user
 ## Key Files
 
 ```
-extensions/pi-subagents/index.ts   # tool schema, subprocess runner, controls, orchestration, rendering
-extensions/pi-subagents/agents.ts  # scoped discovery and frontmatter policy
-agents/*.md                        # bundled agent definitions
-skills/pi-subagents/SKILL.md       # agent-facing tool reference
-tests/                              # deterministic discovery, runner, and tool tests
+extensions/pi-subagents/index.ts   # extension entry: tool registration, orchestration, public re-exports
+extensions/pi-subagents/params.ts    # tool schema and per-mode parameter validation
+extensions/pi-subagents/supervisor.ts # child lifecycle ownership (SubprocessChildSupervisor)
+extensions/pi-subagents/subprocess.ts# pi subprocess execution, protocol parsing, process-tree control
+extensions/pi-subagents/control.ts   # root control state: reservations, locks, depth, delegation policy
+extensions/pi-subagents/env.ts       # child environment allowlisting and passthrough
+extensions/pi-subagents/bounds.ts    # byte bounds, truncation, structured-output validation
+extensions/pi-subagents/render.ts    # TUI rendering helpers
+extensions/pi-subagents/background.ts# session-scoped background run bookkeeping
+extensions/pi-subagents/types.ts     # shared result/detail/usage types
+extensions/pi-subagents/limits.ts    # resource and size limits, env var names
+extensions/pi-subagents/agents.ts    # scoped discovery and frontmatter policy
+agents/*.md                          # bundled agent definitions
+skills/pi-subagents/SKILL.md         # agent-facing tool reference
+tests/                               # deterministic discovery, runner, and tool tests
 ```
 
 ## Agent Definitions
