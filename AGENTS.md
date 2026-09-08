@@ -21,7 +21,8 @@ Merge only a coherent, independently usable slice: it must be complete as a user
 ## Key Files
 
 ```
-extensions/pi-subagents/index.ts   # extension entry: tool registration, orchestration, public re-exports
+extensions/pi-subagents/index.ts   # extension entry: tool registration, setup, dispatch, rendering
+extensions/pi-subagents/modes.ts     # delegation modes: list, validation, task guards, single/parallel/chain/workflow/background runners
 extensions/pi-subagents/params.ts    # tool schema and per-mode parameter validation
 extensions/pi-subagents/supervisor.ts # child lifecycle ownership (SubprocessChildSupervisor)
 extensions/pi-subagents/subprocess.ts# pi subprocess execution, protocol parsing, process-tree control
