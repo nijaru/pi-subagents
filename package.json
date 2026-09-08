@@ -1,6 +1,6 @@
 {
   "name": "pi-subagents",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "type": "module",
   "description": "Clean declarative agent delegation for pi — define agents, run bounded batches, branch workflows, and session-scoped background runs.",
   "keywords": [
