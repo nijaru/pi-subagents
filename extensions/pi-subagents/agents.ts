@@ -314,7 +314,8 @@ export function loadAgentsFromDir(directory: string, source: AgentSource): Agent
   const agents: AgentConfig[] = [];
   let inspectedFiles = 0;
   let inspectedBytes = 0;
-  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+  // Entries were kept in lexicographic order during the bounded read above.
+  for (const entry of entries) {
     if (inspectedFiles >= MAX_AGENT_FILES) break;
     if (!entry.name.endsWith(".md") || (!entry.isFile() && !entry.isSymbolicLink())) continue;
     // A project agent must be contained by the project agent directory. A
