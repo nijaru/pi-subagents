@@ -614,7 +614,8 @@ export default function (pi: ExtensionAPI) {
             return toolResult(`Workflow reached missing node "${currentId}".`, baseDetails("workflow", results), true);
           }
           const task = interpolatePrevious(step.task, previous, MAX_TASK_BYTES);
-          const stepCwd = existingDirectory(cwdFor(rootCwd, step.cwd));
+          const requestedStepCwd = cwdFor(rootCwd, step.cwd);
+          const stepCwd = existingDirectory(requestedStepCwd);
           if (!stepCwd) {
             const errorResult: AgentResult = {
               agent: step.agent.trim(),
@@ -628,7 +629,7 @@ export default function (pi: ExtensionAPI) {
               exitCode: 1,
               stopReason: "error",
               termination: "failed",
-              errorMessage: truncateOutput(`Working directory does not exist: ${stepCwd}`, MAX_DIAGNOSTIC_BYTES),
+              errorMessage: truncateOutput(`Working directory does not exist: ${requestedStepCwd}`, MAX_DIAGNOSTIC_BYTES),
               stderr: "",
               messages: [],
               usage: emptyUsage(),
@@ -669,7 +670,8 @@ export default function (pi: ExtensionAPI) {
         for (let index = 0; index < params.chain!.length; index++) {
           const step = params.chain![index]!;
           const task = interpolatePrevious(step.task, previous, MAX_TASK_BYTES);
-          const stepCwd = existingDirectory(cwdFor(rootCwd, step.cwd));
+          const requestedStepCwd = cwdFor(rootCwd, step.cwd);
+          const stepCwd = existingDirectory(requestedStepCwd);
           if (!stepCwd) {
             const errorResult: AgentResult = {
               agent: step.agent.trim(),
@@ -683,7 +685,7 @@ export default function (pi: ExtensionAPI) {
               exitCode: 1,
               stopReason: "error",
               termination: "failed",
-              errorMessage: truncateOutput(`Working directory does not exist: ${stepCwd}`, MAX_DIAGNOSTIC_BYTES),
+              errorMessage: truncateOutput(`Working directory does not exist: ${requestedStepCwd}`, MAX_DIAGNOSTIC_BYTES),
               stderr: "",
               messages: [],
               usage: emptyUsage(),

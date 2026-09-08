@@ -59,7 +59,7 @@ Use `parallel` for independent fan-out; workflows are for dependent branches and
 
 ### Background runs
 
-Use background mode only when the child should outlive the current tool call. It is an in-memory, session-scoped lifecycle: `start` returns a run id, `status` observes one run or all retained runs, `result` retrieves a completed result, and `stop` cancels a run and waits for cleanup. Background runs do not survive Pi restart and currently support one child at a time, not batches or workflows.
+Use background mode only when the child should outlive the current tool call. It is an in-memory, session-scoped lifecycle: `start` returns a run id, `status` observes one run or all retained runs, `result` retrieves a completed result, and `stop` cancels a run and waits for cleanup. Background runs do not survive Pi restart and support up to four active runs (eight retained) per extension instance, not batches or workflows.
 
 ```json
 {"background":{"action":"start","agent":"explore","task":"Run the long investigation."}}
