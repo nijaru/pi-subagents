@@ -89,5 +89,12 @@ export function stripTerminalControls(value: string): string {
 }
 
 export function truncateChars(value: string, max: number): string {
-  return value.length > max ? `${value.slice(0, Math.max(0, max - 1))}…` : value;
+  if (value.length <= max) return value;
+  let end = Math.max(0, max - 1);
+  // Do not split a surrogate pair; a trailing high surrogate would render as �.
+  if (end > 0 && end < value.length) {
+    const last = value.charCodeAt(end - 1);
+    if (last >= 0xd800 && last <= 0xdbff) end--;
+  }
+  return `${value.slice(0, end)}…`;
 }

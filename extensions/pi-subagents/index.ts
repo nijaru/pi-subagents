@@ -425,7 +425,10 @@ export default function (pi: ExtensionAPI) {
             true,
           );
         }
-        const mutating = potentiallyMutating(discovery.agents.find((agent) => agent.name === item.agent.trim()));
+        const configuredAgent = discovery.agents.find((agent) => agent.name === item.agent.trim());
+        // Unknown names are reported by the supervisor, not the mutation guard;
+        // grouping them as mutating would mask the real "Unknown agent" error.
+        const mutating = configuredAgent ? potentiallyMutating(configuredAgent) : false;
         const conflictRoot = findNearestProjectRoot(taskCwd) ?? taskCwd;
         if (mutating && activeBackgroundMutationRoots.has(conflictRoot)) {
           return toolResult(
@@ -524,7 +527,8 @@ export default function (pi: ExtensionAPI) {
           return toolResult(`Too many retained background runs. Maximum is ${MAX_BACKGROUND_RUNS}. Retrieve or stop an existing run before starting another.`, backgroundToolDetails("start"), true);
         }
         const backgroundAgent = background.agent!.trim();
-        const backgroundMutating = potentiallyMutating(discovery.agents.find((agent) => agent.name === backgroundAgent));
+        const backgroundConfigured = discovery.agents.find((agent) => agent.name === backgroundAgent);
+        const backgroundMutating = backgroundConfigured ? potentiallyMutating(backgroundConfigured) : false;
         const backgroundRun: BackgroundRun = {
           details: {
             runId: randomUUID(),

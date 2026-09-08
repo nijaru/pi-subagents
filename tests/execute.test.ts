@@ -736,6 +736,16 @@ describe("subprocess behavior", () => {
     expect(result.content[0].text).toContain("share project root");
   });
 
+  test("reports unknown agents instead of parallel mutation rejection", async () => {
+    const root = tempDir();
+    const result = await call(tool, {
+      tasks: [{ agent: "nope-one", task: "one" }, { agent: "nope-two", task: "two" }],
+    }, ctx(root));
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Unknown agent");
+    expect(result.content[0].text).not.toContain("Parallel mutation rejected");
+  });
+
   test("allows potentially mutating parallel tasks in distinct canonical cwds", async () => {
     const root = tempDir();
     fs.mkdirSync(path.join(root, "one"));

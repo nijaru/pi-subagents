@@ -67,7 +67,7 @@ function isDirectory(directory: string): boolean {
 }
 
 function isProjectRoot(directory: string): boolean {
-  return [".git", "package.json", "Cargo.toml", "go.mod"].some((name) =>
+  return [".git", ".hg", ".jj", "package.json", "Cargo.toml", "go.mod", "pyproject.toml", "deno.json", "deno.jsonc"].some((name) =>
     fs.existsSync(path.join(directory, name)),
   );
 }

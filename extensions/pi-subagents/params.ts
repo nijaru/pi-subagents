@@ -49,7 +49,7 @@ export const SubagentParamsSchema = Type.Object({
   agent: Type.Optional(Type.String({ description: "Agent name for single mode", minLength: 1, maxLength: 256 })),
   task: Type.Optional(Type.String({ description: "Task for single mode", minLength: 1, maxLength: MAX_TASK_BYTES })),
   tasks: Type.Optional(Type.Array(TaskItem, { description: "Parallel tasks (maximum 8)", maxItems: MAX_PARALLEL_TASKS })),
-  chain: Type.Optional(Type.Array(ChainItem, { description: "Sequential steps using {previous}", maxItems: MAX_CHAIN_STEPS })),
+  chain: Type.Optional(Type.Array(ChainItem, { description: "Sequential steps using {previous} (maximum 32)", maxItems: MAX_CHAIN_STEPS })),
   workflow: Type.Optional(Workflow),
   background: Type.Optional(Background),
   agentScope: Type.Optional(StringEnum(["user", "project", "both"] as const, { description: "Agent scope; bundled agents are always included" })),

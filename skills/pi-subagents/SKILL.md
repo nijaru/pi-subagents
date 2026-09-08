@@ -17,7 +17,7 @@ The tool accepts exactly one mode:
 |---|---|---|
 | Single | `{ agent, task }` | Run one agent and return its final output |
 | Parallel | `{ tasks: [{ agent, task, model?, cwd? }] }` | Run up to 8 tasks with bounded concurrency |
-| Chain | `{ chain: [{ agent, task, model?, cwd? }] }` | Run steps serially; `{previous}` is the preceding final output |
+| Chain | `{ chain: [{ agent, task, model?, cwd? }] }` | Run up to 32 steps serially; `{previous}` is the preceding final output |
 | Workflow | `{ workflow: { start?, steps: [{ id, agent, task, onSuccess?, onFailure? }] } }` | Follow bounded success/failure branches serially; `{previous}` is the prior result |
 | Background | `{ background: { action: "start"|"status"|"result"|"stop", runId?, agent?, task? } }` | Keep one child alive across tool calls in the current Pi session |
 

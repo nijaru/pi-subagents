@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { getFinalOutput, getPiInvocation, interpolatePrevious, parseJsonEventLine, readDepth, stripTerminalControls, truncateOutput } from "../extensions/pi-subagents/index.ts";
+import { truncateChars } from "../extensions/pi-subagents/render.ts";
+import { executable } from "../extensions/pi-subagents/subprocess.ts";
 
 const assistant = {
   role: "assistant",
@@ -128,6 +132,26 @@ describe("pi invocation", () => {
       if (old === undefined) delete process.env.PI_SUBAGENT_BIN;
       else process.env.PI_SUBAGENT_BIN = old;
     }
+  });
+
+  test("does not treat directories as executables", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-bin-"));
+    try {
+      expect(executable(directory)).toBe(false);
+      expect(executable(process.execPath)).toBe(true);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("display truncation safety", () => {
+  test("does not split surrogate pairs when truncating for display", () => {
+    expect(truncateChars("abc", 5)).toBe("abc");
+    const truncated = truncateChars("😀x", 2);
+    expect(truncated).toBe("…");
+    expect(truncated).not.toContain("�");
+    expect(truncateChars("😀x", 3)).toBe("😀x");
   });
 });
 

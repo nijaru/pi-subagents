@@ -42,7 +42,7 @@ Parallel tasks that may mutate the same project root are rejected. Give read-onl
 ]}
 ```
 
-`{previous}` is replaced with the preceding final text output. A chain stops at its first failed step.
+`{previous}` is replaced with the preceding final text output. A chain stops at its first failed step. Up to 32 steps are accepted; longer chains are rejected before spawning.
 
 ### Bounded workflow
 

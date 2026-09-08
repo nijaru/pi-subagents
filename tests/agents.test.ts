@@ -58,6 +58,14 @@ describe("agent discovery", () => {
     expect(findNearestProjectAgentsDir(nested)).toBe(fs.realpathSync.native(path.join(root, "nested", ".pi", "agents")));
   });
 
+  test("detects Python and alternative VCS project roots", () => {
+    const root = tempDir();
+    const nested = path.join(root, "repo", "src");
+    fs.mkdirSync(nested, { recursive: true });
+    fs.writeFileSync(path.join(root, "repo", "pyproject.toml"), "[project]\n");
+    expect(findNearestProjectRoot(nested)).toBe(fs.realpathSync.native(path.join(root, "repo")));
+  });
+
   test("does not walk beyond a repository root", () => {
     const root = tempDir();
     const nested = path.join(root, "repo", "src");
