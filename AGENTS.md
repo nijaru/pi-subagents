@@ -1,61 +1,33 @@
 # pi-subagents
 
-Pi extension for declarative agent delegation. Single, parallel, and sequential-chain delegation with seven bundled agents.
+Pi extension for task-first delegation to fresh child subprocesses. One tool exposes `run`, `spawn`, `status`, `wait`, and `stop`.
 
-## Stack
+## Stack and checks
 
-TypeScript, Bun. Pi extension API (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`), Typebox.
-
-## Testing
+TypeScript, Bun, Pi extension/TUI APIs, TypeBox. Pi loads the extension directly; no build step.
 
 ```bash
 bun run check
 ```
 
-No build step — pi loads the extension directly.
+Merge only a coherent, independently usable slice. Keep dependent scaffolding on feature branches. Before merging, run the checks and inspect the complete diff.
 
-## Integration discipline
+## Ownership and contracts
 
-Merge only a coherent, independently usable slice: it must be complete as a user-facing capability or behavior-preserving infrastructure with a tested contract that leaves `main` usable. Keep incomplete scaffolding and dependent follow-ups on feature branches. Before merging, run `bun run check` and inspect the complete diff.
+- `extensions/pi-subagents/index.ts`: registration, parent session lifecycle, completion notices, command dispatch, rendering.
+- `children.ts`: session-owned handles, synchronous admission, write-conflict checks, wait/stop, retention, shutdown fencing.
+- `supervisor.ts`: the single child execution boundary used by both run and spawn; prompt files, progress, terminal result validation, cleanup.
+- `subprocess.ts`: Pi invocation, bounded JSON framing, process-tree cancellation and normal-exit sweep.
+- `params.ts`, `locations.ts`: command/tool policy and canonical repository write domains.
+- `env.ts`, `bounds.ts`, `limits.ts`, `types.ts`, `render.ts`: environment policy, output/resource bounds, result contracts, rendering helpers.
+- `tests/`: deterministic lifecycle tests plus real subprocess protocol regression tests.
 
-## Key Files
+Children are leaves. Do not add a second scheduler, profile discovery layer, workflow framework, recursive delegation, or persistent registry without an explicit product decision. A future native Pi child API belongs behind the existing execution boundary, not beside a competing runner.
 
-```
-extensions/pi-subagents/index.ts   # extension entry: tool registration, setup, dispatch, rendering
-extensions/pi-subagents/modes.ts     # delegation modes: list, validation, task guards, single/parallel/chain/workflow/background runners
-extensions/pi-subagents/params.ts    # tool schema and per-mode parameter validation
-extensions/pi-subagents/supervisor.ts # child lifecycle ownership (SubprocessChildSupervisor)
-extensions/pi-subagents/subprocess.ts# pi subprocess execution, protocol parsing, process-tree control
-extensions/pi-subagents/control.ts   # root control state: reservations, locks, depth, delegation policy
-extensions/pi-subagents/env.ts       # child environment allowlisting and passthrough
-extensions/pi-subagents/bounds.ts    # byte bounds, truncation, structured-output validation
-extensions/pi-subagents/render.ts    # TUI rendering helpers
-extensions/pi-subagents/background.ts# session-scoped background run bookkeeping
-extensions/pi-subagents/types.ts     # shared result/detail/usage types
-extensions/pi-subagents/limits.ts    # resource and size limits, env var names
-extensions/pi-subagents/agents.ts    # scoped discovery and frontmatter policy
-agents/*.md                          # bundled agent definitions
-skills/pi-subagents/SKILL.md         # agent-facing tool reference
-tests/                               # deterministic discovery, runner, and tool tests
-```
+Admission must happen before asynchronous setup or extension callbacks. Keep the active slot and write domain until process-tree cleanup finishes, not merely until terminal assistant output arrives. Session shutdown fences notifications before aborting and joining children; no completion may enter a replacement session.
 
-## Agent Definitions
+Default tools are known coding/research tools active in the parent; explicit tools can only select active parent tools. Unknown tools and shells are potentially mutating. Parent and child writers need separate worktrees; the extension cannot guard parent edits. Tool lists, effect metadata, and subprocesses are not sandboxes. Child Pi reloads its own integrations; runtime-only parent tools, credentials, providers, and permission hooks are not cloned.
 
-Markdown + YAML frontmatter in `~/.pi/agent/agents/` (user) or `.pi/agents/` (project). Bundled definitions ship in `agents/`. Required: `name`, `description`. Optional: `model`, `thinking`, explicit `tools`, `delegation`, and `capability`.
+Preserve private prompt-file transport, bounded output/protocol framing, meaningful failure states, deadlines, and process-tree cleanup. Changes to removed v0 APIs must update the migration section and agent-facing skill together; do not add silent aliases.
 
-```markdown
----
-name: reviewer
-description: Code review for correctness and quality
-capability: read
-tools: read,grep,find,ls
----
-```
-
-Missing `tools` means `--no-tools`, never all tools. `delegation` defaults false; only `delegation: true` permits the `subagent` tool. `capability` is effect metadata, not a sandbox: `read` or `write`; omission is treated as potentially mutating when parallel tasks share a canonical cwd. A `read` profile must use only the known read-only tools (`read`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `web_research`, `resolve-library-id`, or `query-docs`) and cannot delegate; unknown or mutation-capable tools invalidate the definition. All bundled agents are leaves; custom definitions can opt into bounded nested delegation.
-
-Project agents are opt-in, require pi project trust, and receive a confirmation in UI sessions; headless sessions reject them. Their task cwd must remain inside the trusted project root. Delegation always runs in a fresh subprocess with `--no-session`; nested calls are bounded by depth 3, a root-wide 32-descendant budget, a shared four-process limit, and a propagated deadline/control file.
-
-Task and system-prompt contents use mode-0600 temporary files. Child env is allowlisted: standard Pi model credentials, `$VAR` refs from `~/.pi/agent/models.json`, and credential-shaped `*_API_KEY`/`*_TOKEN` variables are passed so nested agents can use model and research-tool credentials. Other application variables require `PI_SUBAGENT_PASSTHROUGH_ENV` with exact names or globs (`OPENAI_*`, `*`). Use `*` to pass all env (insecure). Best is to store keys via `pi /login` in `~/.pi/agent/auth.json` — then children need no env passthrough. The package has bounded in-memory session-scoped background handles, but does not implement persistent sessions, durable registries, or managed worktrees; those remain future explicit opt-ins.
-
-The implementation relies on the current Pi CLI/API (`--mode json`, `--no-session`, `--tools`/`--no-tools`, and `@file`) and is tested against the 0.84.3 package line; it does not claim compatibility with older Pi versions.
+Development dependencies target Pi 0.84.3. New Pi/pico documentation is design evidence until the corresponding API exists and is verified; do not claim compatibility based on proposed interfaces.

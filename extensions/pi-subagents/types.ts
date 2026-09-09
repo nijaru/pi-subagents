@@ -1,5 +1,4 @@
 import type { Message, StopReason, Usage } from "@earendil-works/pi-ai";
-import type { AgentConfig, AgentScope } from "./agents.ts";
 
 export type AgentTermination = "completed" | "failed" | "cancelled" | "timed_out";
 
@@ -7,19 +6,13 @@ export interface UsageSummary extends Usage {
   turns: number;
 }
 
-export interface AgentResult {
-  agent: string;
-  agentSource: AgentConfig["source"] | "unknown";
-  task: string;
+export interface ChildResult {
+  id: string;
+  prompt: string;
+  cwd: string;
+  tools: string[];
   /** Final assistant text, kept separately from bounded diagnostic messages. */
   output?: string;
-  /** Parsed terminal JSON when the agent definition opts into outputSchema. */
-  structuredOutput?: unknown;
-  runId: string;
-  parentRunId?: string;
-  rootRunId: string;
-  depth: number;
-  step?: number;
   /** Wall-clock timestamps for user-visible runtime reporting. */
   startedAt?: number;
   finishedAt?: number;
@@ -34,32 +27,9 @@ export interface AgentResult {
   model?: string;
 }
 
-export type BackgroundRunStatus = "starting" | "running" | "completed" | "failed" | "cancelled" | "timed_out";
-
-export interface BackgroundRunDetails {
-  runId: string;
-  agent: string;
-  status: BackgroundRunStatus;
-  createdAt: number;
-  startedAt?: number;
-  finishedAt?: number;
-  progress?: string;
-}
-
 export interface SubagentDetails {
-  /** Identifies the background control action or metadata-only list action. */
-  action?: "list" | "start" | "status" | "result" | "stop";
-  mode: "single" | "parallel" | "chain" | "workflow" | "background";
-  background?: BackgroundRunDetails;
-  backgroundRuns?: BackgroundRunDetails[];
-  agentScope: AgentScope;
-  projectAgentsDir: string | null;
-  runId: string;
-  parentRunId?: string;
-  rootRunId: string;
-  depth: number;
-  deadlineMs: number;
-  results: AgentResult[];
+  command: "run" | "spawn" | "status" | "wait" | "stop";
+  results: ChildResult[];
 }
 
 export function emptyUsage(): UsageSummary {
@@ -151,15 +121,4 @@ export function textFromMessage(message: Message): string {
     .filter((part): part is { type: "text"; text: string } => isContentPart(part) && part.type === "text" && typeof part.text === "string")
     .map((part) => part.text)
     .join("\n");
-}
-
-export function getFinalOutput(messages: Message[]): string {
-  for (let index = messages.length - 1; index >= 0; index--) {
-    const message = messages[index];
-    if (message?.role === "assistant") {
-      const text = textFromMessage(message);
-      if (text) return text;
-    }
-  }
-  return "";
 }

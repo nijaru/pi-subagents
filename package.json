@@ -1,17 +1,14 @@
 {
   "name": "pi-subagents",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "type": "module",
-  "description": "Clean declarative agent delegation for pi — define agents, run bounded batches, branch workflows, and session-scoped background runs.",
+  "description": "Task-first child delegation for Pi: foreground runs, background completion notices, and bounded subprocess lifecycle.",
   "keywords": [
     "pi-package",
     "pi",
     "pi-extension",
     "subagents",
     "agents",
-    "chain",
-    "parallel",
-    "workflow",
     "background"
   ],
   "license": "MIT",
@@ -51,9 +48,11 @@
   },
   "files": [
     "extensions",
-    "agents",
     "skills",
     "README.md",
     "LICENSE"
-  ]
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  }
 }

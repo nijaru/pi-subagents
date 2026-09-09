@@ -2,9 +2,10 @@ import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getFinalOutput, getPiInvocation, interpolatePrevious, parseJsonEventLine, readDepth, stripTerminalControls, truncateOutput } from "../extensions/pi-subagents/index.ts";
-import { truncateChars } from "../extensions/pi-subagents/render.ts";
-import { executable } from "../extensions/pi-subagents/subprocess.ts";
+import { textFromMessage } from "../extensions/pi-subagents/types.ts";
+import { truncateOutput } from "../extensions/pi-subagents/bounds.ts";
+import { stripTerminalControls, truncateChars } from "../extensions/pi-subagents/render.ts";
+import { executable, getPiInvocation, parseJsonEventLine } from "../extensions/pi-subagents/subprocess.ts";
 
 const assistant = {
   role: "assistant",
@@ -14,20 +15,6 @@ const assistant = {
   stopReason: "stop",
   timestamp: 0,
 };
-
-describe("depth guard", () => {
-  test("accepts unset and valid values", () => {
-    expect(readDepth(undefined)).toEqual({ valid: true, depth: 0 });
-    expect(readDepth("2")).toEqual({ valid: true, depth: 2 });
-  });
-
-  test("fails closed for malformed, negative, fractional, and unsafe values", () => {
-    for (const value of ["", "-1", "1.5", "abc", "9007199254740992"]) {
-      expect(readDepth(value).valid).toBe(false);
-      expect(readDepth(value).depth).toBe(3);
-    }
-  });
-});
 
 describe("JSON subprocess parsing", () => {
   test("parses final messages and progress while ignoring noise", () => {
@@ -86,21 +73,13 @@ describe("JSON subprocess parsing", () => {
       type: "message_end",
       message: { ...assistant, usage: { ...assistant.usage, output: "bad" } },
     }))).toBeUndefined();
-    expect(getFinalOutput([{ ...assistant, content: [null] } as any])).toBe("");
+    expect(textFromMessage({ ...assistant, content: [null] } as any)).toBe("");
   });
 });
 
 describe("terminal rendering safety", () => {
   test("strips ANSI and OSC controls from untrusted text", () => {
     expect(stripTerminalControls("before\u001b]0;evil title\u0007\u001b[31mafter\u001b[0m")).toBe("beforeafter");
-  });
-});
-
-describe("bounded chain interpolation", () => {
-  test("does not expand repeated previous placeholders beyond the task cap", () => {
-    const task = "{previous}".repeat(10_000);
-    const value = interpolatePrevious(task, "x".repeat(50 * 1024), 100 * 1024);
-    expect(Buffer.byteLength(value, "utf8")).toBeLessThanOrEqual(100 * 1024);
   });
 });
 

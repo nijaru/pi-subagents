@@ -6,10 +6,10 @@ import type { Message, StopReason } from "@earendil-works/pi-ai";
 
 import { MAX_MESSAGES_PER_AGENT, MAX_MESSAGE_BYTES, MAX_OUTPUT_BYTES, MAX_PROTOCOL_LINE_BYTES } from "./limits.ts";
 import { addUsage, isFinalMessage, textFromMessage } from "./types.ts";
-import type { AgentResult, AgentTermination, UsageSummary } from "./types.ts";
+import type { ChildResult, AgentTermination, UsageSummary } from "./types.ts";
 import { boundMessage, boundedDiagnostic, capStderr, jsonBytes, truncateOutput } from "./bounds.ts";
-import { delay, processTimeoutMs } from "./control.ts";
-import type { ChildReservation, ControlContext } from "./control.ts";
+import { processTimeoutMs } from "./limits.ts";
+import { setTimeout as delay } from "node:timers/promises";
 import { childEnvironment } from "./env.ts";
 
 export const activeChildren = new Set<ChildProcess>();
@@ -156,8 +156,8 @@ export function descendantPids(pid: number): number[] {
 /**
  * Terminate a child and its descendants without killing an ancestor group.
  *
- * Keep the first descendant snapshot until the SIGKILL escalation. A nested
- * leader can exit after SIGTERM while its descendants become reparented, so a
+ * Keep the first descendant snapshot until the SIGKILL escalation. A process
+ * can exit after SIGTERM while its descendants become reparented, so a
  * later `ps` snapshot rooted at the leader would otherwise miss them.
  */
 export const terminatedProcessDescendants = new WeakMap<ChildProcess, Set<number>>();
@@ -252,7 +252,7 @@ export function addAssistantUsage(usage: UsageSummary, message: Message): void {
   if (message.usage) addUsage(usage, message.usage);
 }
 
-export function recordMessage(result: AgentResult, message: Message): void {
+export function recordMessage(result: ChildResult, message: Message): void {
   const bounded = boundMessage(message);
   // A provider may attach arbitrary metadata outside the typed message fields.
   // Never retain a record that still exceeds the per-message budget; final
@@ -284,18 +284,12 @@ export function recordMessage(result: AgentResult, message: Message): void {
 export async function runPiProcess(
   args: string[],
   cwd: string,
-  depth: number,
-  control: ControlContext,
-  parentRunId: string,
   childRunId: string,
-  reservation: ChildReservation,
   signal: AbortSignal | undefined,
   onEvent: (event: ParsedJsonEvent) => void,
-  delegationPolicyPath?: string,
 ): Promise<ProcessResult> {
   if (signal?.aborted) return { exitCode: 1, stopReason: "aborted", termination: "cancelled", errorMessage: "Subagent aborted.", stderr: "" };
-  const timeoutMs = processTimeoutMs(control.deadlineMs);
-  if (control.deadlineMs <= Date.now()) return { exitCode: 1, stopReason: "error", termination: "timed_out", errorMessage: "Root subagent deadline reached.", stderr: "" };
+  const timeoutMs = processTimeoutMs();
 
   const invocation = getPiInvocation(args);
   return new Promise((resolve) => {
@@ -320,7 +314,7 @@ export async function runPiProcess(
         // A background run must not release mutation ownership while a
         // descendant from its detached root group can still be alive.
         if (rootSweepPromise) await rootSweepPromise;
-        // A nested leader can close before the escalation timer fires while a
+        // A leader can close before the escalation timer fires while a
         // descendant ignores SIGTERM and does not hold an inherited pipe open.
         // Force the retained tree snapshot before dropping the timer.
         if (aborted || timedOut || eventError) terminateProcessTree(child, "SIGKILL");
@@ -336,18 +330,16 @@ export async function runPiProcess(
     try {
       child = spawn(invocation.command, invocation.args, {
         cwd,
-        env: childEnvironment(depth + 1, control, parentRunId, childRunId, reservation.budgetRemaining, cwd, delegationPolicyPath),
+        env: childEnvironment(childRunId, cwd),
         shell: false,
-        // Keep nested children in the root child's process group. The root
-        // child is detached from the host; descendants then die with that
-        // group instead of becoming independent orphaned model callers.
-        detached: depth === 0,
+        // A child gets its own process group; cleanup includes the commands it starts.
+        detached: true,
         stdio: ["ignore", "pipe", "pipe"],
       });
       activeChildren.add(child);
       let rootGroupSwept = false;
       const sweepRoot = () => {
-        if (depth !== 0 || rootGroupSwept) return;
+        if (rootGroupSwept) return;
         rootGroupSwept = true;
         rootSweepPromise = sweepRootProcessGroup(child);
       };
@@ -486,36 +478,5 @@ export async function runPiProcess(
     });
 
     if (signal?.aborted) stopForAbort();
-  });
-}
-
-export function waitForChild(child: ChildProcess): Promise<void> {
-  return new Promise((resolve) => {
-    let settled = false;
-    const done = () => {
-      if (settled) return;
-      settled = true;
-      child.removeListener("close", done);
-      child.removeListener("error", done);
-      resolve();
-    };
-    child.once("close", done);
-    child.once("error", done);
-    if (child.exitCode !== null || child.signalCode !== null) setTimeout(done, 0);
-  });
-}
-
-export function waitForChildren(children: ChildProcess[], timeoutMs: number): Promise<void> {
-  return new Promise((resolve) => {
-    let settled = false;
-    let timer: ReturnType<typeof setTimeout>;
-    const done = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve();
-    };
-    timer = setTimeout(done, timeoutMs);
-    Promise.all(children.map((child) => waitForChild(child))).then(done);
   });
 }

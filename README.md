@@ -1,6 +1,6 @@
 # pi-subagents
 
-Declarative agent delegation for [pi](https://github.com/earendil-works/pi). Define agents as Markdown files and delegate work to them in isolated subprocesses.
+Delegate a self-contained task to a fresh [Pi](https://github.com/earendil-works/pi) child, either foreground or background. The parent supplies the task—not a named role or workflow.
 
 ## Install
 
@@ -8,171 +8,86 @@ Declarative agent delegation for [pi](https://github.com/earendil-works/pi). Def
 pi install git:github.com/nijaru/pi-subagents
 ```
 
-The extension registers one public tool: `subagent`.
+Restart Pi or use `/reload`. The package registers one tool, `subagent`.
 
-## Modes
+## Usage
 
-Use exactly one mode per call:
-
-### Single
+Ask Pi to delegate a specific task, or use these tool-call shapes:
 
 ```json
-{"agent":"reviewer","task":"Review the authentication changes for correctness."}
+{"command":"run","prompt":"Review the parser changes. Report concrete regressions with file/line and evidence. Do not edit files.","tools":["read"]}
 ```
 
-### Parallel
+`run` waits for the final result. For independent work while the parent continues:
 
 ```json
-{"tasks":[
-  {"agent":"reviewer","task":"Review the implementation."},
-  {"agent":"profiler","task":"Look for measurable performance regressions."}
-]}
+{"command":"spawn","prompt":"Implement the parser regression test in tests/parser.test.ts. Own only that file, run its tests, and report changes and results.","cwd":"../parser-worktree"}
+{"command":"status"}
+{"command":"wait","id":"<child-id>","timeoutMs":30000}
+{"command":"stop","id":"<child-id>"}
 ```
 
-Up to eight tasks are accepted. Execution has a local and root-wide concurrency limit; results remain in input order.
+Background children send a completion notice and request a follow-up parent turn. `wait` returns the retained final result, or reports that the child is still running when its wait budget expires. Cancelling a wait does **not** cancel the child; `stop` cancels it and waits for cleanup. Cancelling `run` cancels its child.
 
-Parallel tasks that may mutate the same project root are rejected. Give read-only agents `capability: read`, use distinct project roots, or use a serial chain.
+Handles belong to the current parent session. All children stop on quit, reload, or session replacement. Background work requires a live parent process; a one-shot print invocation is not a persistent worker host.
 
-### Sequential chain
+### Tools and context
 
-```json
-{"chain":[
-  {"agent":"explore","task":"Map the relevant files."},
-  {"agent":"worker","task":"Implement the fix using this report:\n\n{previous}"}
-]}
-```
+- Defaults are the parent's active tools among `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `web_research`, `resolve-library-id`, and `query-docs`. Research tools require their extensions; they are not supplied by this package.
+- `tools` selects an explicit allowlist, restricted to tools active in the parent. `tools: []` is reasoning-only. An empty default selection is rejected rather than silently launching an unusable coding child.
+- Children are leaves. The `subagent` tool cannot be passed to them, and nested calls are rejected.
+- `model` optionally selects `provider/model-id`; otherwise the parent's model is inherited. Thinking effort inherits the parent's session level.
+- `cwd` defaults to the parent cwd; relative paths resolve against it.
+- Every child starts a new conversation. The prompt should include scope, relevant evidence, constraints, expected output, and verification. Parent conversation history is not copied.
 
-`{previous}` is replaced with the preceding final text output. A chain stops at its first failed step. Up to 32 steps are accepted; longer chains are rejected before spawning.
+The subprocess loads its own Pi configuration, extensions, skills, and applicable `AGENTS.md` files. **Fresh context does not mean an empty system prompt.** Runtime-only tools, providers, credentials, and permission-hook state are not cloned from the parent; required integrations must also be configured in child Pi. A tool active only in the parent may therefore be unavailable in the child.
 
-### Bounded workflow
+### When to delegate
 
-Use a workflow when the next agent depends on whether the previous run succeeded or failed. Nodes run serially through the same supervisor; `onSuccess` and `onFailure` select the next node, and `{previous}` carries the prior result. A missing next edge ends the workflow. Loops are allowed but bounded by the root descendant budget.
+Use `spawn` for independent work alongside useful, non-overlapping parent work. Use `run` when a fresh perspective or context-heavy investigation is worth waiting for. Keep routine lookups and tightly coupled edits local. The parent owns integration and verification; do not repeat the child's assignment while it runs.
 
-```json
-{"workflow":{"start":"review","steps":[
-  {"id":"review","agent":"reviewer","task":"Review the change.","onSuccess":"implement"},
-  {"id":"implement","agent":"worker","task":"Apply the review:\n\n{previous}"}
-]}}
-```
+Use separate worktrees for concurrent writers. The extension rejects simultaneous potentially mutating children in one canonical repository root, including symlink aliases and nested packages. It cannot guard the parent's own edits. Read-only children may overlap, but reading files while another process changes them does not provide a consistent snapshot.
 
-Use `parallel` for independent fan-out; workflows are for dependent branches and bounded retries.
+## Limits and safety
 
-### Background runs
+| Resource | Limit |
+|---|---|
+| Active children | 4 per parent session; excess starts are rejected |
+| Retained handles | 32; oldest completed handles are evicted first |
+| Child execution | 30 minutes by default; `PI_SUBAGENT_TIMEOUT_MS` may set up to 2 hours |
+| One wait call | 30 seconds by default, at most 120 seconds; never extends the child deadline |
+| Task prompt | 100 KiB |
+| Tool response and result details | 50 KiB each |
+| Background completion excerpt | 8 KiB |
 
-Use background mode only when the child should outlive the current tool call. It is an in-memory, session-scoped lifecycle: `start` returns a run id, `status` observes one run or all retained runs, `result` retrieves a completed result, and `stop` cancels a run and waits for cleanup. Background runs do not survive Pi restart and support up to four active runs (eight retained) per extension instance, not batches or workflows.
+All children use the same subprocess runner: `pi --mode json -p --no-session`. Prompts travel through temporary mode-0600 files, not command arguments. Normal completion and cancellation sweep the child's process group before releasing write ownership. No profiles, workflow scheduler, recursive delegation, session persistence, or managed worktree creation is included.
 
-```json
-{"background":{"action":"start","agent":"explore","task":"Run the long investigation."}}
-{"background":{"action":"status","runId":"<run-id>"}}
-{"background":{"action":"result","runId":"<run-id>"}}
-{"background":{"action":"stop","runId":"<run-id>"}}
-```
+A successful child must produce terminal assistant output. Failures, cancellation, and timeouts remain distinguishable in retained status. `run` and completed `wait` throw tool errors for failed children; `status` remains available to inspect them. `stop` reports the resulting state without treating requested cancellation as a tool failure.
 
-The registry allows four active and eight retained runs per extension instance. It shares the normal child supervisor, deadline, cancellation, process cleanup, and output bounds; it does not add persistence, worktrees, artifacts, or peer coordination.
+Tool allowlists and subprocesses are **not sandboxes**. Shells and unknown extension tools are classified as potentially mutating, regardless of the prompt. A child with shell access can launch external effects or processes outside the managed group. Parent permission state is not an inherited security boundary.
 
-## Agent definitions
+Environment variables are allowlisted, with standard model credentials, `$VAR` references from Pi's `models.json`, and `*_API_KEY`/`*_TOKEN` variables forwarded. Other variables require `PI_SUBAGENT_PASSTHROUGH_ENV` (comma-separated exact names or globs). `*` explicitly forwards all environment variables. Credentials saved through `pi /login` remain available through the child's Pi configuration.
 
-Bundled agents ship in this package. User definitions live in `~/.pi/agent/agents/*.md`; project definitions live in the nearest `.pi/agents/*.md` and require project trust plus an interactive confirmation.
+## Migration from 0.0.1
 
-```markdown
----
-name: reviewer
-description: Use when a finished change needs independent fresh-context review.
-capability: read
-tools: read, grep, find, ls
----
+Version 0.1 replaces the profile/workflow API rather than maintaining a second interface:
 
-Review the requested code and report concrete findings.
-```
+- `{agent, task}` → `{command: "run", prompt: task, tools?: [...]}`. Include useful profile instructions in the task prompt.
+- `background.action: "start"` → `command: "spawn"`; `runId` → `id`; `result` → `wait`.
+- Parallel batches → separate `spawn` calls. Chains and workflows → parent-issued calls after inspecting prior results; no `{previous}` substitution.
+- Agent discovery, `agentScope`, role Markdown files, profile schemas, and recursive policies are no longer consumed. Existing user files are left untouched. Validate structured results in the parent when required.
 
-Pi selects agents from their name, description, and the parent task. Keep descriptions focused on **when to delegate**; put procedure and output detail in the body.
-
-Frontmatter fields:
-
-- `name` and `description` are required.
-- `tools` is an explicit Pi tool allowlist. If omitted, the child gets no tools; it never inherits all tools. Supported Pi built-ins include `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`. Tool names are passed through unchanged, so installed extension names must match exactly. Common current research tools include `web_search`, `web_fetch`, `web_research`, `resolve-library-id`, and `query-docs`. The unified `mcp` proxy is also available when `pi-mcp-adapter` is installed.
-- `capability` is effect metadata for scheduling safety, not a security sandbox. Omitted capability is conservatively treated as potentially mutating for parallel safety. A `read` profile must use only the known read-only tools (`read`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `web_research`, `resolve-library-id`, or `query-docs`) and cannot delegate; unknown or mutation-capable tools invalidate the definition.
-- `delegation: true` explicitly permits nested use of `subagent`; it defaults to `false`. Delegation is itself potentially mutating, so delegation-capable profiles must use `capability: write` or omit the capability. Bundled agents are leaves by default; custom definitions can opt into bounded nested delegation when the role genuinely owns coordination.
-- `model` is optional and otherwise inherits the parent model.
-- `thinking` is an optional reasoning effort (`minimal`, `low`, `medium`, `high`, `xhigh`, or `max`). Without it, the child inherits the parent session's thinking level; pi maps generic levels per model and drops them for non-reasoning models, so inheritance is safe across a model override.
-- `outputSchema` is an optional bounded TypeBox-compatible JSON Schema. When present, the child is instructed to return raw JSON only; a malformed or non-matching terminal response is a failed delegation. Schemas are limited to 16 KiB and local `$ref` values.
-- `allowedAgents` optionally restricts the exact agent names this definition may invoke through nested delegation. `maxDelegationDepth` optionally limits how many nested levels it may create (`0` disables nested calls; the global maximum is 3). An inherited parent policy can only narrow these limits.
-
-Definitions with invalid control metadata or output schemas are skipped. Project-agent task directories must stay inside the trusted project root. Bundled definitions can be overridden by user or project definitions with the same name.
-
-### Structured outputs
-
-Opt in per agent when downstream steps need typed data:
-
-```markdown
----
-name: analyst
-description: Use when a downstream workflow needs a compact structured analysis.
-outputSchema:
-  type: object
-  properties:
-    summary:
-      type: string
-    risks:
-      type: array
-      items:
-        type: string
-  required: [summary, risks]
-  additionalProperties: false
----
-Return the analysis as JSON matching the schema.
-```
-
-The parsed value is available as `structuredOutput` in bounded result details. Plain-text agents and existing chain interpolation remain unchanged. JSON must be the complete terminal assistant response; Markdown fences and surrounding prose are rejected.
-
-Nested delegation can be narrowed per agent:
-
-```markdown
----
-name: coordinator
-description: Use when one bounded coordinator should delegate only review work.
-delegation: true
-capability: write
-allowedAgents: [reviewer, researcher]
-maxDelegationDepth: 1
----
-Delegate only the allowed review tasks.
-```
-
-Nested calls outside `allowedAgents` or beyond `maxDelegationDepth` fail before a child starts. The parent policy is intersected with the selected child's policy, so a child cannot broaden its parent's restriction.
-
-## Models, transport, and limits
-
-Every delegation starts a fresh `pi --mode json -p --no-session` subprocess. Task and system-prompt contents are written to temporary mode-0600 files instead of being placed in argv. Cancellation terminates the root process group, and normal completion also sweeps surviving descendants before shutdown.
-
-Nested delegation is bounded by depth 3, a root-wide budget of 32 descendants, a shared limit of four active child slots, at most 16 declared workflow nodes, and one root deadline. Nested callers temporarily yield their parent slot while waiting for descendants, so recursive delegation does not starve behind a full sibling fan-out; the slot count is active work capacity, not a promise that waiting ancestor processes consume no memory. These are guardrails, not a hostile-code sandbox: a Bash-capable child can intentionally launch processes outside the extension's control file or process group. Controls are propagated through ephemeral mode-0600 files and environment IDs; state publication is atomic, policy transport is bounded to 128 KiB, and malformed control state fails closed. Each child has a 30-minute hard timeout, configurable up to two hours with `PI_SUBAGENT_TIMEOUT_MS` and bounded by the root deadline.
-
-Environment is allowlisted. Children automatically receive standard Pi model credential variables, every `$VAR` reference from `~/.pi/agent/models.json`, and credential-shaped `*_API_KEY`/`*_TOKEN` variables. This lets nested agents use model, web research, documentation, GitHub, and similar credentials without manual setup while still excluding arbitrary application environment. `PI_SUBAGENT_PASSTHROUGH_ENV` supports exact names and globs for non-credential variables; `*` passes all env and is an explicit insecure opt-in. Best practice: store keys via `pi /login` into `~/.pi/agent/auth.json` when supported.
-
-A top-level `model` override applies to every mode. A task/chain item may also specify `model`. Resolution is top-level/item override, then agent definition, then the parent pi model. Inheritance passes the parent `provider/id`; runtime-registered providers or credentials are not copied into the child process, so those require child Pi configuration or the explicit environment passthrough policy.
-
-Task inputs are capped at 100 KiB, and agent discovery reads at most 256 Markdown definitions from a bounded streaming directory scan, with 256 KiB per file and 4 MiB of file contents. The model-visible final result and each partial update use one deterministic 50 KiB output cap per tool call. Final assistant output is kept separately from bounded 16 KiB diagnostic message records; oversized provider metadata is omitted from retained message history, and valid structured values are included when they fit the bounded result details. A result is successful only after a terminal assistant response (`stop` or `length`); tool-use turns alone are failures. Result details expose explicit termination states for completed, failed, cancelled, and timed-out runs. The child stream is framed incrementally with a 1 MiB per-line guard: oversized or ignored protocol lines are skipped so verbose tool traffic cannot reject a later valid final response, while cancellation, timeouts, and child failures still terminate the process. Pi 0.84 token-level `message_update` deltas are intentionally ignored for parent previews; `message_end` remains authoritative and tool lifecycle events still provide coarse progress. Background runs retain at most four active and eight bounded handles per extension instance, reject same-root foreground/background mutation overlap, and clean their control state on completion, stop, or session shutdown. Stream input, stderr, diagnostics, stored messages, and rendering are bounded separately and malformed result details render safely. Thrown tool errors retain pi-agent-core error semantics; pi itself may discard custom `Error` fields, so callers must not depend on structured details surviving an error boundary.
-
-`action: "list"` returns the complete agent metadata to the model, while its successful result intentionally renders no body in the interactive TUI to avoid polluting the transcript.
-
-The package targets the current Pi CLI/API used by its `@earendil-works/pi-*` 0.84.3 development dependencies. It does not add compatibility shims for older Pi versions.
-
-## Relationship to pi-workflows
-
-`pi-subagents` is the process-isolated named-agent dispatcher. `pi-workflows` is a separate orchestration extension that owns its private in-process Pi SDK leaf sessions, durable journals, budgets, and lifecycle. Workflows should not invoke this public tool as its worker backend; that would create nested schedulers and duplicate accounting. If workflows later needs crash isolation, it can add a private leaf-process adapter without changing this public API.
-
-## Future opt-ins
-
-Persistent sessions and managed worktrees are deliberately not implemented as subsystems. They can be added later as explicit opt-in features with their own persistence, cleanup, and mutation policies.
+Restart or reload after updating. Old handles do not migrate. Update any personal instructions that still describe named agents or workflow modes; this package does not edit your settings or profiles.
 
 ## Development
 
 ```bash
+bun install --frozen-lockfile
 bun run check
 ```
 
-No build step — pi loads the TypeScript extension directly.
+Pi loads the TypeScript extension directly; there is no build step. Node 22.19+ is required. Checks use the pinned Pi 0.84.3 packages, including real CLI foreground delegation and background RPC notification tests against a local fake model endpoint. Those smoke tests also pass on Pi 0.85.1; no live model calls are needed.
 
-## License
+The subprocess boundary is kept separate from session ownership so a future native Pi child API can replace it; unreleased pico designs are not a supported backend.
 
-MIT
+MIT licensed.

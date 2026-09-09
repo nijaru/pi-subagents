@@ -3,8 +3,7 @@ import * as path from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { findEnvKeys, getProviders } from "@earendil-works/pi-ai/compat";
 
-import { BUDGET_ENV, CONTROL_ENV, DEADLINE_ENV, DELEGATION_POLICY_FILE_ENV, DEPTH_ENV, PARENT_ID_ENV, PASSTHROUGH_ENV, PI_BIN_ENV, ROOT_ID_ENV, RUN_ID_ENV, SUBAGENT_BIN_ENV, TIMEOUT_ENV } from "./limits.ts";
-import type { ControlContext } from "./control.ts";
+import { DEPTH_ENV, PASSTHROUGH_ENV, PI_BIN_ENV, RUN_ID_ENV, SUBAGENT_BIN_ENV, TIMEOUT_ENV } from "./limits.ts";
 
 // Keep the child useful for configured providers without copying arbitrary
 // shell/session state (SSH sockets, cloud metadata, and unrelated secrets).
@@ -132,22 +131,14 @@ export function modelCredentialEnvKeys(): Set<string> {
   return keys;
 }
 
-export function childEnvironment(
-  depth: number,
-  control: ControlContext,
-  parentRunId: string,
-  childRunId: string,
-  budgetRemaining: number,
-  cwd: string,
-  delegationPolicyPath?: string,
-): NodeJS.ProcessEnv {
+export function childEnvironment(childRunId: string, cwd: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const key of SAFE_ENV_KEYS) {
     const value = process.env[key];
     if (value !== undefined) env[key] = value;
   }
   // Auto-include env vars referenced in ~/.pi/agent/models.json. This covers
-  // provider keys, custom headers, and nested children using another configured
+  // provider keys, custom headers, and children using another configured
   // model without exposing unrelated environment variables.
   for (const ref of collectModelEnvRefs()) {
     const value = process.env[ref];
@@ -183,14 +174,8 @@ export function childEnvironment(
     }
   }
   env["PWD"] = cwd;
-  env[DEPTH_ENV] = String(depth);
+  env[DEPTH_ENV] = "1";
   env[RUN_ID_ENV] = childRunId;
-  env[PARENT_ID_ENV] = parentRunId;
-  env[ROOT_ID_ENV] = control.rootRunId;
-  env[CONTROL_ENV] = control.statePath;
-  env[DEADLINE_ENV] = String(control.deadlineMs);
-  env[BUDGET_ENV] = String(budgetRemaining);
-  if (delegationPolicyPath) env[DELEGATION_POLICY_FILE_ENV] = delegationPolicyPath;
   if (process.env[TIMEOUT_ENV] !== undefined) env[TIMEOUT_ENV] = process.env[TIMEOUT_ENV];
   if (process.env[PASSTHROUGH_ENV] !== undefined) env[PASSTHROUGH_ENV] = process.env[PASSTHROUGH_ENV];
   if (process.env[SUBAGENT_BIN_ENV] !== undefined) env[SUBAGENT_BIN_ENV] = process.env[SUBAGENT_BIN_ENV];

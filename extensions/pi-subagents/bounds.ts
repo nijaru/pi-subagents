@@ -1,10 +1,8 @@
 import type { Message } from "@earendil-works/pi-ai";
-import { Check, Errors } from "typebox/value";
-import type { AgentOutputSchema } from "./agents.ts";
 
-import { MAX_DIAGNOSTIC_BYTES, MAX_MESSAGES_PER_AGENT, MAX_MESSAGE_BYTES, MAX_OUTPUT_BYTES, MAX_STDERR_BYTES, MAX_STRUCTURED_OUTPUT_BYTES, MAX_TASK_BYTES } from "./limits.ts";
+import { MAX_DIAGNOSTIC_BYTES, MAX_MESSAGES_PER_AGENT, MAX_MESSAGE_BYTES, MAX_OUTPUT_BYTES, MAX_STDERR_BYTES } from "./limits.ts";
 import { textFromMessage } from "./types.ts";
-import type { AgentResult, SubagentDetails } from "./types.ts";
+import type { ChildResult, SubagentDetails } from "./types.ts";
 
 /** Return a UTF-8 prefix without splitting a code point. */
 export function utf8Prefix(value: string, maxBytes: number): string {
@@ -58,30 +56,6 @@ export function truncateOutput(value: string, maxBytes = MAX_OUTPUT_BYTES): stri
   return utf8Prefix(value, maxBytes);
 }
 
-/** Replace chain placeholders without materializing an unbounded expansion. */
-export function interpolatePrevious(task: string, previous: string, maxBytes = MAX_TASK_BYTES): string {
-  const marker = "{previous}";
-  const chunks: string[] = [];
-  let bytes = 0;
-  let cursor = 0;
-  while (cursor <= task.length && bytes < maxBytes) {
-    const markerIndex = task.indexOf(marker, cursor);
-    const literalEnd = markerIndex < 0 ? task.length : markerIndex;
-    const literal = task.slice(cursor, literalEnd);
-    const literalPrefix = utf8Prefix(literal, maxBytes - bytes);
-    chunks.push(literalPrefix);
-    bytes += Buffer.byteLength(literalPrefix, "utf8");
-    if (literalPrefix.length < literal.length || markerIndex < 0 || bytes >= maxBytes) break;
-
-    const previousPrefix = utf8Prefix(previous, maxBytes - bytes);
-    chunks.push(previousPrefix);
-    bytes += Buffer.byteLength(previousPrefix, "utf8");
-    if (previousPrefix.length < previous.length || bytes >= maxBytes) break;
-    cursor = markerIndex + marker.length;
-  }
-  return chunks.join("");
-}
-
 export function capStderr(current: string, next: string): string {
   const remaining = MAX_STDERR_BYTES - Buffer.byteLength(current, "utf8");
   return remaining > 0 ? current + utf8Prefix(next, remaining) : current;
@@ -93,44 +67,6 @@ export function boundedDiagnostic(value: string | undefined, maxBytes = MAX_DIAG
 
 export function jsonBytes(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value), "utf8");
-}
-
-export function boundStructuredOutput(value: unknown, maxBytes = MAX_DIAGNOSTIC_BYTES): unknown {
-  if (value === undefined) return undefined;
-  try {
-    return jsonBytes(value) <= maxBytes ? value : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-export function structuredOutputPrompt(schema: AgentOutputSchema): string {
-  return [
-    "This agent has an output schema. Your final assistant response must be raw JSON only, with no Markdown fences, commentary, or leading/trailing text.",
-    "The JSON value must validate against this schema:",
-    JSON.stringify(schema),
-    "If you cannot complete the task, still return a JSON value matching the schema rather than a prose error.",
-  ].join("\n");
-}
-
-export function validateStructuredOutput(schema: AgentOutputSchema, raw: string): { value?: unknown; error?: string } {
-  if (Buffer.byteLength(raw, "utf8") > MAX_STRUCTURED_OUTPUT_BYTES) {
-    return { error: `Structured output exceeds the ${MAX_STRUCTURED_OUTPUT_BYTES}-byte limit.` };
-  }
-  let value: unknown;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    return { error: "Structured output must be valid JSON with no surrounding prose or Markdown fences." };
-  }
-  try {
-    if (Check(schema as any, value)) return { value };
-    const issue = [...Errors(schema as any, value)][0];
-    const location = issue?.instancePath ? ` at ${issue.instancePath}` : "";
-    return { error: `Structured output does not match the agent schema${location}${issue?.message ? `: ${issue.message}` : "."}` };
-  } catch (error) {
-    return { error: `Structured output schema could not be evaluated: ${error instanceof Error ? error.message : String(error)}` };
-  }
 }
 
 /** Keep typed pi messages while bounding the data copied into tool details. */
@@ -179,16 +115,12 @@ export function boundMessages(messages: Message[], maxBytes = MAX_OUTPUT_BYTES):
   return result;
 }
 
-export function minimalAgentResult(result: AgentResult): AgentResult {
+export function minimalChildResult(result: ChildResult): ChildResult {
   return {
-    agent: truncateOutput(result.agent, 256),
-    agentSource: result.agentSource,
-    task: "",
-    runId: result.runId,
-    parentRunId: result.parentRunId,
-    rootRunId: result.rootRunId,
-    depth: result.depth,
-    step: result.step,
+    id: result.id,
+    prompt: "",
+    cwd: "",
+    tools: [],
     startedAt: result.startedAt,
     finishedAt: result.finishedAt,
     exitCode: result.exitCode,
@@ -202,20 +134,33 @@ export function minimalAgentResult(result: AgentResult): AgentResult {
   };
 }
 
-export function boundAgentResult(result: AgentResult, maxBytes: number): AgentResult {
-  let bounded = minimalAgentResult(result);
+export function boundChildResult(result: ChildResult, maxBytes: number): ChildResult {
+  let bounded = minimalChildResult(result);
   if (jsonBytes(bounded) >= maxBytes) return bounded;
-  const addCandidate = (key: keyof AgentResult, value: unknown): void => {
-    const next = { ...bounded, [key]: value } as AgentResult;
-    if (jsonBytes(next) <= maxBytes) bounded = next;
+  const addCandidate = (key: keyof ChildResult, value: unknown): boolean => {
+    const next = { ...bounded, [key]: value } as ChildResult;
+    if (jsonBytes(next) > maxBytes) return false;
+    bounded = next;
+    return true;
   };
-  // Structured output is the machine-readable contract for opted-in agents;
-  // do not impose the diagnostic 8 KiB cap when the shared result budget can
-  // retain a larger valid value.
-  addCandidate("structuredOutput", boundStructuredOutput(result.structuredOutput, maxBytes));
-  addCandidate("output", result.output ? truncateOutput(result.output, Math.min(MAX_OUTPUT_BYTES, maxBytes)) : undefined);
-  addCandidate("task", truncateOutput(result.task, Math.min(MAX_DIAGNOSTIC_BYTES, maxBytes)));
-  addCandidate("stderr", truncateOutput(result.stderr, Math.min(MAX_DIAGNOSTIC_BYTES, maxBytes)));
+  // Account for object overhead and JSON escaping rather than dropping a
+  // successful report merely because its full text fills the output budget.
+  const addText = (key: "output" | "prompt" | "stderr", value: string | undefined, cap: number): void => {
+    if (value === undefined) return;
+    let low = 0;
+    let high = Math.min(cap, Buffer.byteLength(value, "utf8"));
+    if (addCandidate(key, truncateOutput(value, high))) return;
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2);
+      if (addCandidate(key, truncateOutput(value, middle))) low = middle + 1;
+      else high = middle - 1;
+    }
+  };
+  addCandidate("tools", result.tools);
+  addCandidate("cwd", result.cwd);
+  addText("output", result.output, MAX_OUTPUT_BYTES);
+  addText("prompt", result.prompt, MAX_DIAGNOSTIC_BYTES);
+  addText("stderr", result.stderr, MAX_DIAGNOSTIC_BYTES);
   // Message histories are the largest and most expensive candidate. Do not
   // build or serialize one when the higher-value fields already fill the
   // result budget, which is common for a completed report.
@@ -226,12 +171,12 @@ export function boundAgentResult(result: AgentResult, maxBytes: number): AgentRe
 }
 
 export function boundDetails(details: SubagentDetails, maxBytes = MAX_OUTPUT_BYTES): SubagentDetails {
-  const minimalResults = details.results.map(minimalAgentResult);
+  const minimalResults = details.results.map(minimalChildResult);
   const bounded: SubagentDetails = { ...details, results: minimalResults };
   const baseBytes = jsonBytes(bounded);
   if (baseBytes >= maxBytes || minimalResults.length === 0) return bounded;
   const perResult = Math.max(1, Math.floor((maxBytes - baseBytes) / minimalResults.length));
-  bounded.results = details.results.map((result) => boundAgentResult(result, jsonBytes(minimalAgentResult(result)) + perResult));
+  bounded.results = details.results.map((result) => boundChildResult(result, jsonBytes(minimalChildResult(result)) + perResult));
   // The allocation above is deterministic. A final minimal fallback keeps
   // the aggregate bounded even if JSON overhead differs across runtimes.
   while (jsonBytes(bounded) > maxBytes && bounded.results.some((result, index) => jsonBytes(result) > jsonBytes(minimalResults[index]!))) {

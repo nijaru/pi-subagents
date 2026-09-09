@@ -1,5 +1,5 @@
-import { addUsage, emptyUsage, isFiniteNumber } from "./types.ts";
-import type { AgentResult, UsageSummary } from "./types.ts";
+import { isFiniteNumber } from "./types.ts";
+import type { ChildResult, UsageSummary } from "./types.ts";
 
 export function isRenderableUsage(value: unknown): value is UsageSummary {
   if (!value || typeof value !== "object") return false;
@@ -10,17 +10,16 @@ export function isRenderableUsage(value: unknown): value is UsageSummary {
     && ["input", "output", "cacheRead", "cacheWrite", "total"].every((key) => isFiniteNumber((cost as Record<string, unknown>)[key]));
 }
 
-export function isRenderableAgentResult(value: unknown): value is AgentResult {
+export function isRenderableChildResult(value: unknown): value is ChildResult {
   if (!value || typeof value !== "object") return false;
-  const result = value as Partial<AgentResult>;
-  return typeof result.agent === "string"
-    && typeof result.agentSource === "string"
-    && typeof result.task === "string"
+  const result = value as Partial<ChildResult>;
+  return typeof result.id === "string"
+    && typeof result.prompt === "string"
+    && typeof result.cwd === "string"
+    && Array.isArray(result.tools) && result.tools.every((tool) => typeof tool === "string")
     && (result.output === undefined || typeof result.output === "string")
-    && (result.structuredOutput === undefined || result.structuredOutput === null || ["string", "number", "boolean", "object"].includes(typeof result.structuredOutput))
-    && typeof result.runId === "string"
-    && typeof result.rootRunId === "string"
-    && isFiniteNumber(result.depth)
+    && (result.errorMessage === undefined || typeof result.errorMessage === "string")
+    && (result.model === undefined || typeof result.model === "string")
     && (result.startedAt === undefined || isFiniteNumber(result.startedAt))
     && (result.finishedAt === undefined || isFiniteNumber(result.finishedAt))
     && isFiniteNumber(result.exitCode)
@@ -42,7 +41,7 @@ export function formatDuration(startedAt?: number, finishedAt?: number): string 
   return `${hours}h ${minutes % 60}m ${seconds}s`;
 }
 
-export function runtimeLabel(result: AgentResult): string {
+export function runtimeLabel(result: ChildResult): string {
   const duration = formatDuration(result.startedAt, result.finishedAt);
   if (!duration) return "";
   return `${duration}${result.exitCode === -1 ? " elapsed" : ""}`;
@@ -64,15 +63,6 @@ export function formatUsage(usage: UsageSummary, model?: string): string {
   if (usage.cost.total) parts.push(`$${usage.cost.total.toFixed(4)}`);
   if (model) parts.push(stripTerminalControls(model));
   return parts.join(" ");
-}
-
-export function aggregateUsage(results: AgentResult[]): UsageSummary {
-  const total = emptyUsage();
-  for (const result of results) {
-    total.turns += result.usage.turns;
-    addUsage(total, result.usage);
-  }
-  return total;
 }
 
 /** Keep untrusted agent text from emitting terminal control sequences in the TUI. */
