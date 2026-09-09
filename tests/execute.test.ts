@@ -10,6 +10,7 @@ interface Host {
   tool: any;
   cwd: string;
   notices: any[];
+  renderers: Map<string, any>;
   execute(params: any, signal?: AbortSignal, update?: (value: any) => void): Promise<any>;
   shutdown(): Promise<void>;
   restart(): Promise<void>;
@@ -25,8 +26,10 @@ function host(active = ["read", "bash", "edit", "write", "web_search", "web_fetc
   let tool: any;
   const events = new Map<string, () => Promise<void>>();
   const notices: any[] = [];
+  const renderers = new Map<string, any>();
   extension({
     registerTool(value: any) { tool = value; },
+    registerMessageRenderer(name: string, renderer: any) { renderers.set(name, renderer); },
     on(name: string, fn: () => Promise<void>) { events.set(name, fn); },
     getActiveTools() { return active; },
     sendMessage(message: any, options: any) { notices.push({ message, options }); },
@@ -34,7 +37,7 @@ function host(active = ["read", "bash", "edit", "write", "web_search", "web_fetc
   const cwd = tempDir();
   const context = { cwd, hasUI: false, model: { provider: "parent", id: "model" }, thinkingLevel: "high" };
   const instance = {
-    tool, cwd, notices,
+    tool, cwd, notices, renderers,
     execute: (params: any, signal?: AbortSignal, update?: (value: any) => void) => tool.execute("call", params, signal, update, context),
     shutdown: () => events.get("session_shutdown")!(),
     restart: () => events.get("session_start")!(),
@@ -167,6 +170,11 @@ describe("background lifecycle", () => {
     expect(h.notices).toHaveLength(1);
     expect(h.notices[0].message.content).toContain(id);
     expect(h.notices[0].options).toEqual({ triggerTurn: true, deliverAs: "followUp" });
+    const theme = { fg: (_: string, text: string) => text, bg: (_: string, text: string) => text };
+    const notice = h.renderers.get("subagent-complete")(h.notices[0].message, { expanded: false, outputPad: 1 }, theme).render(100);
+    expect(notice).toHaveLength(1);
+    expect(notice[0]).toContain(`subagent ${id.slice(0, 8)} completed`);
+    expect(notice[0]).not.toContain("finished later");
     await h.execute({ command: "wait", id });
     expect(h.notices).toHaveLength(1);
   });

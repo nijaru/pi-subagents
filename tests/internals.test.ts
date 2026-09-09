@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { textFromMessage } from "../extensions/pi-subagents/types.ts";
 import { truncateOutput } from "../extensions/pi-subagents/bounds.ts";
-import { stripTerminalControls, truncateChars } from "../extensions/pi-subagents/render.ts";
+import { stripTerminalControls } from "../extensions/pi-subagents/render.ts";
 import { executable, getPiInvocation, parseJsonEventLine } from "../extensions/pi-subagents/subprocess.ts";
 
 const assistant = {
@@ -121,16 +121,6 @@ describe("pi invocation", () => {
     } finally {
       fs.rmSync(directory, { recursive: true, force: true });
     }
-  });
-});
-
-describe("display truncation safety", () => {
-  test("does not split surrogate pairs when truncating for display", () => {
-    expect(truncateChars("abc", 5)).toBe("abc");
-    const truncated = truncateChars("😀x", 2);
-    expect(truncated).toBe("…");
-    expect(truncated).not.toContain("�");
-    expect(truncateChars("😀x", 3)).toBe("😀x");
   });
 });
 

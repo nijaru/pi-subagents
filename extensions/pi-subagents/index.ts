@@ -1,16 +1,14 @@
 import * as path from "node:path";
 import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Check } from "typebox/value";
 import { SessionChildren } from "./children.ts";
 import { SubprocessChildSupervisor, failed, resultText } from "./supervisor.ts";
 import { SubagentParamsSchema, selectTools, validateCommand } from "./params.ts";
-import { DEFAULT_WAIT_MS, MAX_OUTPUT_BYTES, MAX_RETAINED_RUNS, isChildProcess } from "./limits.ts";
+import { DEFAULT_WAIT_MS, MAX_OUTPUT_BYTES, isChildProcess } from "./limits.ts";
 import { existingDirectory } from "./locations.ts";
 import { boundDetails, truncateOutput } from "./bounds.ts";
 import type { ChildResult, SubagentDetails } from "./types.ts";
-import { formatUsage, isRenderableChildResult, runtimeLabel, stripTerminalControls, truncateChars } from "./render.ts";
+import { renderChildCall, renderChildResult, renderChildCompletion, runtimeLabel } from "./render.ts";
 
 export { SubagentParamsSchema } from "./params.ts";
 export type { SubagentParams } from "./params.ts";
@@ -35,6 +33,7 @@ function outcome(command: SubagentDetails["command"], result: ChildResult): Agen
 }
 
 export default function (pi: ExtensionAPI) {
+  pi.registerMessageRenderer("subagent-complete", renderChildCompletion);
   const createChildren = () => new SessionChildren(new SubprocessChildSupervisor(), (result) => {
     pi.sendMessage({
       customType: "subagent-complete",
@@ -99,37 +98,7 @@ export default function (pi: ExtensionAPI) {
       try { return outcome("run", await run.promise); }
       finally { signal?.removeEventListener("abort", abort); }
     },
-    renderCall(args, theme) {
-      const clean = (text: string) => truncateChars(stripTerminalControls(text), 100);
-      const title = `subagent ${clean(args.command ?? "")}${args.id ? ` ${clean(args.id)}` : ""}`;
-      return new Text(`${theme.fg("toolTitle", theme.bold(title))}${args.prompt ? `\n${theme.fg("dim", clean(args.prompt))}` : ""}`, 0, 0);
-    },
-    renderResult(result, { expanded }, theme) {
-      const details = result.details as SubagentDetails | undefined;
-      const fallback = result.content[0]?.type === "text" && typeof result.content[0].text === "string" ? stripTerminalControls(truncateOutput(result.content[0].text)) : "(no output)";
-      const results = Array.isArray(details?.results) ? details.results.slice(0, MAX_RETAINED_RUNS) : [];
-      if (!results.length || !results.every(isRenderableChildResult)) return new Text(fallback, 0, 0);
-      const container = new Container();
-      let remaining = MAX_OUTPUT_BYTES;
-      const take = (text: string) => {
-        const bounded = truncateOutput(text, remaining);
-        remaining = Math.max(0, remaining - Buffer.byteLength(bounded, "utf8"));
-        return stripTerminalControls(bounded);
-      };
-      for (const child of results) {
-        const active = child.exitCode === -1;
-        const status = active ? "running" : child.termination ?? "failed";
-        const icon = active ? "⏳" : failed(child) ? "✗" : "✓";
-        container.addChild(new Text(`${icon} ${theme.fg("accent", stripTerminalControls(truncateChars(child.id, 128)))} ${status} ${runtimeLabel(child)}`, 0, 0));
-        container.addChild(new Text(theme.fg("dim", stripTerminalControls(truncateChars(child.prompt, expanded ? 500 : 100))), 0, 0));
-        if (!active && details?.command !== "status") {
-          const output = take(resultText(child));
-          container.addChild(expanded ? new Markdown(output, 0, 0, getMarkdownTheme()) : new Text(truncateChars(output.split("\n").slice(0, 5).join("\n"), 500), 0, 0));
-          container.addChild(new Text(theme.fg("dim", formatUsage(child.usage, child.model ? truncateChars(child.model, 256) : undefined)), 0, 0));
-        }
-        container.addChild(new Spacer(1));
-      }
-      return container;
-    },
+    renderCall: renderChildCall,
+    renderResult: renderChildResult,
   });
 }

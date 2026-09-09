@@ -31,6 +31,8 @@ Background children send a completion notice and request a follow-up parent turn
 
 Handles belong to the current parent session. All children stop on quit, reload, or session replacement. Background work requires a live parent process; a one-shot print invocation is not a persistent worker host.
 
+The TUI shows each prompt once, short IDs, and up to five visible output lines. Expand tool output for full IDs, working directory, tools, and usage. Short IDs are display-only; tool calls still require the full ID. Completion notices occupy one line, with results available on expansion. A notice already queued while Pi is busy can still arrive after `wait` returns.
+
 ### Tools and context
 
 - Defaults are the parent's active tools among `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `web_research`, `resolve-library-id`, and `query-docs`. Research tools require their extensions; they are not supplied by this package.
