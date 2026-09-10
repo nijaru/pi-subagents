@@ -48,7 +48,7 @@ The subprocess loads its own Pi configuration, extensions, skills, and applicabl
 
 Use `spawn` for independent work alongside useful, non-overlapping parent work. Use `run` when a fresh perspective or context-heavy investigation is worth waiting for. Keep routine lookups and tightly coupled edits local. The parent owns integration and verification; do not repeat the child's assignment while it runs.
 
-Use separate worktrees for concurrent writers. The extension rejects simultaneous potentially mutating children in one canonical repository root, including symlink aliases and nested packages. It cannot guard the parent's own edits. Read-only children may overlap, but reading files while another process changes them does not provide a consistent snapshot.
+Children are separate processes that share your working tree. The extension counts concurrency slots; it does not arbitrate write ownership, and it cannot guard the parent's own edits. Give concurrent writers distinct worktrees rather than relying on children to stay out of each other's way. Read-only children may overlap, but reading files while another process changes them does not provide a consistent snapshot.
 
 ## Limits and safety
 
@@ -62,11 +62,11 @@ Use separate worktrees for concurrent writers. The extension rejects simultaneou
 | Tool response and result details | 50 KiB each |
 | Background completion excerpt | 8 KiB |
 
-All children use the same subprocess runner: `pi --mode json -p --no-session`. Prompts travel through temporary mode-0600 files, not command arguments. Normal completion and cancellation sweep the child's process group before releasing write ownership. No profiles, workflow scheduler, recursive delegation, session persistence, or managed worktree creation is included.
+All children use the same subprocess runner: `pi --mode json -p --no-session`. Prompts travel through temporary mode-0600 files, not command arguments. Normal completion and cancellation sweep the child's process group before releasing the concurrency slot. No profiles, workflow scheduler, recursive delegation, session persistence, or managed worktree creation is included.
 
 A successful child must produce terminal assistant output. Failures, cancellation, and timeouts remain distinguishable in retained status. `run` and completed `wait` throw tool errors for failed children; `status` remains available to inspect them. `stop` reports the resulting state without treating requested cancellation as a tool failure.
 
-Tool allowlists and subprocesses are **not sandboxes**. Shells and unknown extension tools are classified as potentially mutating, regardless of the prompt. A child with shell access can launch external effects or processes outside the managed group. Parent permission state is not an inherited security boundary.
+Tool allowlists and subprocesses are **not sandboxes**. A child with shell access can produce effects outside the managed process group. Parent permission state is not an inherited security boundary.
 
 Environment variables are allowlisted, with standard model credentials, `$VAR` references from Pi's `models.json`, and `*_API_KEY`/`*_TOKEN` variables forwarded. Other variables require `PI_SUBAGENT_PASSTHROUGH_ENV` (comma-separated exact names or globs). `*` explicitly forwards all environment variables. Credentials saved through `pi /login` remain available through the child's Pi configuration.
 

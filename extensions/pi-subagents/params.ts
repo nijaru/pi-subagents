@@ -18,12 +18,13 @@ export const SubagentParamsSchema = Type.Object({
 
 export type SubagentParams = Static<typeof SubagentParamsSchema>;
 
-// These are effect metadata, not a sandbox. Unknown extension tools and shells
-// are potentially mutating even when the task asks them only to inspect files.
+// Always offered by default, and the source of the research tools in the default
+// allowlist below; `read` is filtered out there because it is listed explicitly.
 export const READ_ONLY_TOOLS = new Set([
   "read", "grep", "find", "ls", "web_search", "web_fetch", "web_research", "resolve-library-id", "query-docs",
 ]);
-const DEFAULT_TOOLS = ["read", "bash", "edit", "write", ...[...READ_ONLY_TOOLS].filter((name) => name !== "read")];
+const CODING_TOOLS = ["read", "bash", "edit", "write"];
+const DEFAULT_TOOLS = [...CODING_TOOLS, ...[...READ_ONLY_TOOLS].filter((name) => name !== "read")];
 
 export function selectTools(requested: string[] | undefined, active: string[]): string[] {
   const tools = requested ?? DEFAULT_TOOLS.filter((name) => active.includes(name));

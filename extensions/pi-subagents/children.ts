@@ -5,8 +5,6 @@ import type { ChildSupervisor } from "./supervisor.ts";
 import { copyResult } from "./supervisor.ts";
 import { MAX_CONCURRENCY, MAX_DIAGNOSTIC_BYTES, MAX_RETAINED_RUNS } from "./limits.ts";
 import { truncateOutput } from "./bounds.ts";
-import { READ_ONLY_TOOLS } from "./params.ts";
-import { projectRoot } from "./locations.ts";
 
 export interface ChildRun {
   result: ChildResult;
@@ -17,8 +15,6 @@ export interface ChildRun {
   promise: Promise<ChildResult>;
   /** Removable completion listeners; timed-out waits must not accumulate promise reactions. */
   waiters: Set<() => void>;
-  projectRoot: string;
-  mutating: boolean;
 }
 
 export interface StartChild {
@@ -42,11 +38,6 @@ export class SessionChildren {
     if (this.closed) throw new Error("The parent session is closing; no new children can start.");
     const active = [...this.runs.values()].filter((run) => !run.settled);
     if (active.length >= MAX_CONCURRENCY) throw new Error(`Too many active children (maximum ${MAX_CONCURRENCY}). Wait for or stop a child first.`);
-    const root = projectRoot(options.cwd);
-    const mutating = options.tools.some((tool) => !READ_ONLY_TOOLS.has(tool));
-    if (mutating && active.some((run) => run.mutating && run.projectRoot === root)) {
-      throw new Error(`Concurrent mutation rejected: a child already owns project root ${root}. Use a separate worktree or wait for it to finish.`);
-    }
     while (this.runs.size >= MAX_RETAINED_RUNS) {
       const oldest = [...this.runs.values()].find((run) => run.settled);
       if (!oldest) throw new Error("All retained child handles are active.");
@@ -59,7 +50,7 @@ export class SessionChildren {
     const completion = Promise.withResolvers<ChildResult>();
     const run: ChildRun = {
       result, notifyOnCompletion: options.background, controller: new AbortController(), settled: false,
-      promise: completion.promise, waiters: new Set(), projectRoot: root, mutating,
+      promise: completion.promise, waiters: new Set(),
     };
     // Register before execution can emit, await, or invoke extension callbacks.
     this.runs.set(result.id, run);

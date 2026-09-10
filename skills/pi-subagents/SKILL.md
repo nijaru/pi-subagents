@@ -26,9 +26,9 @@ The prompt must carry the relevant evidence, decisions, scope, constraints, expe
 
 Omitted `tools` selects active parent coding and known research tools. Use an explicit list to narrow access, or `tools: []` for reasoning-only work. Research extensions must be installed in child Pi too; parent runtime-only tools and providers are not copied. `model` overrides the inherited parent model; thinking effort inherits the parent session level.
 
-Tools must be active in the parent. Shells and unknown extension tools are conservatively treated as potentially mutating. `subagent` itself is forbidden: children are leaves. These are access and scheduling controls, not a sandbox or a transfer of parent permission-hook state.
+Tools must be active in the parent. `subagent` itself is forbidden: children are leaves. These are access controls, not a sandbox or a transfer of parent permission-hook state.
 
-Give concurrent writers distinct worktrees through `cwd`. The extension rejects simultaneous child writers sharing a repository root; it cannot prevent overlap with parent edits. Do not duplicate the delegated assignment. Inspect returned evidence or patches and own integration and final verification in the parent.
+Give concurrent writers distinct worktrees through `cwd`. Children are separate processes sharing one working tree; the extension does not arbitrate write ownership and cannot prevent overlap with parent edits. Do not duplicate the delegated assignment. Inspect returned evidence or patches and own integration and final verification in the parent.
 
 ## Failure and recovery
 

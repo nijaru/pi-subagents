@@ -52,7 +52,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
-    description: "Delegate one self-contained task to a fresh child. run waits; spawn returns an id and reports completion later. status, wait and stop control session-scoped children. Defaults to available coding/research tools; tools can narrow access. No profiles, nested delegation, shared history, or persistent child sessions. Concurrent writers must use distinct project roots/worktrees.",
+    description: "Delegate one self-contained task to a fresh child. run waits; spawn returns an id and reports completion later. status, wait and stop control session-scoped children. Defaults to available coding/research tools; tools can narrow access. No profiles, nested delegation, shared history, or persistent child sessions.",
     parameters: SubagentParamsSchema,
     executionMode: "sequential",
     promptSnippet: "Use run for a fresh-context result, or spawn for independent work alongside useful local work.",
@@ -60,7 +60,7 @@ export default function (pi: ExtensionAPI) {
       "Give the child relevant evidence, scope, constraints, expected output and checks. Its conversation starts fresh; it does not receive parent history.",
       "Prefer direct work for routine or tightly coupled tasks. Do not duplicate delegated work. The parent owns integration and verification.",
       "Background children send completion notices. Wait only when their result blocks your next step. Cancelling wait does not stop the child; use stop.",
-      "Use separate worktrees for concurrent writers, including parent-versus-child writes. Tools and separate processes are not sandboxes.",
+      "Use separate worktrees for concurrent writers, including parent-versus-child writers. Children are separate processes that share one working tree; the extension does not arbitrate write ownership.",
     ],
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       if (!Check(SubagentParamsSchema, params)) throw new Error("Invalid subagent parameters. Use command: run/spawn with prompt, or status/wait/stop with id. Named agents, tasks[], chain, workflow and background objects are no longer supported.");

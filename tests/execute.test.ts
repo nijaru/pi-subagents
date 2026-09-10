@@ -221,7 +221,7 @@ describe("background lifecycle", () => {
     await expect(h.execute({ command: "run", prompt: "fifth", tools: ["read"] })).rejects.toThrow("maximum 4");
     expect((await h.execute({ command: "status" })).details.results).toHaveLength(4);
   });
-  test("rejects writers in one git root even through nested packages and symlinks", async () => {
+  test("admits concurrent writers in one root and one worktree", async () => {
     const h = host(); fakePi("await Bun.sleep(10000);");
     fs.mkdirSync(path.join(h.cwd, ".git"));
     for (const name of ["one", "two"]) {
@@ -230,17 +230,8 @@ describe("background lifecycle", () => {
     }
     fs.symlinkSync(path.join(h.cwd, "two"), path.join(h.cwd, "alias"));
     await spawn(h, { tools: ["bash"], cwd: "one" });
-    await expect(h.execute({ command: "run", prompt: "writer", cwd: "alias" })).rejects.toThrow("Concurrent mutation");
-  });
-  test("permits independent worktree writers and same-root readers", async () => {
-    const h = host(); fakePi("await Bun.sleep(10000);");
-    for (const name of ["one", "two"]) {
-      fs.mkdirSync(path.join(h.cwd, name));
-      fs.writeFileSync(path.join(h.cwd, name, ".git"), "gitdir: /unused");
-    }
-    await spawn(h, { tools: ["bash"], cwd: "one" });
-    await spawn(h, { tools: ["bash"], cwd: "two" });
-    await spawn(h, { tools: ["read"], cwd: "one" });
+    await spawn(h, { tools: ["bash"], cwd: "alias" });
+    await spawn(h, { tools: ["read", "bash", "edit", "write"], cwd: "." });
     expect((await h.execute({ command: "status" })).details.results).toHaveLength(3);
   });
 });
