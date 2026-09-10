@@ -18,7 +18,7 @@ Merge only a coherent, independently usable slice. Keep dependent scaffolding on
 - `children.ts`: session-owned handles, synchronous admission, wait/stop, retention, shutdown fencing.
 - `supervisor.ts`: the single child execution boundary used by both run and spawn; prompt files, progress, terminal result validation, cleanup.
 - `subprocess.ts`: Pi invocation, bounded JSON framing, process-tree cancellation and normal-exit sweep.
-- `params.ts`, `locations.ts`: command/tool policy and working-directory resolution.
+- `params.ts`: command/tool policy and working-directory resolution.
 - `env.ts`, `bounds.ts`, `limits.ts`, `types.ts`, `render.ts`: environment policy, output/resource bounds, result contracts, rendering helpers.
 - `tests/`: deterministic lifecycle tests plus real subprocess protocol regression tests.
 

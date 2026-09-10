@@ -1,3 +1,5 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
 import { MAX_TASK_BYTES, MAX_WAIT_MS } from "./limits.ts";
@@ -49,4 +51,13 @@ export function validateCommand(params: SubagentParams): void {
     if (params.id !== undefined && !params.id.trim()) throw new Error("Child id must not be blank.");
     if (params.command !== "wait" && params.timeoutMs !== undefined) throw new Error("timeoutMs is only accepted by wait.");
   }
+}
+
+/** Resolve a child's working directory against the parent's; symlinks are canonicalized. */
+export function resolveCwd(parentCwd: string, requested: string | undefined): string {
+  const directory = path.resolve(parentCwd, requested ?? ".");
+  try {
+    if (fs.statSync(directory).isDirectory()) return fs.realpathSync.native(directory);
+  } catch { /* Report one actionable diagnostic for missing and invalid paths. */ }
+  throw new Error(`Working directory does not exist: ${directory}`);
 }

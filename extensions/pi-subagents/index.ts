@@ -1,11 +1,9 @@
-import * as path from "node:path";
 import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Check } from "typebox/value";
 import { SessionChildren } from "./children.ts";
 import { SubprocessChildSupervisor, failed, resultText } from "./supervisor.ts";
-import { SubagentParamsSchema, selectTools, validateCommand } from "./params.ts";
+import { SubagentParamsSchema, resolveCwd, selectTools, validateCommand } from "./params.ts";
 import { DEFAULT_WAIT_MS, MAX_OUTPUT_BYTES, isChildProcess } from "./limits.ts";
-import { existingDirectory } from "./locations.ts";
 import { boundDetails, truncateOutput } from "./bounds.ts";
 import type { ChildResult, SubagentDetails } from "./types.ts";
 import { renderChildCall, renderChildResult, renderChildCompletion, runtimeLabel } from "./render.ts";
@@ -83,7 +81,7 @@ export default function (pi: ExtensionAPI) {
       }
       if (signal?.aborted) throw new Error("Child launch cancelled.");
       const tools = selectTools(params.tools, pi.getActiveTools());
-      const cwd = existingDirectory(path.resolve(ctx.cwd || process.cwd(), params.cwd ?? "."));
+      const cwd = resolveCwd(ctx.cwd || process.cwd(), params.cwd);
       const background = params.command === "spawn";
       const run = owner.start({
         prompt: params.prompt!, tools, cwd, background,
