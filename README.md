@@ -88,7 +88,7 @@ bun install --frozen-lockfile
 bun run check
 ```
 
-Pi loads the TypeScript extension directly; there is no build step. Node 22.19+ is required. Checks use the pinned Pi 0.84.3 packages, including real CLI foreground delegation and background RPC notification tests against a local fake model endpoint. Those smoke tests also pass on Pi 0.85.1; no live model calls are needed.
+Pi loads the TypeScript extension directly; there is no build step. Node 22.19+ is required. Checks use the pinned Pi 0.85.1 packages, including real CLI foreground delegation and background RPC notification tests against a local fake model endpoint. No live model calls are needed.
 
 The subprocess boundary is kept separate from session ownership so a future native Pi child API can replace it; unreleased pico designs are not a supported backend.
 
