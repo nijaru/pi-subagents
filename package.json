@@ -1,6 +1,6 @@
 {
-  "name": "pi-subagents",
-  "version": "0.1.0",
+  "name": "@nijaru/pi-subagents",
+  "version": "0.0.1",
   "type": "module",
   "description": "Task-first child delegation for Pi: foreground runs, background completion notices, and bounded subprocess lifecycle.",
   "keywords": [
@@ -12,6 +12,10 @@
     "background"
   ],
   "license": "MIT",
+
+  "publishConfig": {
+    "access": "public"
+  },
   "author": "Nick Naru <nick@nijaru.com>",
   "repository": {
     "type": "git",

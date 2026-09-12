@@ -5,7 +5,7 @@ Delegate a self-contained task to a fresh [Pi](https://github.com/earendil-works
 ## Install
 
 ```bash
-pi install git:github.com/nijaru/pi-subagents
+pi install npm:@nijaru/pi-subagents
 ```
 
 Restart Pi or use `/reload`. The package registers one tool, `subagent`.
