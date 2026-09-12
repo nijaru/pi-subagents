@@ -30,4 +30,4 @@ Default tools are known coding/research tools active in the parent; explicit too
 
 Preserve private prompt-file transport, bounded output/protocol framing, meaningful failure states, deadlines, and process-tree cleanup. Changes to removed v0 APIs must update the migration section and agent-facing skill together; do not add silent aliases.
 
-Development dependencies target Pi 0.84.3. New Pi/pico documentation is design evidence until the corresponding API exists and is verified; do not claim compatibility based on proposed interfaces.
+Development dependencies target Pi 0.85.1 and the full subprocess/lifecycle suite is the compatibility gate. New Pi/pico documentation is design evidence until the corresponding API exists and is verified; do not claim compatibility based on proposed interfaces.
