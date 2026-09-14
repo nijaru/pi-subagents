@@ -1,9 +1,8 @@
-import type { ChildResult } from "./types.ts";
-import type { AgentOutcome } from "./types.ts";
+import type { AgentOutcome, ChildResult } from "./types.ts";
 import type { Message, StopReason } from "@earendil-works/pi-ai";
-import { MAX_DIAGNOSTIC_BYTES, MAX_STDERR_BYTES, RUNNING_PROGRESS_TEXT, RUNTIME_UPDATE_INTERVAL_MS } from "./limits.ts";
+import { MAX_DIAGNOSTIC_BYTES, RUNNING_PROGRESS_TEXT, RUNTIME_UPDATE_INTERVAL_MS } from "./limits.ts";
 import { boundedDiagnostic, truncateOutput } from "./bounds.ts";
-import { applyMessage, runPiProcess } from "./subprocess.ts";
+import { applyMessage, runPiProcess, type ProcessResult } from "./subprocess.ts";
 
 export interface ChildRunRequest {
   result: ChildResult;
@@ -89,7 +88,8 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
         },
       });
 
-      result.stderr = truncateOutput(processResult.stderr, MAX_STDERR_BYTES);
+      // Bounded by the process reader; keep the head and tail intact here.
+      result.stderr = processResult.stderr;
       const outcome = classify(result, processResult, messageOutcome, messageStopReason, protocolFailure);
       report(result.output || outcome.errorMessage || "(no output)");
       return outcome;
@@ -110,7 +110,7 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
 
 function classify(
   result: ChildResult,
-  processResult: { exitCode: number; stopReason?: StopReason; outcome: AgentOutcome; errorMessage?: string },
+  processResult: ProcessResult,
   messageOutcome: AgentOutcome | undefined,
   messageStopReason: StopReason | undefined,
   protocolFailure: string | undefined,

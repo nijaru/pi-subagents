@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { Message, StopReason } from "@earendil-works/pi-ai";
 
-import { MAX_OUTPUT_BYTES, MAX_PROTOCOL_LINE_BYTES } from "./limits.ts";
+import { MAX_OUTPUT_BYTES, MAX_PROTOCOL_LINE_BYTES, MAX_STDERR_BYTES } from "./limits.ts";
 import { addUsage, isFinalMessage, textFromMessage } from "./types.ts";
 import type { ChildResult, AgentOutcome, UsageSummary } from "./types.ts";
 import { boundedDiagnostic, capStderr, truncateHeadTail, truncateOutput } from "./bounds.ts";
@@ -370,7 +370,7 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
         if (killTimer) clearTimeout(killTimer);
         if (processTimer) clearTimeout(processTimer);
         if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
-        resolve({ ...result, stderr: truncateOutput(stderr) });
+        resolve({ ...result, stderr: truncateHeadTail(stderr, MAX_STDERR_BYTES) });
       })();
     };
 

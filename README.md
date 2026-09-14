@@ -46,6 +46,8 @@ The TUI shows each prompt once, short IDs, and up to five visible output lines. 
 
 The subprocess loads its own Pi configuration, extensions, skills, and applicable `AGENTS.md` files. **Fresh context does not mean an empty system prompt.** Runtime-only tools, providers, credentials, and permission-hook state are not cloned from the parent; required integrations must also be configured in child Pi. A tool active only in the parent may therefore be unavailable in the child.
 
+`tools` filters tool names, not extension code: child Pi still loads its configured extensions, so unrelated extension behavior (commands, hooks, providers) keeps running even when its tools are excluded. Use `tools: []` to give the model no tools; that is not a sandbox.
+
 ### When to delegate
 
 Use `spawn` for independent work alongside useful, non-overlapping parent work. Use `run` when a fresh perspective or context-heavy investigation is worth waiting for. Keep routine lookups and tightly coupled edits local. The parent owns integration and verification; do not repeat the child's assignment while it runs.
