@@ -204,6 +204,40 @@ export function terminateProcessGroup(child: ChildProcess, signal: NodeJS.Signal
   }
 }
 
+/**
+ * Spawn a detached watchdog that holds the parent's end of a private pipe.
+ *
+ * The pipe closes however the parent dies, including SIGKILL, and the watchdog
+ * then terminates the child's process group. That is the only way a hard parent
+ * crash cannot leave a mutating child behind, since no exit handler runs on
+ * SIGKILL. Windows needs a native job object for the same effect, so it keeps
+ * the graceful-shutdown-only guarantee.
+ */
+export function spawnDeathWatchdog(child: ChildProcess): ChildProcess | undefined {
+  if (process.platform === "win32" || !child.pid) return undefined;
+  const script = [
+    "cat >/dev/null",
+    'kill -s TERM -- "-$1" 2>/dev/null',
+    "i=0",
+    'while kill -s 0 -- "-$1" 2>/dev/null && [ "$i" -lt 25 ]; do sleep 0.2; i=$((i+1)); done',
+    'kill -s KILL -- "-$1" 2>/dev/null',
+  ].join("; ");
+  try {
+    const watchdog = spawn("sh", ["-c", script, "sh", String(child.pid)], {
+      stdio: ["pipe", "ignore", "ignore"],
+      // Survive a parent that is killed together with its process group.
+      detached: true,
+    });
+    watchdog.on("error", () => {});
+    watchdog.stdin?.on("error", () => {});
+    // Cleanup alone must never keep the parent's event loop alive.
+    watchdog.unref();
+    return watchdog;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Sweep only the detached root group after its leader exits. */
 export async function sweepRootProcessGroup(child: ChildProcess): Promise<void> {
   if (!child.pid) return;
@@ -306,12 +340,16 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
     let processTimer: ReturnType<typeof setTimeout> | undefined;
     let timedOut = false;
     let eventError: string | undefined;
+    let watchdog: ChildProcess | undefined;
     const decoder = new StringDecoder("utf8");
     let abortHandler: (() => void) | undefined;
 
     const finish = (result: ProcessResult) => {
       if (settled || finishing) return;
       finishing = true;
+      // Release the death watchdog: the child is already exiting, and its pipe
+      // must not stay open once this run is accounted for.
+      watchdog?.stdin?.end();
       void (async () => {
         // A background run must not release mutation ownership while a
         // descendant from its detached root group can still be alive.
@@ -351,6 +389,7 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
       // cannot defer cleanup until the hard timeout.
       child.once("exit", sweepRoot);
       child.once("close", sweepRoot);
+      watchdog = spawnDeathWatchdog(child);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       finish({ exitCode: 1, stopReason: "error", termination: "failed", errorMessage: message, stderr });

@@ -346,6 +346,46 @@ describe("subprocess regressions", () => {
     expect(first(value).termination).toBe("completed");
     expect(fs.existsSync(marker)).toBe(true);
   });
+  test("killing the parent mid-run kills the child instead of orphaning it", async () => {
+    if (process.platform === "win32") return;
+    const dir = tempDir();
+    const started = path.join(dir, "started");
+    const marker = path.join(dir, "mutation");
+    const pi = path.join(dir, "pi");
+    // A real child that outlives its parent long enough to mutate the tree.
+    fs.writeFileSync(pi, `#!/usr/bin/env bun
+import * as fs from "node:fs";
+const decoder = new TextDecoder();
+let prompt = "";
+for await (const chunk of Bun.stdin.stream()) prompt += decoder.decode(chunk, { stream: true });
+fs.writeFileSync(${JSON.stringify(started)}, "1");
+await Bun.sleep(1500);
+fs.writeFileSync(${JSON.stringify(marker)}, "mutated");
+`);
+    fs.chmodSync(pi, 0o755);
+    const parentScript = path.join(dir, "parent.ts");
+    fs.writeFileSync(parentScript, `import { SubprocessChildSupervisor } from ${JSON.stringify(path.resolve(import.meta.dir, "../extensions/pi-subagents/supervisor.ts"))};
+const result: any = { id: "orphan-check", prompt: "task", cwd: process.cwd(), tools: [], exitCode: -1, stderr: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, turns: 0 } };
+await new SubprocessChildSupervisor().run({ result, signal: new AbortController().signal });
+`);
+    const proc = Bun.spawn([process.execPath, parentScript], {
+      cwd: dir,
+      env: { ...process.env, PI_SUBAGENT_BIN: pi },
+      stdout: "ignore", stderr: "pipe",
+    });
+    try {
+      const deadline = Date.now() + 15000;
+      while (!fs.existsSync(started) && Date.now() < deadline) await Bun.sleep(20);
+      expect(fs.existsSync(started)).toBe(true);
+      process.kill(proc.pid, "SIGKILL");
+      await proc.exited;
+      await Bun.sleep(2500);
+      expect(fs.existsSync(marker)).toBe(false);
+    } finally {
+      try { process.kill(proc.pid, "SIGKILL"); } catch { /* already gone */ }
+      await proc.exited;
+    }
+  }, 30000);
   test("renders current results and safely falls back for old transcripts", async () => {
     const h = host(); fakePi();
     const value = await h.execute({ command: "run", prompt: "render me" });

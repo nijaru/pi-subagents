@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -5,7 +6,7 @@ import * as path from "node:path";
 import { textFromMessage } from "../extensions/pi-subagents/types.ts";
 import { truncateOutput } from "../extensions/pi-subagents/bounds.ts";
 import { stripTerminalControls } from "../extensions/pi-subagents/render.ts";
-import { executable, getPiInvocation, parseJsonEventLine } from "../extensions/pi-subagents/subprocess.ts";
+import { executable, getPiInvocation, parseJsonEventLine, spawnDeathWatchdog } from "../extensions/pi-subagents/subprocess.ts";
 
 const assistant = {
   role: "assistant",
@@ -128,3 +129,32 @@ function pathReal(value: string): string {
   // realpath is intentionally kept local so the test only asserts the public contract.
   return fs.realpathSync.native(value);
 }
+
+function groupAlive(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+describe("parent-death supervision", () => {
+  test("the watchdog leaves a live parent's child group alone until the pipe closes", async () => {
+    if (process.platform === "win32") return;
+    const victim = spawn("sh", ["-c", "sleep 30"], { detached: true, stdio: "ignore" });
+    const pid = victim.pid!;
+    const watchdog = spawnDeathWatchdog(victim);
+    expect(watchdog).toBeDefined();
+    try {
+      await Bun.sleep(300);
+      expect(groupAlive(pid)).toBe(true);
+      watchdog!.stdin!.end();
+      const deadline = Date.now() + 8000;
+      while (groupAlive(pid) && Date.now() < deadline) await Bun.sleep(50);
+      expect(groupAlive(pid)).toBe(false);
+    } finally {
+      try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
+    }
+  });
+});
