@@ -78,9 +78,16 @@ Tool allowlists and subprocesses are **not sandboxes**. A child with shell acces
 
 Environment variables are allowlisted, with standard model credentials, `$VAR` references from Pi's `models.json`, and `*_API_KEY`/`*_TOKEN` variables forwarded. Other variables require `PI_SUBAGENT_PASSTHROUGH_ENV` (comma-separated exact names or globs). `*` explicitly forwards all environment variables. Credentials saved through `pi /login` remain available through the child's Pi configuration.
 
-## Migration from 0.0.1
+## Release notes
 
-Version 0.1 replaces the profile/workflow API rather than maintaining a second interface:
+`0.0.x` is pre-release: the tool schema is stable, but behavior and the exported `ChildResult` shape are not promised across patch releases. Read this file, not the version number, for what changed.
+
+- **0.0.2**: `run` joins within a foreground budget and then continues as background work; `ChildResult` carries `state` instead of `exitCode`/`termination`; prompts travel on stdin instead of a temporary file; a blocking join claims the result it delivers; a crashed or killed parent now stops its children; stderr keeps both ends.
+- **0.0.1**: task-first child lifecycle.
+
+## Migration from the profile/workflow API
+
+This package replaces the profile/workflow API rather than maintaining a second interface:
 
 - `{agent, task}` → `{command: "run", prompt: task, tools?: [...]}`. Include useful profile instructions in the task prompt.
 - `background.action: "start"` → `command: "spawn"`; `runId` → `id`; `result` → `wait`.

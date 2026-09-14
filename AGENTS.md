@@ -12,6 +12,12 @@ bun run check
 
 Merge only a coherent, independently usable slice. Keep dependent scaffolding on feature branches. Before merging, run the checks and inspect the complete diff.
 
+## Versioning and release
+
+Stay on `0.0.x` while this is pre-release and effectively single-user: bump only the patch component and put breaking changes in the README migration section rather than in the version number. Move to `0.x.0` once something other than the author consumes the package, when the number has to carry compatibility meaning for someone else. `0.0.x` gives ranges no protection (`~0.0.1` would accept a breaking `0.0.2`), so never rely on the version to warn a consumer.
+
+Release through the manual `publish` workflow, never from a working tree. Verify the packed artifact, not just the source tree: `npm pack`, extract, and run a real delegation against the extracted copy before dispatching.
+
 ## Ownership and contracts
 
 - `extensions/pi-subagents/index.ts`: registration, parent session lifecycle, completion notices, command dispatch, rendering.
