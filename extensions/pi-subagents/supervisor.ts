@@ -72,7 +72,9 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
         signal,
         onEvent: (event) => {
           if (event.kind === "message" && event.message) {
-            sawMessageEvent = true;
+            // Only assistant messages are authoritative for output and usage, so
+            // only they suppress the agent_end fallback.
+            if (event.message.role === "assistant") sawMessageEvent = true;
             note(event.message);
             report(result.output || "Child is working...");
           } else if (event.kind === "messages" && event.messages && !sawMessageEvent) {

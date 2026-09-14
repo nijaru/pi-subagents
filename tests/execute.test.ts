@@ -398,6 +398,14 @@ await new SubprocessChildSupervisor().run({ result, signal: new AbortController(
     expect(status.stderr).toContain("EARLY_DIAGNOSTIC");
     expect(status.stderr).toContain("FINAL_STACK_TRACE");
   });
+  test("still accepts a terminal assistant message delivered only by agent_end", async () => {
+    const h = host();
+    // A non-assistant message event must not suppress the fallback path.
+    fakePi('emit({type:"message_end",message:{role:"user",content:"task",timestamp:0}}); emit({type:"agent_end",messages:[message("from agent_end")]});');
+    const value = await h.execute({ command: "run", prompt: "x" });
+    expect(first(value).output).toBe("from agent_end");
+    expect(first(value).state).toMatchObject({ outcome: "completed" });
+  });
   test("renders current results and safely falls back for old transcripts", async () => {
     const h = host(); fakePi();
     const value = await h.execute({ command: "run", prompt: "render me" });
