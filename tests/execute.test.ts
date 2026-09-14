@@ -308,9 +308,13 @@ describe("subprocess regressions", () => {
     expect(first(value).usage.totalTokens).toBe(9);
     expect(first(value).usage.cost.total).toBe(1);
   });
-  test("update-handler failure cleans up and retains its diagnostic", async () => {
+  test("a failing update handler does not fail or terminate the child", async () => {
     const h = host(); fakePi();
-    await expect(h.execute({ command: "run", prompt: "x" }, undefined, () => { throw new Error("update boom"); })).rejects.toThrow("update boom");
+    let updates = 0;
+    const value = await h.execute({ command: "run", prompt: "x" }, undefined, () => { updates++; throw new Error("update boom"); });
+    expect(first(value).output).toBe("done");
+    expect(first(value).termination).toBe("completed");
+    expect(updates).toBe(1);
     expect(activeChildren.size).toBe(0);
   });
   test("emits coarse heartbeats while foreground work is running", async () => {

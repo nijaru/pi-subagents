@@ -18,29 +18,29 @@ export interface ChildSupervisor {
 
 export class SubprocessChildSupervisor implements ChildSupervisor {
   async run({ result, thinking, signal, emit }: ChildRunRequest): Promise<void> {
-    let updateError: string | undefined;
     let eventFailure: string | undefined;
     // Usage and output are counted from authoritative message events. The
     // agent_end snapshot is only a protocol fallback when none arrived, so a
     // message dropped by the retention bound is never charged twice.
     let sawMessageEvent = false;
+    let presentationFailed = false;
     let runtimeTimer: ReturnType<typeof setInterval> | undefined;
-    const report = (progress: string, propagate = true) => {
+    // Progress publishing is best effort. A renderer or TUI callback failure
+    // must never change the child's outcome or terminate its work.
+    const report = (progress: string) => {
       if (result.exitCode !== -1 && result.startedAt !== undefined && result.finishedAt === undefined) result.finishedAt = Date.now();
+      if (presentationFailed || !emit) return;
       try {
-        emit?.(result, progress);
-      } catch (error) {
-        updateError = error instanceof Error ? error.message : String(error);
-        if (propagate) throw error;
+        emit(result, progress);
+      } catch {
+        presentationFailed = true;
       }
     };
     try {
       if (signal.aborted) throw new Error("Child aborted before launch.");
       result.startedAt = Date.now();
       report(RUNNING_PROGRESS_TEXT);
-      runtimeTimer = setInterval(() => {
-        try { emit?.(result, RUNNING_PROGRESS_TEXT); } catch { /* Display-only heartbeats are best effort. */ }
-      }, RUNTIME_UPDATE_INTERVAL_MS);
+      runtimeTimer = setInterval(() => report(RUNNING_PROGRESS_TEXT), RUNTIME_UPDATE_INTERVAL_MS);
       const args = ["--mode", "json", "-p", "--no-session"];
       if (result.model) args.push("--model", result.model);
       if (thinking) args.push("--thinking", thinking);
@@ -84,11 +84,11 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
       result.stopReason = processResult.stopReason ?? result.stopReason ?? (processResult.exitCode === 0 ? "stop" : "error");
       result.errorMessage = boundedDiagnostic(processResult.errorMessage ?? result.errorMessage);
       result.stderr = truncateOutput(processResult.stderr, MAX_STDERR_BYTES);
-      if (eventFailure || updateError) {
+      if (eventFailure) {
         result.exitCode = 1;
         result.stopReason = "error";
         result.termination = "failed";
-        result.errorMessage = truncateOutput(eventFailure ?? `Child update failed: ${updateError}`, MAX_DIAGNOSTIC_BYTES);
+        result.errorMessage = truncateOutput(eventFailure, MAX_DIAGNOSTIC_BYTES);
       } else if (processResult.termination === "completed" && (result.termination !== "completed" || !result.output)) {
         result.exitCode = 1;
         result.stopReason = "error";
@@ -96,13 +96,7 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
         result.errorMessage ??= "Child produced no terminal assistant output; a final response is required.";
       }
       if (result.stopReason === "error" && !result.errorMessage) result.errorMessage = "Child failed.";
-      report(result.output || result.errorMessage || "(no output)", false);
-      if (updateError && result.exitCode === 0) {
-        result.exitCode = 1;
-        result.stopReason = "error";
-        result.termination = "failed";
-        result.errorMessage = truncateOutput(`Child update failed: ${updateError}`, MAX_DIAGNOSTIC_BYTES);
-      }
+      report(result.output || result.errorMessage || "(no output)");
     } catch (error) {
       result.exitCode = 1;
       result.termination = signal.aborted ? "cancelled" : "failed";
