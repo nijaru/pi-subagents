@@ -20,6 +20,10 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
   async run({ result, thinking, signal, emit }: ChildRunRequest): Promise<void> {
     let updateError: string | undefined;
     let eventFailure: string | undefined;
+    // Usage and output are counted from authoritative message events. The
+    // agent_end snapshot is only a protocol fallback when none arrived, so a
+    // message dropped by the retention bound is never charged twice.
+    let sawMessageEvent = false;
     let runtimeTimer: ReturnType<typeof setInterval> | undefined;
     const report = (progress: string, propagate = true) => {
       if (result.exitCode !== -1 && result.startedAt !== undefined && result.finishedAt === undefined) result.finishedAt = Date.now();
@@ -51,13 +55,14 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
         signal,
         onEvent: (event) => {
           if (event.kind === "message" && event.message) {
+            sawMessageEvent = true;
             recordMessage(result, event.message);
             if (eventFailure) {
               result.stopReason = "error";
               result.errorMessage = eventFailure;
             }
             report(result.output || "Child is working...");
-          } else if (event.kind === "messages" && event.messages && result.messages.length === 0) {
+          } else if (event.kind === "messages" && event.messages && !sawMessageEvent && result.messages.length === 0) {
             for (const message of event.messages) recordMessage(result, message);
             report(result.output || "Child finished...");
           } else if (event.kind === "progress") {

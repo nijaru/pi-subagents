@@ -10,11 +10,15 @@ export interface ChildRun {
   result: ChildResult;
   notifyOnCompletion: boolean;
   controller: AbortController;
-  /** Terminal output is not publishable until process-tree and prompt cleanup finish. */
+  /** Terminal output is not publishable until process-tree cleanup finishes. */
   settled: boolean;
   promise: Promise<ChildResult>;
   /** Removable completion listeners; timed-out waits must not accumulate promise reactions. */
   waiters: Set<() => void>;
+  /** In-flight joins. A blocking waiter claims delivery, so it suppresses the notice. */
+  activeWaits: number;
+  /** Notification policy saved while joins are in flight; restored only if the child is still live. */
+  suspendedNotify: boolean;
 }
 
 export interface StartChild {
@@ -50,7 +54,7 @@ export class SessionChildren {
     const completion = Promise.withResolvers<ChildResult>();
     const run: ChildRun = {
       result, notifyOnCompletion: options.background, controller: new AbortController(), settled: false,
-      promise: completion.promise, waiters: new Set(),
+      promise: completion.promise, waiters: new Set(), activeWaits: 0, suspendedNotify: options.background,
     };
     // Register before execution can emit, await, or invoke extension callbacks.
     this.runs.set(result.id, run);
@@ -110,26 +114,48 @@ export class SessionChildren {
     return run.promise;
   }
 
+  /**
+   * A blocking join is itself a delivery: while one is in flight the completion
+   * notice is suppressed, so a result cannot reach the parent twice.
+   */
+  private suspendDelivery(run: ChildRun): void {
+    if (run.activeWaits++ > 0) return;
+    run.suspendedNotify = run.notifyOnCompletion;
+    run.notifyOnCompletion = false;
+  }
+
+  private resumeDelivery(run: ChildRun): void {
+    if (--run.activeWaits > 0) return;
+    // A join that returned a terminal result already delivered it. Only an
+    // expired or cancelled join on a live child re-arms the notice.
+    if (!run.settled) run.notifyOnCompletion = run.suspendedNotify;
+  }
+
   async wait(id: string, timeoutMs: number, signal?: AbortSignal): Promise<ChildResult> {
     const run = this.get(id);
     if (run.settled) return this.snapshot(run);
     if (signal?.aborted) throw new Error("Wait cancelled; the background child is still owned by the session. Use stop to cancel it.");
-    await new Promise<void>((resolve, reject) => {
-      let settled = false;
-      const finish = (error?: Error) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        signal?.removeEventListener("abort", abort);
-        run.waiters.delete(complete);
-        if (error) reject(error); else resolve();
-      };
-      const complete = () => finish();
-      const abort = () => finish(new Error("Wait cancelled; use stop to cancel the child."));
-      const timer = setTimeout(complete, timeoutMs);
-      signal?.addEventListener("abort", abort, { once: true });
-      run.waiters.add(complete);
-    });
+    this.suspendDelivery(run);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const finish = (error?: Error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          signal?.removeEventListener("abort", abort);
+          run.waiters.delete(complete);
+          if (error) reject(error); else resolve();
+        };
+        const complete = () => finish();
+        const abort = () => finish(new Error("Wait cancelled; use stop to cancel the child."));
+        const timer = setTimeout(complete, timeoutMs);
+        signal?.addEventListener("abort", abort, { once: true });
+        run.waiters.add(complete);
+      });
+    } finally {
+      this.resumeDelivery(run);
+    }
     return this.snapshot(run);
   }
 

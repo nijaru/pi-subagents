@@ -2,6 +2,7 @@
 export const MAX_CONCURRENCY = 4;
 export const MAX_RETAINED_RUNS = 32;
 export const MAX_OUTPUT_BYTES = 50 * 1024;
+export const MAX_COMPLETION_BYTES = 8 * 1024;
 export const MAX_DIAGNOSTIC_BYTES = 8 * 1024;
 export const MAX_MESSAGE_BYTES = 16 * 1024;
 export const MAX_MESSAGES_PER_AGENT = 128;

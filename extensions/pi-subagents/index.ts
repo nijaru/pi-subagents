@@ -3,7 +3,7 @@ import { Check } from "typebox/value";
 import { SessionChildren } from "./children.ts";
 import { SubprocessChildSupervisor, failed, resultText } from "./supervisor.ts";
 import { SubagentParamsSchema, resolveCwd, selectTools, validateCommand } from "./params.ts";
-import { DEFAULT_WAIT_MS, MAX_OUTPUT_BYTES, isChildProcess } from "./limits.ts";
+import { DEFAULT_WAIT_MS, MAX_COMPLETION_BYTES, MAX_OUTPUT_BYTES, isChildProcess } from "./limits.ts";
 import { boundDetails, truncateOutput } from "./bounds.ts";
 import type { ChildResult, SubagentDetails } from "./types.ts";
 import { renderChildCall, renderChildResult, renderChildCompletion, runtimeLabel } from "./render.ts";
@@ -33,9 +33,15 @@ function outcome(command: SubagentDetails["command"], result: ChildResult): Agen
 export default function (pi: ExtensionAPI) {
   pi.registerMessageRenderer("subagent-complete", renderChildCompletion);
   const createChildren = () => new SessionChildren(new SubprocessChildSupervisor(), (result) => {
+    const output = resultText(result);
+    const excerpt = truncateOutput(output, MAX_COMPLETION_BYTES);
+    // The notice is the delivery for background work, so it carries the result
+    // inline. Only an actually truncated excerpt points at the retained copy,
+    // which keeps the same output from being pulled into context twice.
+    const guidance = excerpt === output ? "" : "\n\nExcerpt truncated; use subagent wait with this id for the full retained result.";
     pi.sendMessage({
       customType: "subagent-complete",
-      content: `Background child finished.\n${summary(result)}\n\n${truncateOutput(resultText(result), 8 * 1024)}\n\nUse subagent wait with this id for the retained result.`,
+      content: `Background child finished.\n${summary(result)}\n\n${excerpt}${guidance}`,
       display: true,
       details: boundDetails({ command: "wait", results: [result] }),
     }, { triggerTurn: true, deliverAs: "followUp" });

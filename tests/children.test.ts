@@ -56,6 +56,23 @@ describe("session ownership", () => {
     expect(run.waiters.size).toBe(0);
     await c.children.close();
   });
+  test("an active join claims delivery and suppresses the completion notice", async () => {
+    const c = controlled();
+    const run = c.start();
+    const joining = c.children.wait(run.result.id, 10000);
+    c.gates[0]!.resolve();
+    expect((await joining).output).toBe("done");
+    await run.promise;
+    expect(c.notices).toEqual([]);
+  });
+  test("a join that expires while the child is live re-arms the completion notice", async () => {
+    const c = controlled();
+    const run = c.start();
+    expect((await c.children.wait(run.result.id, 1)).exitCode).toBe(-1);
+    c.gates[0]!.resolve();
+    await run.promise;
+    expect(c.notices).toEqual([run.result.id]);
+  });
   test("evicts only completed handles and bounds retained state", async () => {
     const c = controlled();
     const active = c.start();

@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import extension from "../extensions/pi-subagents/index.ts";
 import { activeChildren } from "../extensions/pi-subagents/subprocess.ts";
+import { MAX_COMPLETION_BYTES } from "../extensions/pi-subagents/limits.ts";
 
 const directories: string[] = [];
 interface Host {
@@ -159,25 +160,45 @@ describe("task-first tool", () => {
 });
 
 describe("background lifecycle", () => {
-  test("returns before completion, times out a wait without cancelling, then notifies once", async () => {
+  test("re-arms the notice after a wait expires, then delivers once without a waiter", async () => {
     const h = host();
     const file = fakePi('await Bun.sleep(150); final("finished later");');
     const id = await spawn(h);
     const interim = await h.execute({ command: "wait", id, timeoutMs: 1 });
     expect(first(interim).exitCode).toBe(-1);
     await captured(file);
-    const value = await h.execute({ command: "wait", id });
-    expect(first(value).output).toBe("finished later");
+    // No waiter is active when the child finishes, so the armed notice delivers.
+    await Bun.sleep(400);
     expect(h.notices).toHaveLength(1);
     expect(h.notices[0].message.content).toContain(id);
+    expect(h.notices[0].message.content).toContain("finished later");
+    expect(h.notices[0].message.content).not.toContain("use subagent wait");
     expect(h.notices[0].options).toEqual({ triggerTurn: true, deliverAs: "followUp" });
     const theme = { fg: (_: string, text: string) => text, bg: (_: string, text: string) => text };
     const notice = h.renderers.get("subagent-complete")(h.notices[0].message, { expanded: false, outputPad: 1 }, theme).render(100);
     expect(notice).toHaveLength(1);
     expect(notice[0]).toContain(`subagent ${id.slice(0, 8)} completed`);
     expect(notice[0]).not.toContain("finished later");
-    await h.execute({ command: "wait", id });
+    expect(first(await h.execute({ command: "wait", id })).output).toBe("finished later");
     expect(h.notices).toHaveLength(1);
+  });
+  test("a delivering wait claims the result and suppresses the notice", async () => {
+    const h = host();
+    fakePi('await Bun.sleep(50); final("delivered by wait");');
+    const id = await spawn(h);
+    const value = await h.execute({ command: "wait", id });
+    expect(first(value).output).toBe("delivered by wait");
+    await Bun.sleep(100);
+    expect(h.notices).toHaveLength(0);
+  });
+  test("points at the retained result only when the notice excerpt was truncated", async () => {
+    const h = host();
+    fakePi('await Bun.sleep(50); final("y".repeat(20000));');
+    await spawn(h);
+    await Bun.sleep(300);
+    expect(h.notices).toHaveLength(1);
+    expect(h.notices[0].message.content).toContain("use subagent wait");
+    expect(Buffer.byteLength(h.notices[0].message.content)).toBeLessThanOrEqual(MAX_COMPLETION_BYTES + 2048);
   });
   test("cancelling wait leaves the child running; stop joins and is idempotent", async () => {
     const h = host();
@@ -278,6 +299,14 @@ describe("subprocess regressions", () => {
     expect(Buffer.byteLength(JSON.stringify(value.details))).toBeLessThanOrEqual(50 * 1024);
     expect(first(value).messages).toHaveLength(0);
     expect(first(value).output.length).toBeGreaterThan(1000);
+  });
+  test("counts usage once when a dropped message is repeated by agent_end", async () => {
+    const h = host();
+    fakePi('const m=message("x".repeat(1000),"stop",{providerMetadata:"x".repeat(20000)}); emit({type:"message_end",message:m}); emit({type:"agent_end",messages:[m]});');
+    const value = await h.execute({ command: "run", prompt: "x" });
+    expect(first(value).usage.turns).toBe(1);
+    expect(first(value).usage.totalTokens).toBe(9);
+    expect(first(value).usage.cost.total).toBe(1);
   });
   test("update-handler failure cleans up and retains its diagnostic", async () => {
     const h = host(); fakePi();
