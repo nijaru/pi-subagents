@@ -17,7 +17,7 @@ function controlled() {
   };
   const notices: string[] = [];
   const children = new SessionChildren(supervisor, (result) => notices.push(result.id));
-  const start = (background = true) => children.start({ prompt: "bounded task", tools: ["read"], cwd: process.cwd(), background });
+  const start = (background = true) => children.start({ prompt: "bounded task", tools: ["read"], cwd: process.cwd(), notify: background });
   return { children, start, requests, gates, notices };
 }
 
@@ -100,7 +100,7 @@ describe("session ownership", () => {
   test("shutdown fences foreground updates as well as completion notices", async () => {
     const c = controlled();
     let updates = 0;
-    c.children.start({ prompt: "x", tools: [], cwd: process.cwd(), background: false, emit: () => { updates++; } });
+    c.children.start({ prompt: "x", tools: [], cwd: process.cwd(), notify: false, emit: () => { updates++; } });
     const closing = c.children.close();
     c.requests[0]!.emit?.(c.requests[0]!.result, "stale update");
     await closing;
@@ -108,7 +108,7 @@ describe("session ownership", () => {
   });
   test("notification failure does not lose the completed result", async () => {
     const children = new SessionChildren({ async run({ result }) { result.exitCode = 0; result.termination = "completed"; result.output = "answer"; } }, () => { throw new Error("UI unavailable"); });
-    const run = children.start({ prompt: "x", tools: [], cwd: process.cwd(), background: true });
+    const run = children.start({ prompt: "x", tools: [], cwd: process.cwd(), notify: true });
     await run.promise;
     expect((await children.wait(run.result.id, 1)).output).toBe("answer");
     await children.close();
@@ -116,7 +116,7 @@ describe("session ownership", () => {
   test("supervisor setup failures settle rather than leaking admission", async () => {
     const children = new SessionChildren({ async run() { throw new Error("setup failed"); } }, () => {});
     for (let i = 0; i < 8; i++) {
-      const run = children.start({ prompt: "x", tools: [], cwd: process.cwd(), background: true });
+      const run = children.start({ prompt: "x", tools: [], cwd: process.cwd(), notify: true });
       expect((await run.promise).errorMessage).toBe("setup failed");
       expect(children.snapshot(run).termination).toBe("failed");
     }

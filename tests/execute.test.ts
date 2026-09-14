@@ -79,6 +79,7 @@ beforeEach(() => {
   savedEnv = { ...process.env };
   delete process.env.PI_SUBAGENT_DEPTH;
   delete process.env.PI_SUBAGENT_TIMEOUT_MS;
+  delete process.env.PI_SUBAGENT_FOREGROUND_MS;
 });
 afterEach(async () => {
   await Promise.all(hosts.splice(0).map((h) => h.shutdown()));
@@ -199,6 +200,19 @@ describe("background lifecycle", () => {
     expect(h.notices).toHaveLength(1);
     expect(h.notices[0].message.content).toContain("use subagent wait");
     expect(Buffer.byteLength(h.notices[0].message.content)).toBeLessThanOrEqual(MAX_COMPLETION_BYTES + 2048);
+  });
+  test("run degrades to background work when the foreground budget expires", async () => {
+    const h = host();
+    process.env.PI_SUBAGENT_FOREGROUND_MS = "50";
+    fakePi('await Bun.sleep(250); final("late result");');
+    const value = await h.execute({ command: "run", prompt: "x" });
+    expect(first(value).exitCode).toBe(-1);
+    expect(value.content[0].text).toContain("Still running after");
+    expect(h.notices).toHaveLength(0);
+    await Bun.sleep(500);
+    expect(h.notices).toHaveLength(1);
+    expect(h.notices[0].message.content).toContain("late result");
+    expect(first(await h.execute({ command: "wait", id: first(value).id })).output).toBe("late result");
   });
   test("cancelling wait leaves the child running; stop joins and is idempotent", async () => {
     const h = host();

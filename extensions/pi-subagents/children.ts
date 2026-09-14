@@ -27,7 +27,8 @@ export interface StartChild {
   tools: string[];
   model?: string;
   thinking?: string;
-  background: boolean;
+  /** Arm the completion notice. A blocking join suppresses it while it delivers. */
+  notify: boolean;
   emit?: (result: ChildResult, progress: string) => void;
 }
 
@@ -53,8 +54,8 @@ export class SessionChildren {
     };
     const completion = Promise.withResolvers<ChildResult>();
     const run: ChildRun = {
-      result, notifyOnCompletion: options.background, controller: new AbortController(), settled: false,
-      promise: completion.promise, waiters: new Set(), activeWaits: 0, suspendedNotify: options.background,
+      result, notifyOnCompletion: options.notify, controller: new AbortController(), settled: false,
+      promise: completion.promise, waiters: new Set(), activeWaits: 0, suspendedNotify: options.notify,
     };
     // Register before execution can emit, await, or invoke extension callbacks.
     this.runs.set(result.id, run);

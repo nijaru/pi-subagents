@@ -3,7 +3,7 @@ import { Check } from "typebox/value";
 import { SessionChildren } from "./children.ts";
 import { SubprocessChildSupervisor, failed, resultText } from "./supervisor.ts";
 import { SubagentParamsSchema, resolveCwd, selectTools, validateCommand } from "./params.ts";
-import { DEFAULT_WAIT_MS, MAX_COMPLETION_BYTES, MAX_OUTPUT_BYTES, isChildProcess } from "./limits.ts";
+import { DEFAULT_WAIT_MS, MAX_COMPLETION_BYTES, MAX_OUTPUT_BYTES, foregroundBudgetMs, isChildProcess } from "./limits.ts";
 import { boundDetails, truncateOutput } from "./bounds.ts";
 import type { ChildResult, SubagentDetails } from "./types.ts";
 import { renderChildCall, renderChildResult, renderChildCompletion, runtimeLabel } from "./render.ts";
@@ -56,7 +56,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
-    description: "Delegate one self-contained task to a fresh child. run waits; spawn returns an id and reports completion later. status, wait and stop control session-scoped children. Defaults to available coding/research tools; tools can narrow access. No profiles, nested delegation, shared history, or persistent child sessions.",
+    description: "Delegate one self-contained task to a fresh child. run joins within a foreground budget, then lets the child finish as background work; spawn returns an id immediately and reports completion later. status, wait and stop control session-scoped children. Defaults to available coding/research tools; tools can narrow access. No profiles, nested delegation, shared history, or persistent child sessions.",
     parameters: SubagentParamsSchema,
     executionMode: "sequential",
     promptSnippet: "Use run for a fresh-context result, or spawn for independent work alongside useful local work.",
@@ -64,6 +64,7 @@ export default function (pi: ExtensionAPI) {
       "Give the child relevant evidence, scope, constraints, expected output and checks. Its conversation starts fresh; it does not receive parent history.",
       "Prefer direct work for routine or tightly coupled tasks. Do not duplicate delegated work. The parent owns integration and verification.",
       "Background children send completion notices. Wait only when their result blocks your next step. Cancelling wait does not stop the child; use stop.",
+      "run blocks only for a bounded foreground budget; if it expires the child keeps working and reports completion like spawn, so never relaunch it as a duplicate.",
       "Use separate worktrees for concurrent writers, including parent-versus-child writers. Children are separate processes that share one working tree; the extension does not arbitrate write ownership.",
     ],
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -88,19 +89,28 @@ export default function (pi: ExtensionAPI) {
       if (signal?.aborted) throw new Error("Child launch cancelled.");
       const tools = selectTools(params.tools, pi.getActiveTools());
       const cwd = resolveCwd(ctx.cwd || process.cwd(), params.cwd);
-      const background = params.command === "spawn";
+      const foreground = params.command === "run";
+      // Every child arms its completion notice. A blocking run joins with a
+      // budget, and the join itself suppresses the notice if it delivers; only
+      // a budget expiry leaves the notice armed and the child in the background.
       const run = owner.start({
-        prompt: params.prompt!, tools, cwd, background,
+        prompt: params.prompt!, tools, cwd, notify: true,
         model: params.model?.trim() ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
         thinking: ctx.thinkingLevel,
-        emit: background ? undefined : (result, progress) => onUpdate?.(answer("run", [{ ...result, exitCode: -1, termination: undefined, finishedAt: undefined }], progress)),
+        emit: foreground ? (result, progress) => onUpdate?.(answer("run", [{ ...result, exitCode: -1, termination: undefined, finishedAt: undefined }], progress)) : undefined,
       });
-      if (background) return answer("spawn", [owner.snapshot(run)], `Started child ${run.result.id}. It will report completion automatically. Continue non-overlapping work; use status, wait or stop with this id.`);
+      if (!foreground) return answer("spawn", [owner.snapshot(run)], `Started child ${run.result.id}. It will report completion automatically. Continue non-overlapping work; use status, wait or stop with this id.`);
       const abort = () => run.controller.abort();
       signal?.addEventListener("abort", abort, { once: true });
       if (signal?.aborted) abort();
-      try { return outcome("run", await run.promise); }
-      finally { signal?.removeEventListener("abort", abort); }
+      try {
+        const budget = foregroundBudgetMs();
+        const result = await owner.wait(run.result.id, budget);
+        if (result.exitCode === -1) {
+          return answer("run", [result], `${summary(result)}\nStill running after ${Math.round(budget / 1000)}s; it continues as background work and will send a completion notice. Use status, wait or stop with this id.`);
+        }
+        return outcome("run", result);
+      } finally { signal?.removeEventListener("abort", abort); }
     },
     renderCall: renderChildCall,
     renderResult: renderChildResult,

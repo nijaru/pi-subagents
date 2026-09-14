@@ -11,11 +11,14 @@ export const DEFAULT_PROCESS_TIMEOUT_MS = 30 * 60 * 1000;
 export const MAX_PROCESS_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 export const DEFAULT_WAIT_MS = 30_000;
 export const MAX_WAIT_MS = 120_000;
+/** How long a foreground `run` blocks the parent turn before handing off to background work. */
+export const DEFAULT_FOREGROUND_MS = 60_000;
 export const RUNTIME_UPDATE_INTERVAL_MS = 1_000;
 export const RUNNING_PROGRESS_TEXT = "Working...";
 export const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
 export const RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
 export const TIMEOUT_ENV = "PI_SUBAGENT_TIMEOUT_MS";
+export const FOREGROUND_ENV = "PI_SUBAGENT_FOREGROUND_MS";
 export const PASSTHROUGH_ENV = "PI_SUBAGENT_PASSTHROUGH_ENV";
 export const SUBAGENT_BIN_ENV = "PI_SUBAGENT_BIN";
 export const PI_BIN_ENV = "PI_BIN";
@@ -24,6 +27,16 @@ export function processTimeoutMs(): number {
   const configured = Number(process.env[TIMEOUT_ENV]);
   return Number.isSafeInteger(configured) && configured > 0 && configured <= MAX_PROCESS_TIMEOUT_MS
     ? configured : DEFAULT_PROCESS_TIMEOUT_MS;
+}
+
+/**
+ * How long a foreground `run` blocks the parent turn before the child becomes
+ * background work. Deliberately independent of the child deadline: a child that
+ * times out is still reported to its caller as a timed-out result.
+ */
+export function foregroundBudgetMs(): number {
+  const configured = Number(process.env[FOREGROUND_ENV]);
+  return Number.isSafeInteger(configured) && configured > 0 ? configured : DEFAULT_FOREGROUND_MS;
 }
 
 /** Invalid or nonzero depth fails closed. Children cannot use this extension to delegate. */
