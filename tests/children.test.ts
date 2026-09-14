@@ -12,7 +12,10 @@ function controlled() {
       requests.push(request); gates.push(gate);
       request.signal.addEventListener("abort", () => gate.resolve(), { once: true });
       await gate.promise;
-      Object.assign(request.result, { exitCode: request.signal.aborted ? 1 : 0, termination: request.signal.aborted ? "cancelled" : "completed", output: "done" });
+      request.result.output = "done";
+      return request.signal.aborted
+        ? { outcome: "cancelled", exitCode: 1, stopReason: "aborted" }
+        : { outcome: "completed", exitCode: 0, stopReason: "stop" };
     },
   };
   const notices: string[] = [];
@@ -34,12 +37,13 @@ describe("session ownership", () => {
   test("holds admission until execution cleanup returns, even after terminal output", async () => {
     const c = controlled();
     const runs = Array.from({ length: 4 }, () => c.start());
-    c.requests[0]!.result.exitCode = 0;
-    c.requests[0]!.result.termination = "completed";
-    expect(c.children.snapshot(runs[0]!).exitCode).toBe(-1);
+    // Terminal output has arrived, but the supervisor has not returned yet.
+    c.requests[0]!.result.output = "done";
+    expect(c.children.snapshot(runs[0]!).state.status).toBe("running");
     expect(() => c.start()).toThrow("maximum 4");
     c.gates[0]!.resolve();
     await runs[0]!.promise;
+    expect(c.children.snapshot(runs[0]!).state).toMatchObject({ status: "terminal", outcome: "completed" });
     c.start();
     await c.children.close();
   });
@@ -68,7 +72,7 @@ describe("session ownership", () => {
   test("a join that expires while the child is live re-arms the completion notice", async () => {
     const c = controlled();
     const run = c.start();
-    expect((await c.children.wait(run.result.id, 1)).exitCode).toBe(-1);
+    expect((await c.children.wait(run.result.id, 1)).state.status).toBe("running");
     c.gates[0]!.resolve();
     await run.promise;
     expect(c.notices).toEqual([run.result.id]);
@@ -107,7 +111,7 @@ describe("session ownership", () => {
     expect(updates).toBe(0);
   });
   test("notification failure does not lose the completed result", async () => {
-    const children = new SessionChildren({ async run({ result }) { result.exitCode = 0; result.termination = "completed"; result.output = "answer"; } }, () => { throw new Error("UI unavailable"); });
+    const children = new SessionChildren({ async run({ result }) { result.output = "answer"; return { outcome: "completed", exitCode: 0, stopReason: "stop" }; } }, () => { throw new Error("UI unavailable"); });
     const run = children.start({ prompt: "x", tools: [], cwd: process.cwd(), notify: true });
     await run.promise;
     expect((await children.wait(run.result.id, 1)).output).toBe("answer");
@@ -118,7 +122,7 @@ describe("session ownership", () => {
     for (let i = 0; i < 8; i++) {
       const run = children.start({ prompt: "x", tools: [], cwd: process.cwd(), notify: true });
       expect((await run.promise).errorMessage).toBe("setup failed");
-      expect(children.snapshot(run).termination).toBe("failed");
+      expect(children.snapshot(run).state).toMatchObject({ status: "terminal", outcome: "failed" });
     }
     await children.close();
   });

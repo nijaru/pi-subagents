@@ -6,8 +6,8 @@ import type { Message, StopReason } from "@earendil-works/pi-ai";
 
 import { MAX_OUTPUT_BYTES, MAX_PROTOCOL_LINE_BYTES } from "./limits.ts";
 import { addUsage, isFinalMessage, textFromMessage } from "./types.ts";
-import type { ChildResult, AgentTermination, UsageSummary } from "./types.ts";
-import { boundedDiagnostic, capStderr, truncateOutput } from "./bounds.ts";
+import type { ChildResult, AgentOutcome, UsageSummary } from "./types.ts";
+import { boundedDiagnostic, capStderr, truncateHeadTail, truncateOutput } from "./bounds.ts";
 import { processTimeoutMs } from "./limits.ts";
 import { setTimeout as delay } from "node:timers/promises";
 import { childEnvironment } from "./env.ts";
@@ -122,7 +122,7 @@ export function parseJsonEventLine(line: string): ParsedJsonEvent | undefined {
 export interface ProcessResult {
   exitCode: number;
   stopReason?: StopReason;
-  termination: AgentTermination;
+  termination: AgentOutcome;
   errorMessage?: string;
   stderr: string;
 }
@@ -286,30 +286,38 @@ export function addAssistantUsage(usage: UsageSummary, message: Message): void {
   if (message.usage) addUsage(usage, message.usage);
 }
 
+/** Facts derived from one protocol message that the caller must fold into liveness. */
+export interface MessageEffect {
+  outcome?: AgentOutcome;
+  stopReason?: StopReason;
+}
+
 /**
  * Fold one protocol message into the child result. Messages are processed
- * transiently: only the derived output, usage, model, and terminal state are
+ * transiently: only the derived output, usage, model, and diagnostics are
  * retained, so a long transcript cannot pin message payloads in memory.
  */
-export function applyMessage(result: ChildResult, message: Message): void {
+export function applyMessage(result: ChildResult, message: Message): MessageEffect {
   addAssistantUsage(result.usage, message);
-  if (message.role !== "assistant") return;
+  if (message.role !== "assistant") return {};
+  const effect: MessageEffect = {};
   const output = textFromMessage(message);
   if (typeof message.model === "string" && message.model) result.model = truncateOutput(message.model, 256);
   if (message.stopReason === "stop" || message.stopReason === "length" || message.stopReason === "toolUse" || message.stopReason === "error" || message.stopReason === "aborted") {
-    result.stopReason = message.stopReason;
+    effect.stopReason = message.stopReason;
   }
   // Only terminal assistant messages are authoritative output. Text attached
   // to a toolUse turn is progress, not a completed report.
   if (message.stopReason === "stop" || message.stopReason === "length") {
-    result.termination = "completed";
+    effect.outcome = "completed";
     if (output) result.output = truncateOutput(output, MAX_OUTPUT_BYTES);
   } else if (message.stopReason === "aborted") {
-    result.termination = "cancelled";
+    effect.outcome = "cancelled";
   } else if (message.stopReason === "error") {
-    result.termination = "failed";
+    effect.outcome = "failed";
   }
   if (typeof message.errorMessage === "string" && message.errorMessage) result.errorMessage = boundedDiagnostic(message.errorMessage);
+  return effect;
 }
 
 export interface PiProcessRequest {
@@ -513,7 +521,7 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
       if (exitCode !== 0) {
         const cleanStderr = stderr.trim();
         if (cleanStderr) {
-          errorMessage = `Subagent exited with code ${exitCode}.\n${truncateOutput(cleanStderr, 2048)}`;
+          errorMessage = `Subagent exited with code ${exitCode}.\n${truncateHeadTail(cleanStderr, 2048)}`;
           if (/No API key|No models match pattern|API key.*not found/i.test(cleanStderr)) {
             errorMessage += `\n\nHint: Child env passes model refs and *_API_KEY/*_TOKEN credentials automatically. For non-credential variables, set PI_SUBAGENT_PASSTHROUGH_ENV with an exact name or glob and restart Pi. Auth in ~/.pi/agent/auth.json via /login needs no passthrough.`;
           }

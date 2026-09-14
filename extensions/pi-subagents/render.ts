@@ -32,10 +32,12 @@ export function isRenderableChildResult(value: unknown): value is ChildResult {
     && (result.output === undefined || typeof result.output === "string")
     && (result.errorMessage === undefined || typeof result.errorMessage === "string")
     && (result.model === undefined || typeof result.model === "string")
-    && (result.startedAt === undefined || isFiniteNumber(result.startedAt))
-    && (result.finishedAt === undefined || isFiniteNumber(result.finishedAt))
-    && isFiniteNumber(result.exitCode)
-    && (result.termination === undefined || result.termination === "completed" || result.termination === "failed" || result.termination === "cancelled" || result.termination === "timed_out")
+    && isFiniteNumber(result.startedAt ?? 0)
+    && (result.state?.status === "running"
+      || (result.state?.status === "terminal"
+        && (result.state.outcome === "completed" || result.state.outcome === "failed" || result.state.outcome === "cancelled" || result.state.outcome === "timed_out")
+        && isFiniteNumber(result.state.exitCode)
+        && isFiniteNumber(result.state.finishedAt)))
     && typeof result.stderr === "string"
     && isRenderableUsage(result.usage);
 }
@@ -53,9 +55,9 @@ export function formatDuration(startedAt?: number, finishedAt?: number): string 
 }
 
 export function runtimeLabel(result: ChildResult): string {
-  const duration = formatDuration(result.startedAt, result.finishedAt);
+  const duration = formatDuration(result.startedAt, result.state.status === "terminal" ? result.state.finishedAt : undefined);
   if (!duration) return "";
-  return `${duration}${result.exitCode === -1 ? " elapsed" : ""}`;
+  return `${duration}${result.state.status === "running" ? " elapsed" : ""}`;
 }
 
 export function formatTokens(value: number): string {
@@ -134,10 +136,11 @@ function renderOutput(text: string, expanded: boolean, theme: Theme): Component 
 
 function childHeading(child: ChildResult, theme: Theme, options: { expanded: boolean; showId: boolean; notification: boolean; command?: SubagentDetails["command"] }): string {
   const { expanded, showId, notification, command } = options;
-  const active = child.exitCode === -1;
-  const status = active ? command === "spawn" ? "started" : "running" : (child.termination ?? "failed").replaceAll("_", " ");
-  const color = active ? "muted" : child.termination === "cancelled" ? "warning" : failed(child) ? "error" : "success";
-  const icon = active ? "○" : child.termination === "cancelled" ? "−" : failed(child) ? "✗" : "✓";
+  const active = child.state.status === "running";
+  const outcome = child.state.status === "terminal" ? child.state.outcome : undefined;
+  const status = active ? command === "spawn" ? "started" : "running" : outcome!.replaceAll("_", " ");
+  const color = active ? "muted" : outcome === "cancelled" ? "warning" : failed(child) ? "error" : "success";
+  const icon = active ? "○" : outcome === "cancelled" ? "−" : failed(child) ? "✗" : "✓";
   const id = showId ? `${theme.fg("accent", displayId(child.id, expanded))} ` : "";
   // Spawn/status/wait are snapshots, not live activity indicators.
   const duration = active && command !== "run" ? "" : runtimeLabel(child);
@@ -151,7 +154,7 @@ function renderChildren(details: unknown, expanded: boolean, theme: Theme, targe
   const container = new Container();
   let remaining = MAX_OUTPUT_BYTES;
   for (const child of results) {
-    const active = child.exitCode === -1;
+    const active = child.state.status === "running";
     const heading = childHeading(child, theme, { expanded, showId: notification || child.id !== targetId, notification, command: data?.command });
     container.addChild(notification && !expanded ? singleLine(heading) : new Text(heading, 0, 0));
     // Status lists need task labels; run/spawn already show the prompt in their call header.

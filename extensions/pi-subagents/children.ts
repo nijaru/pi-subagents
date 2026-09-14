@@ -50,7 +50,7 @@ export class SessionChildren {
     }
     const result: ChildResult = {
       id: randomUUID(), prompt: options.prompt, cwd: options.cwd, tools: [...options.tools],
-      model: options.model, exitCode: -1, stderr: "", usage: emptyUsage(),
+      model: options.model, state: { status: "running" }, stderr: "", usage: emptyUsage(),
     };
     const completion = Promise.withResolvers<ChildResult>();
     const run: ChildRun = {
@@ -65,17 +65,20 @@ export class SessionChildren {
 
   private async execute(run: ChildRun, options: StartChild): Promise<ChildResult> {
     try {
-      await this.supervisor.run({
+      const outcome = await this.supervisor.run({
         result: run.result, thinking: options.thinking, signal: run.controller.signal,
         emit: options.emit ? (result, progress) => { if (!this.closed) options.emit?.(result, progress); } : undefined,
       });
+      if (outcome.errorMessage) run.result.errorMessage = outcome.errorMessage;
+      run.result.state = { status: "terminal", ...outcome, finishedAt: Date.now() };
     } catch (error) {
-      run.result.exitCode = 1;
-      run.result.termination = run.controller.signal.aborted ? "cancelled" : "failed";
-      run.result.stopReason = run.controller.signal.aborted ? "aborted" : "error";
+      const cancelled = run.controller.signal.aborted;
       run.result.errorMessage = truncateOutput(error instanceof Error ? error.message : String(error), MAX_DIAGNOSTIC_BYTES);
+      run.result.state = {
+        status: "terminal", outcome: cancelled ? "cancelled" : "failed", exitCode: 1,
+        stopReason: cancelled ? "aborted" : "error", finishedAt: Date.now(),
+      };
     } finally {
-      run.result.finishedAt ??= Date.now();
       run.result.prompt = truncateOutput(run.result.prompt, MAX_DIAGNOSTIC_BYTES);
       run.settled = true;
       for (const complete of run.waiters) complete();
@@ -95,11 +98,8 @@ export class SessionChildren {
 
   snapshot(run: ChildRun): ChildResult {
     const result = copyResult(run.result);
-    if (!run.settled) {
-      result.exitCode = -1;
-      result.termination = undefined;
-      result.finishedAt = undefined;
-    }
+    // Terminal output is not publishable until process-tree cleanup finishes.
+    if (!run.settled) result.state = { status: "running" };
     return result;
   }
 

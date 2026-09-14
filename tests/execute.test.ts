@@ -67,7 +67,10 @@ ${body}
 }
 async function captured(file: string) {
   for (let i = 0; i < 200; i++) {
-    if (fs.existsSync(file + ".capture")) return JSON.parse(fs.readFileSync(file + ".capture", "utf8"));
+    if (fs.existsSync(file + ".capture")) {
+      // The writer creates the file before filling it; retry a partial read.
+      try { return JSON.parse(fs.readFileSync(file + ".capture", "utf8")); } catch { /* still writing */ }
+    }
     await Bun.sleep(10);
   }
   throw new Error("fake child did not start");
@@ -166,7 +169,7 @@ describe("background lifecycle", () => {
     const file = fakePi('await Bun.sleep(150); final("finished later");');
     const id = await spawn(h);
     const interim = await h.execute({ command: "wait", id, timeoutMs: 1 });
-    expect(first(interim).exitCode).toBe(-1);
+    expect(first(interim).state.status).toBe("running");
     await captured(file);
     // No waiter is active when the child finishes, so the armed notice delivers.
     await Bun.sleep(400);
@@ -206,7 +209,7 @@ describe("background lifecycle", () => {
     process.env.PI_SUBAGENT_FOREGROUND_MS = "50";
     fakePi('await Bun.sleep(250); final("late result");');
     const value = await h.execute({ command: "run", prompt: "x" });
-    expect(first(value).exitCode).toBe(-1);
+    expect(first(value).state.status).toBe("running");
     expect(value.content[0].text).toContain("Still running after");
     expect(h.notices).toHaveLength(0);
     await Bun.sleep(500);
@@ -223,9 +226,9 @@ describe("background lifecycle", () => {
     const pending = h.execute({ command: "wait", id }, controller.signal);
     controller.abort();
     await expect(pending).rejects.toThrow("use stop");
-    expect(first(await h.execute({ command: "status", id })).exitCode).toBe(-1);
-    expect(first(await h.execute({ command: "stop", id })).termination).toBe("cancelled");
-    expect(first(await h.execute({ command: "stop", id })).termination).toBe("cancelled");
+    expect(first(await h.execute({ command: "status", id })).state.status).toBe("running");
+    expect(first(await h.execute({ command: "stop", id })).state).toMatchObject({ outcome: "cancelled" });
+    expect(first(await h.execute({ command: "stop", id })).state).toMatchObject({ outcome: "cancelled" });
     expect(h.notices).toHaveLength(0);
     expect(activeChildren.size).toBe(0);
   });
@@ -236,7 +239,7 @@ describe("background lifecycle", () => {
     const pending = h.execute({ command: "run", prompt: "x" }, controller.signal);
     await captured(file); controller.abort();
     await expect(pending).rejects.toThrow("cancelled");
-    expect(first(await h.execute({ command: "status" })).termination).toBe("cancelled");
+    expect(first(await h.execute({ command: "status" })).state).toMatchObject({ outcome: "cancelled" });
   });
   test("shutdown drains children, suppresses stale notices, and session start drops old handles", async () => {
     const h = host();
@@ -249,7 +252,7 @@ describe("background lifecycle", () => {
     await h.restart();
     await expect(h.execute({ command: "status", id })).rejects.toThrow("Unknown child");
     fakePi();
-    expect(first(await h.execute({ command: "run", prompt: "new session" })).termination).toBe("completed");
+    expect(first(await h.execute({ command: "run", prompt: "new session" })).state).toMatchObject({ outcome: "completed" });
   });
   test("enforces one shared capacity limit across sibling spawn/run calls", async () => {
     const h = host(); fakePi("await Bun.sleep(10000);");
@@ -282,13 +285,13 @@ describe("subprocess regressions", () => {
   ])("reports %s as failure", async (_name, body, error) => {
     const h = host(); fakePi(body);
     await expect(h.execute({ command: "run", prompt: "x" })).rejects.toThrow(error);
-    expect(first(await h.execute({ command: "status" })).termination).toBe("failed");
+    expect(first(await h.execute({ command: "status" })).state).toMatchObject({ outcome: "failed" });
   });
   test("distinguishes deadline expiry from cancellation", async () => {
     const h = host(); fakePi("await Bun.sleep(10000);");
     process.env.PI_SUBAGENT_TIMEOUT_MS = "100";
     await expect(h.execute({ command: "run", prompt: "x" })).rejects.toThrow("timed out");
-    expect(first(await h.execute({ command: "status" })).termination).toBe("timed_out");
+    expect(first(await h.execute({ command: "status" })).state).toMatchObject({ outcome: "timed_out" });
   });
   test.each([
     'emit({type:"tool_execution_update",partialResult:"x".repeat(2*1024*1024)});',
@@ -327,7 +330,7 @@ describe("subprocess regressions", () => {
     let updates = 0;
     const value = await h.execute({ command: "run", prompt: "x" }, undefined, () => { updates++; throw new Error("update boom"); });
     expect(first(value).output).toBe("done");
-    expect(first(value).termination).toBe("completed");
+    expect(first(value).state).toMatchObject({ outcome: "completed" });
     expect(updates).toBe(1);
     expect(activeChildren.size).toBe(0);
   });
@@ -343,7 +346,7 @@ describe("subprocess regressions", () => {
     const marker = path.join(tempDir(), "swept");
     fakePi(`const child=Bun.spawn(["sh","-c",${JSON.stringify(`trap 'printf swept > '${JSON.stringify(marker)}'; exit 0' TERM; printf ready; while :; do sleep 1; done`)}],{stdout:"pipe",stderr:"inherit"}); const reader=child.stdout.getReader(); await reader.read(); final("done"); process.exit(0);`);
     const value = await h.execute({ command: "run", prompt: "x" });
-    expect(first(value).termination).toBe("completed");
+    expect(first(value).state).toMatchObject({ outcome: "completed" });
     expect(fs.existsSync(marker)).toBe(true);
   });
   test("killing the parent mid-run kills the child instead of orphaning it", async () => {
@@ -365,7 +368,7 @@ fs.writeFileSync(${JSON.stringify(marker)}, "mutated");
     fs.chmodSync(pi, 0o755);
     const parentScript = path.join(dir, "parent.ts");
     fs.writeFileSync(parentScript, `import { SubprocessChildSupervisor } from ${JSON.stringify(path.resolve(import.meta.dir, "../extensions/pi-subagents/supervisor.ts"))};
-const result: any = { id: "orphan-check", prompt: "task", cwd: process.cwd(), tools: [], exitCode: -1, stderr: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, turns: 0 } };
+const result: any = { id: "orphan-check", prompt: "task", cwd: process.cwd(), tools: [], state: { status: "running" }, stderr: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, turns: 0 } };
 await new SubprocessChildSupervisor().run({ result, signal: new AbortController().signal });
 `);
     const proc = Bun.spawn([process.execPath, parentScript], {
@@ -386,6 +389,15 @@ await new SubprocessChildSupervisor().run({ result, signal: new AbortController(
       await proc.exited;
     }
   }, 30000);
+  test("keeps the tail of over-budget stderr so the final failure survives", async () => {
+    const h = host();
+    fakePi('process.stderr.write("EARLY_DIAGNOSTIC\\n" + "x".repeat(60000) + "\\nFINAL_STACK_TRACE\\n"); process.exit(3);');
+    await expect(h.execute({ command: "run", prompt: "x" })).rejects.toThrow("FINAL_STACK_TRACE");
+    const status = first(await h.execute({ command: "status" }));
+    expect(Buffer.byteLength(status.stderr)).toBeLessThanOrEqual(50 * 1024);
+    expect(status.stderr).toContain("EARLY_DIAGNOSTIC");
+    expect(status.stderr).toContain("FINAL_STACK_TRACE");
+  });
   test("renders current results and safely falls back for old transcripts", async () => {
     const h = host(); fakePi();
     const value = await h.execute({ command: "run", prompt: "render me" });

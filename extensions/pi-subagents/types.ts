@@ -1,6 +1,21 @@
 import type { Message, StopReason, Usage } from "@earendil-works/pi-ai";
 
-export type AgentTermination = "completed" | "failed" | "cancelled" | "timed_out";
+export type AgentOutcome = "completed" | "failed" | "cancelled" | "timed_out";
+
+/**
+ * One discriminated lifecycle state. Everything that differs between a live
+ * child and a finished one lives here, so no call site has to infer liveness
+ * from a sentinel exit code or repair mismatched fields.
+ */
+export type ChildState =
+  | { status: "running" }
+  | {
+      status: "terminal";
+      outcome: AgentOutcome;
+      exitCode: number;
+      stopReason?: StopReason;
+      finishedAt: number;
+    };
 
 export interface UsageSummary extends Usage {
   turns: number;
@@ -11,19 +26,23 @@ export interface ChildResult {
   prompt: string;
   cwd: string;
   tools: string[];
-  /** Final assistant text, kept separately from bounded diagnostic messages. */
+  /** Final assistant text, kept separately from bounded diagnostics. */
   output?: string;
-  /** Wall-clock timestamps for user-visible runtime reporting. */
+  /** Wall-clock launch time for user-visible runtime reporting. */
   startedAt?: number;
-  finishedAt?: number;
-  exitCode: number;
-  stopReason?: StopReason;
-  /** Distinguishes ordinary failure, cancellation, and timeout across the API boundary. */
-  termination?: AgentTermination;
+  state: ChildState;
   errorMessage?: string;
   stderr: string;
   usage: UsageSummary;
   model?: string;
+}
+
+export function isRunning(result: ChildResult): boolean {
+  return result.state.status === "running";
+}
+
+export function outcomeOf(result: ChildResult): AgentOutcome | undefined {
+  return result.state.status === "terminal" ? result.state.outcome : undefined;
 }
 
 export interface SubagentDetails {

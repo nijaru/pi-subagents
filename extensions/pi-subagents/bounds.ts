@@ -21,6 +21,42 @@ export function utf8Prefix(value: string, maxBytes: number): string {
   return value.slice(0, low);
 }
 
+/** Return a UTF-8 suffix without splitting a code point. */
+export function utf8Suffix(value: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  let low = 0;
+  let high = value.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (Buffer.byteLength(value.slice(middle), "utf8") <= maxBytes) high = middle;
+    else low = middle + 1;
+  }
+  // A UTF-16 boundary can land between a surrogate pair.
+  if (low > 0 && low < value.length) {
+    const first = value.charCodeAt(low);
+    if (first >= 0xdc00 && first <= 0xdfff) low++;
+  }
+  return value.slice(low);
+}
+
+const HEAD_TAIL_MARKER = "\n…[truncated]…\n";
+
+/**
+ * Keep both ends of over-budget text. Unlike report output, streams such as
+ * stderr carry their actionable evidence at the end: the final exception and
+ * stack trace, not the opening diagnostics.
+ */
+export function truncateHeadTail(value: string, maxBytes = MAX_STDERR_BYTES): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  const markerBytes = Buffer.byteLength(HEAD_TAIL_MARKER, "utf8");
+  if (maxBytes <= markerBytes) return utf8Prefix(value, maxBytes);
+  const budget = maxBytes - markerBytes;
+  const head = utf8Prefix(value, Math.ceil(budget / 2));
+  const tail = utf8Suffix(value, budget - Buffer.byteLength(head, "utf8"));
+  return head + HEAD_TAIL_MARKER + tail;
+}
+
 /**
  * Truncate output by bytes with a stable, bounded marker. This is deliberately
  * head truncation: the beginning of a subagent report contains its useful context.
@@ -54,8 +90,7 @@ export function truncateOutput(value: string, maxBytes = MAX_OUTPUT_BYTES): stri
 }
 
 export function capStderr(current: string, next: string): string {
-  const remaining = MAX_STDERR_BYTES - Buffer.byteLength(current, "utf8");
-  return remaining > 0 ? current + utf8Prefix(next, remaining) : current;
+  return truncateHeadTail(current + next, MAX_STDERR_BYTES);
 }
 
 export function boundedDiagnostic(value: string | undefined, maxBytes = MAX_DIAGNOSTIC_BYTES): string | undefined {
@@ -73,10 +108,7 @@ export function minimalChildResult(result: ChildResult): ChildResult {
     cwd: "",
     tools: [],
     startedAt: result.startedAt,
-    finishedAt: result.finishedAt,
-    exitCode: result.exitCode,
-    stopReason: result.stopReason,
-    termination: result.termination,
+    state: { ...result.state },
     errorMessage: boundedDiagnostic(result.errorMessage, 512),
     stderr: "",
     usage: result.usage,
@@ -95,14 +127,14 @@ export function boundChildResult(result: ChildResult, maxBytes: number): ChildRe
   };
   // Account for object overhead and JSON escaping rather than dropping a
   // successful report merely because its full text fills the output budget.
-  const addText = (key: "output" | "prompt" | "stderr", value: string | undefined, cap: number): void => {
+  const addText = (key: "output" | "prompt" | "stderr", value: string | undefined, cap: number, truncate: typeof truncateOutput = truncateOutput): void => {
     if (value === undefined) return;
     let low = 0;
     let high = Math.min(cap, Buffer.byteLength(value, "utf8"));
-    if (addCandidate(key, truncateOutput(value, high))) return;
+    if (addCandidate(key, truncate(value, high))) return;
     while (low <= high) {
       const middle = Math.floor((low + high) / 2);
-      if (addCandidate(key, truncateOutput(value, middle))) low = middle + 1;
+      if (addCandidate(key, truncate(value, middle))) low = middle + 1;
       else high = middle - 1;
     }
   };
@@ -110,7 +142,8 @@ export function boundChildResult(result: ChildResult, maxBytes: number): ChildRe
   addCandidate("cwd", result.cwd);
   addText("output", result.output, MAX_OUTPUT_BYTES);
   addText("prompt", result.prompt, MAX_DIAGNOSTIC_BYTES);
-  addText("stderr", result.stderr, MAX_DIAGNOSTIC_BYTES);
+  // Stderr keeps both ends: its actionable evidence is the final exception.
+  addText("stderr", result.stderr, MAX_DIAGNOSTIC_BYTES, truncateHeadTail);
   return bounded;
 }
 

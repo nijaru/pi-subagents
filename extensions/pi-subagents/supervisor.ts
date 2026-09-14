@@ -1,4 +1,6 @@
 import type { ChildResult } from "./types.ts";
+import type { AgentOutcome } from "./types.ts";
+import type { Message, StopReason } from "@earendil-works/pi-ai";
 import { MAX_DIAGNOSTIC_BYTES, MAX_STDERR_BYTES, RUNNING_PROGRESS_TEXT, RUNTIME_UPDATE_INTERVAL_MS } from "./limits.ts";
 import { boundedDiagnostic, truncateOutput } from "./bounds.ts";
 import { applyMessage, runPiProcess } from "./subprocess.ts";
@@ -10,31 +12,47 @@ export interface ChildRunRequest {
   emit?: (result: ChildResult, progress: string) => void;
 }
 
+/** What execution concluded. Liveness and notification stay owned by the session registry. */
+export interface ChildExecutionOutcome {
+  outcome: AgentOutcome;
+  exitCode: number;
+  stopReason?: StopReason;
+  errorMessage?: string;
+}
+
 /** One execution boundary for both run and spawn. No session registry or scheduler here. */
 export interface ChildSupervisor {
-  /** Updates request.result in place; resolves only after execution and cleanup finish. */
-  run(request: ChildRunRequest): Promise<void>;
+  /**
+   * Fills request.result with derived output, usage, and diagnostics, then
+   * returns the outcome. Resolves only after execution and cleanup finish.
+   */
+  run(request: ChildRunRequest): Promise<ChildExecutionOutcome>;
 }
 
 export class SubprocessChildSupervisor implements ChildSupervisor {
-  async run({ result, thinking, signal, emit }: ChildRunRequest): Promise<void> {
-    let eventFailure: string | undefined;
+  async run({ result, thinking, signal, emit }: ChildRunRequest): Promise<ChildExecutionOutcome> {
+    let protocolFailure: string | undefined;
     // Usage and output are counted from authoritative message events. The
-    // agent_end snapshot is only a protocol fallback when none arrived, so a
-    // message dropped by the retention bound is never charged twice.
+    // agent_end snapshot is only a protocol fallback when none arrived.
     let sawMessageEvent = false;
+    let messageOutcome: AgentOutcome | undefined;
+    let messageStopReason: StopReason | undefined;
     let presentationFailed = false;
     let runtimeTimer: ReturnType<typeof setInterval> | undefined;
     // Progress publishing is best effort. A renderer or TUI callback failure
     // must never change the child's outcome or terminate its work.
     const report = (progress: string) => {
-      if (result.exitCode !== -1 && result.startedAt !== undefined && result.finishedAt === undefined) result.finishedAt = Date.now();
       if (presentationFailed || !emit) return;
       try {
         emit(result, progress);
       } catch {
         presentationFailed = true;
       }
+    };
+    const note = (message: Message) => {
+      const effect = applyMessage(result, message);
+      if (effect.outcome) messageOutcome = effect.outcome;
+      if (effect.stopReason) messageStopReason = effect.stopReason;
     };
     try {
       if (signal.aborted) throw new Error("Child aborted before launch.");
@@ -56,62 +74,70 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
         onEvent: (event) => {
           if (event.kind === "message" && event.message) {
             sawMessageEvent = true;
-            applyMessage(result, event.message);
-            if (eventFailure) {
-              result.stopReason = "error";
-              result.errorMessage = eventFailure;
-            }
+            note(event.message);
             report(result.output || "Child is working...");
           } else if (event.kind === "messages" && event.messages && !sawMessageEvent) {
-            for (const message of event.messages) applyMessage(result, message);
+            for (const message of event.messages) note(message);
             report(result.output || "Child finished...");
           } else if (event.kind === "progress") {
             report(event.text || "Child is working...");
           } else if (event.kind === "error") {
-            eventFailure = truncateOutput(event.errorMessage || "Child process reported an error.", MAX_DIAGNOSTIC_BYTES);
-            result.stopReason = "error";
-            result.errorMessage = eventFailure;
-            report(eventFailure);
+            protocolFailure = truncateOutput(event.errorMessage || "Child process reported an error.", MAX_DIAGNOSTIC_BYTES);
+            result.errorMessage = protocolFailure;
+            report(protocolFailure);
           }
         },
       });
 
-      const messageTermination = result.termination;
-      result.exitCode = processResult.exitCode;
-      result.termination = processResult.termination;
-      // A protocol-level error/abort must not be hidden by a zero exit code.
-      if (messageTermination === "failed" || messageTermination === "cancelled") result.termination = messageTermination;
-      result.stopReason = processResult.stopReason ?? result.stopReason ?? (processResult.exitCode === 0 ? "stop" : "error");
-      result.errorMessage = boundedDiagnostic(processResult.errorMessage ?? result.errorMessage);
       result.stderr = truncateOutput(processResult.stderr, MAX_STDERR_BYTES);
-      if (eventFailure) {
-        result.exitCode = 1;
-        result.stopReason = "error";
-        result.termination = "failed";
-        result.errorMessage = truncateOutput(eventFailure, MAX_DIAGNOSTIC_BYTES);
-      } else if (processResult.termination === "completed" && (result.termination !== "completed" || !result.output)) {
-        result.exitCode = 1;
-        result.stopReason = "error";
-        result.termination = "failed";
-        result.errorMessage ??= "Child produced no terminal assistant output; a final response is required.";
-      }
-      if (result.stopReason === "error" && !result.errorMessage) result.errorMessage = "Child failed.";
-      report(result.output || result.errorMessage || "(no output)");
+      const outcome = classify(result, processResult, messageOutcome, messageStopReason, protocolFailure);
+      report(result.output || outcome.errorMessage || "(no output)");
+      return outcome;
     } catch (error) {
-      result.exitCode = 1;
-      result.termination = signal.aborted ? "cancelled" : "failed";
-      result.stopReason = result.termination === "cancelled" ? "aborted" : "error";
-      result.errorMessage = boundedDiagnostic(error instanceof Error ? error.message : String(error)) ?? "Child failed.";
-      result.stderr = result.errorMessage;
+      const cancelled = signal.aborted;
+      result.stderr = boundedDiagnostic(error instanceof Error ? error.message : String(error)) ?? "Child failed.";
+      return {
+        outcome: cancelled ? "cancelled" : "failed",
+        exitCode: 1,
+        stopReason: cancelled ? "aborted" : "error",
+        errorMessage: boundedDiagnostic(error instanceof Error ? error.message : String(error)) ?? "Child failed.",
+      };
     } finally {
       if (runtimeTimer) clearInterval(runtimeTimer);
-      result.finishedAt = Date.now();
     }
   }
 }
 
+function classify(
+  result: ChildResult,
+  processResult: { exitCode: number; stopReason?: StopReason; termination: AgentOutcome; errorMessage?: string },
+  messageOutcome: AgentOutcome | undefined,
+  messageStopReason: StopReason | undefined,
+  protocolFailure: string | undefined,
+): ChildExecutionOutcome {
+  let exitCode = processResult.exitCode;
+  let outcome = processResult.termination;
+  // A protocol-level failure or abort must not be hidden by a zero exit code.
+  if (messageOutcome === "failed" || messageOutcome === "cancelled") outcome = messageOutcome;
+  let stopReason = processResult.stopReason ?? messageStopReason ?? (exitCode === 0 ? "stop" : "error");
+  let errorMessage = boundedDiagnostic(processResult.errorMessage ?? result.errorMessage);
+  if (protocolFailure) {
+    exitCode = 1;
+    outcome = "failed";
+    stopReason = "error";
+    errorMessage = protocolFailure;
+  } else if (outcome === "completed" && (messageOutcome !== "completed" || !result.output)) {
+    exitCode = 1;
+    outcome = "failed";
+    stopReason = "error";
+    errorMessage ??= "Child produced no terminal assistant output; a final response is required.";
+  }
+  if (stopReason === "error" && !errorMessage) errorMessage = "Child failed.";
+  return { outcome, exitCode, stopReason, errorMessage };
+}
+
 export function failed(result: ChildResult): boolean {
-  return result.exitCode !== -1 && (result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted" || result.termination !== "completed");
+  return result.state.status === "terminal" && result.state.outcome !== "completed";
 }
 
 export function resultText(result: ChildResult): string {
@@ -121,5 +147,10 @@ export function resultText(result: ChildResult): string {
 }
 
 export function copyResult(result: ChildResult): ChildResult {
-  return { ...result, tools: [...result.tools], usage: { ...result.usage, cost: { ...result.usage.cost } } };
+  return {
+    ...result,
+    tools: [...result.tools],
+    state: { ...result.state },
+    usage: { ...result.usage, cost: { ...result.usage.cost } },
+  };
 }

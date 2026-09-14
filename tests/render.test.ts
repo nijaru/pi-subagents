@@ -10,7 +10,7 @@ import { emptyUsage, type ChildResult, type SubagentDetails } from "../extension
 const theme = { fg: (_: string, text: string) => text, bg: (_: string, text: string) => text, bold: (text: string) => text } as Theme;
 const child: ChildResult = {
   id: "900c096e-a585-4c0f-9089-25ada5a73466", prompt: "Read the package version.", cwd: "/project", tools: ["read"],
-  output: "pi-subagents 0.1.0", exitCode: 0, termination: "completed", startedAt: 0, finishedAt: 8000,
+  output: "pi-subagents 0.1.0", state: { status: "terminal", outcome: "completed", exitCode: 0, stopReason: "stop", finishedAt: 8000 }, startedAt: 0,
   stderr: "", usage: { ...emptyUsage(), turns: 2 }, model: "test/model",
 };
 const result = (command: SubagentDetails["command"], children = [child]): AgentToolResult<SubagentDetails> => ({
@@ -63,7 +63,7 @@ describe("compact child rendering", () => {
     for (const value of [child.prompt, child.output!, "cwd: /project", "tools: read", "2 turns", "test/model"]) expect(text).toContain(value);
   });
   test("spawn omits duplicate prompt and wait expiry stays explicit", () => {
-    const active = { ...child, exitCode: -1, termination: undefined, startedAt: undefined, finishedAt: undefined };
+    const active = { ...child, state: { status: "running" } as const, startedAt: undefined };
     expect(lines("spawn", { command: "spawn", prompt: child.prompt }, false, [active])).toEqual([
       "subagent spawn", child.prompt, "○ 900c096e started",
     ]);
@@ -72,7 +72,7 @@ describe("compact child rendering", () => {
     ]);
   });
   test("old spawn and status snapshots do not acquire a live elapsed timer", () => {
-    const active = { ...child, exitCode: -1, termination: undefined, startedAt: 0, finishedAt: undefined };
+    const active = { ...child, state: { status: "running" } as const, startedAt: 0 };
     for (const command of ["spawn", "status", "wait"] as const) {
       const text = lines(command, { command }, false, [active]).join("\n");
       expect(text).not.toContain("elapsed");
@@ -81,7 +81,7 @@ describe("compact child rendering", () => {
   });
   test("failed, timed-out and cancelled children remain distinguishable", () => {
     for (const termination of ["failed", "timed_out", "cancelled"] as const) {
-      const failed = { ...child, exitCode: 1, termination, errorMessage: "Reason for stopping" };
+      const failed = { ...child, state: { status: "terminal", outcome: termination, exitCode: 1, finishedAt: 8000 } as const, errorMessage: "Reason for stopping" };
       const text = lines("stop", { command: "stop", id: child.id }, false, [failed]).join("\n");
       expect(text).toContain(termination.replaceAll("_", " "));
       expect(text).toContain("Reason for stopping");

@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { textFromMessage } from "../extensions/pi-subagents/types.ts";
-import { truncateOutput } from "../extensions/pi-subagents/bounds.ts";
+import { truncateHeadTail, truncateOutput } from "../extensions/pi-subagents/bounds.ts";
 import { stripTerminalControls } from "../extensions/pi-subagents/render.ts";
 import { executable, getPiInvocation, parseJsonEventLine, spawnDeathWatchdog } from "../extensions/pi-subagents/subprocess.ts";
 
@@ -85,6 +85,20 @@ describe("terminal rendering safety", () => {
 });
 
 describe("deterministic truncation", () => {
+  test("head+tail truncation keeps both ends of over-budget text", () => {
+    const value = "EARLY_DIAGNOSTIC\n" + "x".repeat(60000) + "\nFINAL_STACK_TRACE";
+    const bounded = truncateHeadTail(value, 8192);
+    expect(Buffer.byteLength(bounded, "utf8")).toBeLessThanOrEqual(8192);
+    expect(bounded).toContain("EARLY_DIAGNOSTIC");
+    expect(bounded).toContain("FINAL_STACK_TRACE");
+    expect(bounded).toContain("truncated");
+    expect(truncateHeadTail("short", 8192)).toBe("short");
+    for (const limit of [8, 20, 40]) {
+      const emoji = truncateHeadTail("😀漢字".repeat(50), limit);
+      expect(Buffer.byteLength(emoji, "utf8")).toBeLessThanOrEqual(limit);
+      expect(emoji).not.toContain("\ufffd");
+    }
+  });
   test("is unchanged below the limit and byte-safe above it", () => {
     expect(truncateOutput("small", 20)).toBe("small");
     const value = "😀漢字".repeat(100);

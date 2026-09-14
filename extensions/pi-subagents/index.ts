@@ -5,16 +5,17 @@ import { SubprocessChildSupervisor, failed, resultText } from "./supervisor.ts";
 import { SubagentParamsSchema, resolveCwd, selectTools, validateCommand } from "./params.ts";
 import { DEFAULT_WAIT_MS, MAX_COMPLETION_BYTES, MAX_OUTPUT_BYTES, foregroundBudgetMs, isChildProcess } from "./limits.ts";
 import { boundDetails, truncateOutput } from "./bounds.ts";
+import { isRunning } from "./types.ts";
 import type { ChildResult, SubagentDetails } from "./types.ts";
 import { renderChildCall, renderChildResult, renderChildCompletion, runtimeLabel } from "./render.ts";
 
 export { SubagentParamsSchema } from "./params.ts";
 export type { SubagentParams } from "./params.ts";
-export type { ChildResult, SubagentDetails, AgentTermination, UsageSummary } from "./types.ts";
+export type { ChildResult, SubagentDetails, AgentOutcome, ChildState, UsageSummary } from "./types.ts";
 export { MAX_CONCURRENCY } from "./limits.ts";
 
 function summary(result: ChildResult): string {
-  const status = result.exitCode === -1 ? "running" : result.termination ?? "failed";
+  const status = result.state.status === "running" ? "running" : result.state.outcome;
   return `${result.id} [${status}]${runtimeLabel(result) ? ` · ${runtimeLabel(result)}` : ""}\n${truncateOutput(result.prompt, 256)}`;
 }
 
@@ -83,7 +84,7 @@ export default function (pi: ExtensionAPI) {
       }
       if (params.command === "wait") {
         const result = await owner.wait(params.id!, params.timeoutMs ?? DEFAULT_WAIT_MS, signal);
-        if (result.exitCode === -1) return answer("wait", [result], `${summary(result)}\nStill running; the wait budget expired. The child continues and will send a completion notice.`);
+        if (isRunning(result)) return answer("wait", [result], `${summary(result)}\nStill running; the wait budget expired. The child continues and will send a completion notice.`);
         return outcome("wait", result);
       }
       if (signal?.aborted) throw new Error("Child launch cancelled.");
@@ -97,7 +98,7 @@ export default function (pi: ExtensionAPI) {
         prompt: params.prompt!, tools, cwd, notify: true,
         model: params.model?.trim() ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
         thinking: ctx.thinkingLevel,
-        emit: foreground ? (result, progress) => onUpdate?.(answer("run", [{ ...result, exitCode: -1, termination: undefined, finishedAt: undefined }], progress)) : undefined,
+        emit: foreground ? (result, progress) => onUpdate?.(answer("run", [{ ...result, state: { status: "running" } }], progress)) : undefined,
       });
       if (!foreground) return answer("spawn", [owner.snapshot(run)], `Started child ${run.result.id}. It will report completion automatically. Continue non-overlapping work; use status, wait or stop with this id.`);
       const abort = () => run.controller.abort();
@@ -106,7 +107,7 @@ export default function (pi: ExtensionAPI) {
       try {
         const budget = foregroundBudgetMs();
         const result = await owner.wait(run.result.id, budget);
-        if (result.exitCode === -1) {
+        if (isRunning(result)) {
           return answer("run", [result], `${summary(result)}\nStill running after ${Math.round(budget / 1000)}s; it continues as background work and will send a completion notice. Use status, wait or stop with this id.`);
         }
         return outcome("run", result);
