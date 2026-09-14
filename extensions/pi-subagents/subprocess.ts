@@ -281,13 +281,18 @@ export function recordMessage(result: ChildResult, message: Message): void {
   if (typeof message.errorMessage === "string" && message.errorMessage) result.errorMessage = boundedDiagnostic(message.errorMessage);
 }
 
-export async function runPiProcess(
-  args: string[],
-  cwd: string,
-  childRunId: string,
-  signal: AbortSignal | undefined,
-  onEvent: (event: ParsedJsonEvent) => void,
-): Promise<ProcessResult> {
+export interface PiProcessRequest {
+  args: string[];
+  /** Task text delivered on stdin; Pi reads a piped prompt as its initial message. */
+  prompt: string;
+  cwd: string;
+  childRunId: string;
+  signal?: AbortSignal;
+  onEvent: (event: ParsedJsonEvent) => void;
+}
+
+export async function runPiProcess(request: PiProcessRequest): Promise<ProcessResult> {
+  const { args, prompt, cwd, childRunId, signal, onEvent } = request;
   if (signal?.aborted) return { exitCode: 1, stopReason: "aborted", termination: "cancelled", errorMessage: "Subagent aborted.", stderr: "" };
   const timeoutMs = processTimeoutMs();
 
@@ -334,7 +339,8 @@ export async function runPiProcess(
         shell: false,
         // A child gets its own process group; cleanup includes the commands it starts.
         detached: true,
-        stdio: ["ignore", "pipe", "pipe"],
+        // The task travels on stdin, so no temporary prompt file can leak.
+        stdio: ["pipe", "pipe", "pipe"],
       });
       activeChildren.add(child);
       let rootGroupSwept = false;
@@ -385,6 +391,11 @@ export async function runPiProcess(
     };
     abortHandler = stopForAbort;
     if (signal) signal.addEventListener("abort", abortHandler, { once: true });
+
+    // The child may exit before it drains the prompt; an EPIPE here is already
+    // reflected by the close/exit handling below.
+    child.stdin?.on("error", () => {});
+    child.stdin?.end(prompt);
 
     const consumeStdoutText = (text: string) => {
       let cursor = 0;

@@ -137,7 +137,6 @@ export class SessionChildren {
     this.closed = true;
     for (const run of this.runs.values()) if (!run.settled) run.controller.abort();
     await Promise.allSettled([...this.runs.values()].map((run) => run.promise));
-    await this.supervisor.dispose?.();
     this.runs.clear();
   }
 }

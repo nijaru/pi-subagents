@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -50,8 +50,10 @@ function fakePi(body = 'final("done");'): string {
   fs.writeFileSync(file, `#!/usr/bin/env bun
 import * as fs from "node:fs";
 const args = process.argv.slice(2);
-const taskPath = args.find((arg) => arg.startsWith("@"))?.slice(1);
-fs.writeFileSync(import.meta.filename + ".capture", JSON.stringify({ args, cwd: process.cwd(), prompt: taskPath ? fs.readFileSync(taskPath, "utf8") : null, mode: taskPath ? fs.statSync(taskPath).mode & 0o777 : null, depth: process.env.PI_SUBAGENT_DEPTH }));
+const decoder = new TextDecoder();
+let prompt = "";
+for await (const chunk of Bun.stdin.stream()) prompt += decoder.decode(chunk, { stream: true });
+fs.writeFileSync(import.meta.filename + ".capture", JSON.stringify({ args, cwd: process.cwd(), prompt, depth: process.env.PI_SUBAGENT_DEPTH }));
 const usage = { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, totalTokens: 9, cost: { input: 0.1, output: 0.2, cacheRead: 0.3, cacheWrite: 0.4, total: 1 } };
 const message = (text, stopReason = "stop", extra = {}) => ({ role: "assistant", content: [{ type: "text", text }], model: "fake/model", usage, stopReason, timestamp: 0, ...extra });
 const emit = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
@@ -88,13 +90,12 @@ describe("task-first tool", () => {
   test("exposes only the lifecycle API", () => {
     expect(Object.keys(host().tool.parameters.properties)).toEqual(["command", "prompt", "tools", "model", "cwd", "id", "timeoutMs"]);
   });
-  test("runs without profiles, inherits model/thinking, and transports a private prompt file", async () => {
+  test("runs without profiles, inherits model/thinking, and delivers the prompt on stdin", async () => {
     const h = host();
     const file = fakePi();
     const value = await h.execute({ command: "run", prompt: "Read exactly these facts; no parent history." });
     const capture = await captured(file);
     expect(capture.prompt).toBe("Read exactly these facts; no parent history.");
-    expect(capture.mode).toBe(0o600);
     expect(capture.depth).toBe("1");
     expect(capture.args).toContain("--no-session");
     expect(capture.args).toContain("parent/model");
@@ -102,7 +103,7 @@ describe("task-first tool", () => {
     expect(capture.args).not.toContain("--append-system-prompt");
     expect(capture.args).not.toContain(capture.prompt);
     expect(capture.args).toContain("read,bash,edit,write,web_search,web_fetch,web_research,query-docs");
-    expect(fs.existsSync(capture.args.find((arg: string) => arg.startsWith("@")).slice(1))).toBe(false);
+    expect(capture.args.some((arg: string) => arg.startsWith("@"))).toBe(false);
     expect(first(value).output).toBe("done");
     expect(first(value).usage.cost.total).toBe(1);
     expect(h.notices).toHaveLength(0);
@@ -277,24 +278,6 @@ describe("subprocess regressions", () => {
     expect(Buffer.byteLength(JSON.stringify(value.details))).toBeLessThanOrEqual(50 * 1024);
     expect(first(value).messages).toHaveLength(0);
     expect(first(value).output.length).toBeGreaterThan(1000);
-  });
-  test("failed private-prompt cleanup is visible, bounds further launches, and retries on shutdown", async () => {
-    const h = host(); const file = fakePi();
-    const remove = fs.promises.rm.bind(fs.promises);
-    const mock = spyOn(fs.promises, "rm").mockImplementation(async (target, options) => {
-      if (String(target).includes("pi-subagent-")) throw new Error("simulated cleanup denial");
-      return remove(target, options);
-    });
-    let promptPath = "";
-    try {
-      await expect(h.execute({ command: "run", prompt: "private" })).rejects.toThrow("Private prompt cleanup failed");
-      const capture = await captured(file);
-      promptPath = capture.args.find((arg: string) => arg.startsWith("@")).slice(1);
-      expect(fs.existsSync(promptPath)).toBe(true);
-      await expect(h.execute({ command: "run", prompt: "do not create another file" })).rejects.toThrow("cleanup is pending");
-    } finally { mock.mockRestore(); }
-    await h.shutdown();
-    expect(fs.existsSync(promptPath)).toBe(false);
   });
   test("update-handler failure cleans up and retains its diagnostic", async () => {
     const h = host(); fakePi();

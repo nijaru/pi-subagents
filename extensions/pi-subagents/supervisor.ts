@@ -1,6 +1,3 @@
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
 import type { ChildResult } from "./types.ts";
 import { MAX_DIAGNOSTIC_BYTES, MAX_STDERR_BYTES, RUNNING_PROGRESS_TEXT, RUNTIME_UPDATE_INTERVAL_MS } from "./limits.ts";
 import { boundedDiagnostic, truncateOutput } from "./bounds.ts";
@@ -17,26 +14,13 @@ export interface ChildRunRequest {
 export interface ChildSupervisor {
   /** Updates request.result in place; resolves only after execution and cleanup finish. */
   run(request: ChildRunRequest): Promise<void>;
-  dispose?(): Promise<void>;
 }
 
 export class SubprocessChildSupervisor implements ChildSupervisor {
-  private readonly pendingPromptCleanup = new Set<string>();
-
-  private async removePromptDirectory(directory: string): Promise<void> {
-    await fs.promises.rm(directory, { recursive: true, force: true });
-    this.pendingPromptCleanup.delete(directory);
-  }
-
-  async dispose(): Promise<void> {
-    await Promise.all([...this.pendingPromptCleanup].map((directory) => this.removePromptDirectory(directory)));
-  }
-
   async run({ result, thinking, signal, emit }: ChildRunRequest): Promise<void> {
     let updateError: string | undefined;
     let eventFailure: string | undefined;
     let runtimeTimer: ReturnType<typeof setInterval> | undefined;
-    let tempDir: string | undefined;
     const report = (progress: string, propagate = true) => {
       if (result.exitCode !== -1 && result.startedAt !== undefined && result.finishedAt === undefined) result.finishedAt = Date.now();
       try {
@@ -48,7 +32,6 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
     };
     try {
       if (signal.aborted) throw new Error("Child aborted before launch.");
-      if (this.pendingPromptCleanup.size) throw new Error("Private prompt cleanup is pending; reload the parent session to retry before launching more children.");
       result.startedAt = Date.now();
       report(RUNNING_PROGRESS_TEXT);
       runtimeTimer = setInterval(() => {
@@ -59,30 +42,33 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
       if (thinking) args.push("--thinking", thinking);
       if (result.tools.length) args.push("--tools", result.tools.join(","));
       else args.push("--no-tools");
-      tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
-      const taskPath = path.join(tempDir, "task.md");
-      await fs.promises.writeFile(taskPath, result.prompt, { encoding: "utf8", mode: 0o600 });
-      args.push(`@${taskPath}`);
 
-      const processResult = await runPiProcess(args, result.cwd, result.id, signal, (event) => {
-        if (event.kind === "message" && event.message) {
-          recordMessage(result, event.message);
-          if (eventFailure) {
+      const processResult = await runPiProcess({
+        args,
+        prompt: result.prompt,
+        cwd: result.cwd,
+        childRunId: result.id,
+        signal,
+        onEvent: (event) => {
+          if (event.kind === "message" && event.message) {
+            recordMessage(result, event.message);
+            if (eventFailure) {
+              result.stopReason = "error";
+              result.errorMessage = eventFailure;
+            }
+            report(result.output || "Child is working...");
+          } else if (event.kind === "messages" && event.messages && result.messages.length === 0) {
+            for (const message of event.messages) recordMessage(result, message);
+            report(result.output || "Child finished...");
+          } else if (event.kind === "progress") {
+            report(event.text || "Child is working...");
+          } else if (event.kind === "error") {
+            eventFailure = truncateOutput(event.errorMessage || "Child process reported an error.", MAX_DIAGNOSTIC_BYTES);
             result.stopReason = "error";
             result.errorMessage = eventFailure;
+            report(eventFailure);
           }
-          report(result.output || "Child is working...");
-        } else if (event.kind === "messages" && event.messages && result.messages.length === 0) {
-          for (const message of event.messages) recordMessage(result, message);
-          report(result.output || "Child finished...");
-        } else if (event.kind === "progress") {
-          report(event.text || "Child is working...");
-        } else if (event.kind === "error") {
-          eventFailure = truncateOutput(event.errorMessage || "Child process reported an error.", MAX_DIAGNOSTIC_BYTES);
-          result.stopReason = "error";
-          result.errorMessage = eventFailure;
-          report(eventFailure);
-        }
+        },
       });
 
       const messageTermination = result.termination;
@@ -121,16 +107,6 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
     } finally {
       if (runtimeTimer) clearInterval(runtimeTimer);
       result.finishedAt = Date.now();
-      if (tempDir) {
-        try { await this.removePromptDirectory(tempDir); }
-        catch (error) {
-          this.pendingPromptCleanup.add(tempDir);
-          result.exitCode = 1;
-          result.termination = "failed";
-          result.stopReason = "error";
-          result.errorMessage = boundedDiagnostic(`Private prompt cleanup failed; session shutdown will retry: ${error instanceof Error ? error.message : String(error)}`);
-        }
-      }
     }
   }
 }
