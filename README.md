@@ -18,7 +18,7 @@ Ask Pi to delegate a specific task, or use these tool-call shapes:
 {"command":"run","prompt":"Review the parser changes. Report concrete regressions with file/line and evidence. Do not edit files.","tools":["read"]}
 ```
 
-`run` waits for the final result. For independent work while the parent continues:
+`run` joins the child within a foreground budget (60 seconds by default) and returns its final result. If the budget expires first, the child keeps working in the background and reports completion like `spawn`. For independent work while the parent continues:
 
 ```json
 {"command":"spawn","prompt":"Implement the parser regression test in tests/parser.test.ts. Own only that file, run its tests, and report changes and results.","cwd":"../parser-worktree"}
@@ -29,9 +29,11 @@ Ask Pi to delegate a specific task, or use these tool-call shapes:
 
 Background children send a completion notice and request a follow-up parent turn. `wait` returns the retained final result, or reports that the child is still running when its wait budget expires. Cancelling a wait does **not** cancel the child; `stop` cancels it and waits for cleanup. Cancelling `run` cancels its child.
 
+A blocking `run` or `wait` claims the result it delivers: the completion notice is suppressed while a join is in flight and re-armed only if that join expires or is cancelled while the child is still running. The notice carries the final result inline and points at `wait` only when its excerpt was truncated. A notice queued before the join started can still arrive afterwards.
+
 Handles belong to the current parent session. All children stop on quit, reload, or session replacement. Background work requires a live parent process; a one-shot print invocation is not a persistent worker host.
 
-The TUI shows each prompt once, short IDs, and up to five visible output lines. Expand tool output for full IDs, working directory, tools, and usage. Short IDs are display-only; tool calls still require the full ID. Completion notices occupy one line, with results available on expansion. A notice already queued while Pi is busy can still arrive after `wait` returns.
+The TUI shows each prompt once, short IDs, and up to five visible output lines. Expand tool output for full IDs, working directory, tools, and usage. Short IDs are display-only; tool calls still require the full ID. Completion notices occupy one line, with results available on expansion.
 
 ### Tools and context
 
@@ -56,15 +58,19 @@ Children are separate processes that share your working tree. The extension coun
 |---|---|
 | Active children | 4 per parent session; excess starts are rejected |
 | Retained handles | 32; oldest completed handles are evicted first |
+| Foreground `run` | 60 seconds by default; `PI_SUBAGENT_FOREGROUND_MS` changes it, and expiry hands the child to background work |
 | Child execution | 30 minutes by default; `PI_SUBAGENT_TIMEOUT_MS` may set up to 2 hours |
 | One wait call | 30 seconds by default, at most 120 seconds; never extends the child deadline |
 | Task prompt | 100 KiB |
 | Tool response and result details | 50 KiB each |
+| Child stderr | 50 KiB, keeping both ends so the final stack trace survives |
 | Background completion excerpt | 8 KiB |
 
-All children use the same subprocess runner: `pi --mode json -p --no-session`. Prompts travel through temporary mode-0600 files, not command arguments. Normal completion and cancellation sweep the child's process group before releasing the concurrency slot. No profiles, workflow scheduler, recursive delegation, session persistence, or managed worktree creation is included.
+All children use the same subprocess runner: `pi --mode json -p --no-session`. The task prompt travels on the child's stdin, not in command arguments and not through a temporary file. Normal completion and cancellation sweep the child's process group before releasing the concurrency slot. No profiles, workflow scheduler, recursive delegation, session persistence, or managed worktree creation is included.
 
 A successful child must produce terminal assistant output. Failures, cancellation, and timeouts remain distinguishable in retained status. `run` and completed `wait` throw tool errors for failed children; `status` remains available to inspect them. `stop` reports the resulting state without treating requested cancellation as a tool failure.
+
+**Parent death.** Children run detached in their own process groups, so they do not die with the parent by default. Each child is watched by a detached supervisor that holds a pipe from the parent: when that pipe closes—graceful shutdown, crash, or `SIGKILL`—the watcher terminates the child's process group. On Windows there is no equivalent without a native job object, so only graceful shutdown, the leader process, and a best-effort `taskkill /T` sweep are guaranteed there.
 
 Tool allowlists and subprocesses are **not sandboxes**. A child with shell access can produce effects outside the managed process group. Parent permission state is not an inherited security boundary.
 
@@ -88,7 +94,7 @@ bun install --frozen-lockfile
 bun run check
 ```
 
-Pi loads the TypeScript extension directly; there is no build step. Node 22.19+ is required. Checks use the pinned Pi 0.85.1 packages, including real CLI foreground delegation and background RPC notification tests against a local fake model endpoint. No live model calls are needed.
+Pi loads the TypeScript extension directly; there is no build step. Node 22.19+ is required. Checks use the pinned Pi 0.85.1 packages, including real CLI foreground delegation, background RPC notification, and abrupt-parent-death tests against a local fake model endpoint. No live model calls are needed. The process-tree and death-watchdog tests are POSIX-only and skip on Windows.
 
 The subprocess boundary is kept separate from session ownership so a future native Pi child API can replace it; unreleased pico designs are not a supported backend.
 

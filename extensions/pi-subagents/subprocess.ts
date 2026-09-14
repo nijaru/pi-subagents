@@ -122,7 +122,7 @@ export function parseJsonEventLine(line: string): ParsedJsonEvent | undefined {
 export interface ProcessResult {
   exitCode: number;
   stopReason?: StopReason;
-  termination: AgentOutcome;
+  outcome: AgentOutcome;
   errorMessage?: string;
   stderr: string;
 }
@@ -332,7 +332,7 @@ export interface PiProcessRequest {
 
 export async function runPiProcess(request: PiProcessRequest): Promise<ProcessResult> {
   const { args, prompt, cwd, childRunId, signal, onEvent } = request;
-  if (signal?.aborted) return { exitCode: 1, stopReason: "aborted", termination: "cancelled", errorMessage: "Subagent aborted.", stderr: "" };
+  if (signal?.aborted) return { exitCode: 1, stopReason: "aborted", outcome: "cancelled", errorMessage: "Subagent aborted.", stderr: "" };
   const timeoutMs = processTimeoutMs();
 
   const invocation = getPiInvocation(args);
@@ -400,7 +400,7 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
       watchdog = spawnDeathWatchdog(child);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      finish({ exitCode: 1, stopReason: "error", termination: "failed", errorMessage: message, stderr });
+      finish({ exitCode: 1, stopReason: "error", outcome: "failed", errorMessage: message, stderr });
       return;
     }
 
@@ -487,13 +487,13 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
       activeChildren.delete(child);
       const message = error instanceof Error ? error.message : String(error);
       if (eventError) {
-        finish({ exitCode: 1, stopReason: "error", termination: "failed", errorMessage: `Subagent event handling failed: ${eventError}`, stderr });
+        finish({ exitCode: 1, stopReason: "error", outcome: "failed", errorMessage: `Subagent event handling failed: ${eventError}`, stderr });
       } else if (timedOut) {
-        finish({ exitCode: 1, stopReason: "error", termination: "timed_out", errorMessage: `Subagent timed out after ${timeoutMs} ms.`, stderr });
+        finish({ exitCode: 1, stopReason: "error", outcome: "timed_out", errorMessage: `Subagent timed out after ${timeoutMs} ms.`, stderr });
       } else if (aborted) {
-        finish({ exitCode: 1, stopReason: "aborted", termination: "cancelled", errorMessage: "Subagent aborted.", stderr });
+        finish({ exitCode: 1, stopReason: "aborted", outcome: "cancelled", errorMessage: "Subagent aborted.", stderr });
       } else {
-        finish({ exitCode: 1, stopReason: "error", termination: "failed", errorMessage: message, stderr });
+        finish({ exitCode: 1, stopReason: "error", outcome: "failed", errorMessage: message, stderr });
       }
     });
     child.on("close", (code) => {
@@ -505,15 +505,15 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
         if (event) deliverEvent(event);
       }
       if (eventError) {
-        finish({ exitCode: 1, stopReason: "error", termination: "failed", errorMessage: `Subagent event handling failed: ${eventError}`, stderr });
+        finish({ exitCode: 1, stopReason: "error", outcome: "failed", errorMessage: `Subagent event handling failed: ${eventError}`, stderr });
         return;
       }
       if (timedOut) {
-        finish({ exitCode: 1, stopReason: "error", termination: "timed_out", errorMessage: `Subagent timed out after ${timeoutMs} ms.`, stderr });
+        finish({ exitCode: 1, stopReason: "error", outcome: "timed_out", errorMessage: `Subagent timed out after ${timeoutMs} ms.`, stderr });
         return;
       }
       if (aborted || signal?.aborted) {
-        finish({ exitCode: code ?? 1, stopReason: "aborted", termination: "cancelled", errorMessage: "Subagent aborted.", stderr });
+        finish({ exitCode: code ?? 1, stopReason: "aborted", outcome: "cancelled", errorMessage: "Subagent aborted.", stderr });
         return;
       }
       const exitCode = code ?? 1;
@@ -529,7 +529,7 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
           errorMessage = `Subagent exited with code ${exitCode}.`;
         }
       }
-      finish({ exitCode, stderr, stopReason: exitCode === 0 ? undefined : "error", termination: exitCode === 0 ? "completed" : "failed", errorMessage });
+      finish({ exitCode, stderr, stopReason: exitCode === 0 ? undefined : "error", outcome: exitCode === 0 ? "completed" : "failed", errorMessage });
     });
 
     if (signal?.aborted) stopForAbort();

@@ -15,9 +15,9 @@ Merge only a coherent, independently usable slice. Keep dependent scaffolding on
 ## Ownership and contracts
 
 - `extensions/pi-subagents/index.ts`: registration, parent session lifecycle, completion notices, command dispatch, rendering.
-- `children.ts`: session-owned handles, synchronous admission, wait/stop, retention, shutdown fencing.
-- `supervisor.ts`: the single child execution boundary used by both run and spawn; prompt files, progress, terminal result validation, cleanup.
-- `subprocess.ts`: Pi invocation, bounded JSON framing, process-tree cancellation and normal-exit sweep.
+- `children.ts`: session-owned handles, synchronous admission, wait/stop, delivery arbitration, retention, shutdown fencing.
+- `supervisor.ts`: the single child execution boundary used by both run and spawn; it fills derived output/usage/diagnostics and returns an execution outcome. No session registry here, and no lifecycle state ownership.
+- `subprocess.ts`: Pi invocation, stdin prompt transport, bounded JSON framing, process-tree cancellation and normal-exit sweep, and the parent-death watchdog.
 - `params.ts`: command/tool policy and working-directory resolution.
 - `env.ts`, `bounds.ts`, `limits.ts`, `types.ts`, `render.ts`: environment policy, output/resource bounds, result contracts, rendering helpers.
 - `tests/`: deterministic lifecycle tests plus real subprocess protocol regression tests.
@@ -28,6 +28,8 @@ Admission must happen before asynchronous setup or extension callbacks. Keep the
 
 Default tools are known coding/research tools active in the parent; explicit tools can only select active parent tools. Tool lists, effect metadata, and subprocesses are not sandboxes: a child with shell access can produce effects outside the managed process group. Concurrent writers, including parent-versus-child writers, need separate worktrees; admission counts slots and does not arbitrate write ownership. Child Pi reloads its own integrations; runtime-only parent tools, credentials, providers, and permission hooks are not cloned.
 
-Preserve private prompt-file transport, bounded output/protocol framing, meaningful failure states, deadlines, and process-tree cleanup. Changes to removed v0 APIs must update the migration section and agent-facing skill together; do not add silent aliases.
+Preserve bounded output/protocol framing, meaningful failure states, deadlines, and process-tree cleanup. A blocking join owns the result it delivers: while `run` or `wait` is in flight the completion notice stays suppressed. Only `SessionChildren` may publish lifecycle state; the supervisor returns an outcome. Changes to removed v0 APIs must update the migration section and agent-facing skill together; do not add silent aliases.
+
+Process-tree guarantees are POSIX-first. Windows has no equivalent of the detached pipe watchdog without a native job object, so only graceful shutdown, the leader process, and a best-effort `taskkill /T` sweep are guaranteed there; keep the documentation and the skipped regression test honest about that.
 
 Development dependencies target Pi 0.85.1 and the full subprocess/lifecycle suite is the compatibility gate. New Pi/pico documentation is design evidence until the corresponding API exists and is verified; do not claim compatibility based on proposed interfaces.

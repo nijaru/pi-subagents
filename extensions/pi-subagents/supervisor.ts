@@ -110,13 +110,13 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
 
 function classify(
   result: ChildResult,
-  processResult: { exitCode: number; stopReason?: StopReason; termination: AgentOutcome; errorMessage?: string },
+  processResult: { exitCode: number; stopReason?: StopReason; outcome: AgentOutcome; errorMessage?: string },
   messageOutcome: AgentOutcome | undefined,
   messageStopReason: StopReason | undefined,
   protocolFailure: string | undefined,
 ): ChildExecutionOutcome {
   let exitCode = processResult.exitCode;
-  let outcome = processResult.termination;
+  let outcome = processResult.outcome;
   // A protocol-level failure or abort must not be hidden by a zero exit code.
   if (messageOutcome === "failed" || messageOutcome === "cancelled") outcome = messageOutcome;
   let stopReason = processResult.stopReason ?? messageStopReason ?? (exitCode === 0 ? "stop" : "error");
