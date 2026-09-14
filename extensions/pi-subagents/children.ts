@@ -49,7 +49,7 @@ export class SessionChildren {
     }
     const result: ChildResult = {
       id: randomUUID(), prompt: options.prompt, cwd: options.cwd, tools: [...options.tools],
-      model: options.model, exitCode: -1, stderr: "", messages: [], usage: emptyUsage(),
+      model: options.model, exitCode: -1, stderr: "", usage: emptyUsage(),
     };
     const completion = Promise.withResolvers<ChildResult>();
     const run: ChildRun = {

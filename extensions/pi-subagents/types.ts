@@ -22,7 +22,6 @@ export interface ChildResult {
   termination?: AgentTermination;
   errorMessage?: string;
   stderr: string;
-  messages: Message[];
   usage: UsageSummary;
   model?: string;
 }

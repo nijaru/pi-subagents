@@ -297,10 +297,10 @@ describe("subprocess regressions", () => {
     expect(updates).toBeLessThan(10);
     expect(Buffer.byteLength(value.content[0].text)).toBeLessThanOrEqual(50 * 1024);
     expect(Buffer.byteLength(JSON.stringify(value.details))).toBeLessThanOrEqual(50 * 1024);
-    expect(first(value).messages).toHaveLength(0);
+    expect("messages" in first(value)).toBe(false);
     expect(first(value).output.length).toBeGreaterThan(1000);
   });
-  test("counts usage once when a dropped message is repeated by agent_end", async () => {
+  test("counts usage once when agent_end repeats an already-seen message", async () => {
     const h = host();
     fakePi('const m=message("x".repeat(1000),"stop",{providerMetadata:"x".repeat(20000)}); emit({type:"message_end",message:m}); emit({type:"agent_end",messages:[m]});');
     const value = await h.execute({ command: "run", prompt: "x" });

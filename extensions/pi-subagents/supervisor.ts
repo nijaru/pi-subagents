@@ -1,7 +1,7 @@
 import type { ChildResult } from "./types.ts";
 import { MAX_DIAGNOSTIC_BYTES, MAX_STDERR_BYTES, RUNNING_PROGRESS_TEXT, RUNTIME_UPDATE_INTERVAL_MS } from "./limits.ts";
 import { boundedDiagnostic, truncateOutput } from "./bounds.ts";
-import { recordMessage, runPiProcess } from "./subprocess.ts";
+import { applyMessage, runPiProcess } from "./subprocess.ts";
 
 export interface ChildRunRequest {
   result: ChildResult;
@@ -56,14 +56,14 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
         onEvent: (event) => {
           if (event.kind === "message" && event.message) {
             sawMessageEvent = true;
-            recordMessage(result, event.message);
+            applyMessage(result, event.message);
             if (eventFailure) {
               result.stopReason = "error";
               result.errorMessage = eventFailure;
             }
             report(result.output || "Child is working...");
-          } else if (event.kind === "messages" && event.messages && !sawMessageEvent && result.messages.length === 0) {
-            for (const message of event.messages) recordMessage(result, message);
+          } else if (event.kind === "messages" && event.messages && !sawMessageEvent) {
+            for (const message of event.messages) applyMessage(result, message);
             report(result.output || "Child finished...");
           } else if (event.kind === "progress") {
             report(event.text || "Child is working...");
@@ -127,5 +127,5 @@ export function resultText(result: ChildResult): string {
 }
 
 export function copyResult(result: ChildResult): ChildResult {
-  return { ...result, tools: [...result.tools], messages: [...result.messages], usage: { ...result.usage, cost: { ...result.usage.cost } } };
+  return { ...result, tools: [...result.tools], usage: { ...result.usage, cost: { ...result.usage.cost } } };
 }

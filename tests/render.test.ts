@@ -11,7 +11,7 @@ const theme = { fg: (_: string, text: string) => text, bg: (_: string, text: str
 const child: ChildResult = {
   id: "900c096e-a585-4c0f-9089-25ada5a73466", prompt: "Read the package version.", cwd: "/project", tools: ["read"],
   output: "pi-subagents 0.1.0", exitCode: 0, termination: "completed", startedAt: 0, finishedAt: 8000,
-  stderr: "", messages: [], usage: { ...emptyUsage(), turns: 2 }, model: "test/model",
+  stderr: "", usage: { ...emptyUsage(), turns: 2 }, model: "test/model",
 };
 const result = (command: SubagentDetails["command"], children = [child]): AgentToolResult<SubagentDetails> => ({
   content: [{ type: "text", text: "fallback" }], details: { command, results: children },

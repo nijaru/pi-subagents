@@ -4,10 +4,10 @@ import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { Message, StopReason } from "@earendil-works/pi-ai";
 
-import { MAX_MESSAGES_PER_AGENT, MAX_MESSAGE_BYTES, MAX_OUTPUT_BYTES, MAX_PROTOCOL_LINE_BYTES } from "./limits.ts";
+import { MAX_OUTPUT_BYTES, MAX_PROTOCOL_LINE_BYTES } from "./limits.ts";
 import { addUsage, isFinalMessage, textFromMessage } from "./types.ts";
 import type { ChildResult, AgentTermination, UsageSummary } from "./types.ts";
-import { boundMessage, boundedDiagnostic, capStderr, jsonBytes, truncateOutput } from "./bounds.ts";
+import { boundedDiagnostic, capStderr, truncateOutput } from "./bounds.ts";
 import { processTimeoutMs } from "./limits.ts";
 import { setTimeout as delay } from "node:timers/promises";
 import { childEnvironment } from "./env.ts";
@@ -252,15 +252,12 @@ export function addAssistantUsage(usage: UsageSummary, message: Message): void {
   if (message.usage) addUsage(usage, message.usage);
 }
 
-export function recordMessage(result: ChildResult, message: Message): void {
-  const bounded = boundMessage(message);
-  // A provider may attach arbitrary metadata outside the typed message fields.
-  // Never retain a record that still exceeds the per-message budget; final
-  // assistant text and usage are tracked separately below.
-  if (jsonBytes(bounded) <= MAX_MESSAGE_BYTES) {
-    result.messages.push(bounded);
-    if (result.messages.length > MAX_MESSAGES_PER_AGENT) result.messages.shift();
-  }
+/**
+ * Fold one protocol message into the child result. Messages are processed
+ * transiently: only the derived output, usage, model, and terminal state are
+ * retained, so a long transcript cannot pin message payloads in memory.
+ */
+export function applyMessage(result: ChildResult, message: Message): void {
   addAssistantUsage(result.usage, message);
   if (message.role !== "assistant") return;
   const output = textFromMessage(message);

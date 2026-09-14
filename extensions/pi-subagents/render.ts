@@ -37,7 +37,6 @@ export function isRenderableChildResult(value: unknown): value is ChildResult {
     && isFiniteNumber(result.exitCode)
     && (result.termination === undefined || result.termination === "completed" || result.termination === "failed" || result.termination === "cancelled" || result.termination === "timed_out")
     && typeof result.stderr === "string"
-    && Array.isArray(result.messages)
     && isRenderableUsage(result.usage);
 }
 
