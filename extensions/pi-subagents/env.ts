@@ -1,7 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { findEnvKeys, getProviders } from "@earendil-works/pi-ai/compat";
+import { findEnvKeys } from "@earendil-works/pi-ai/compat";
+import { getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 
 import { DEPTH_ENV, PASSTHROUGH_ENV, PI_BIN_ENV, RUN_ID_ENV, SUBAGENT_BIN_ENV, TIMEOUT_ENV } from "./limits.ts";
 
@@ -122,7 +123,7 @@ export function modelCredentialEnvKeys(): Set<string> {
     Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
   );
   try {
-    for (const provider of getProviders()) {
+    for (const provider of getBuiltinProviders()) {
       for (const key of findEnvKeys(provider, available) ?? []) keys.add(key);
     }
   } catch {
