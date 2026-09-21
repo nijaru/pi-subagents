@@ -38,4 +38,4 @@ Preserve bounded output/protocol framing, meaningful failure states, deadlines, 
 
 Process-tree guarantees are POSIX-first. Windows has no equivalent of the detached pipe watchdog without a native job object, so only graceful shutdown, the leader process, and a best-effort `taskkill /T` sweep are guaranteed there; keep the documentation and the skipped regression test honest about that.
 
-Development dependencies target Pi 0.85.1 and the full subprocess/lifecycle suite is the compatibility gate. New Pi/pico documentation is design evidence until the corresponding API exists and is verified; do not claim compatibility based on proposed interfaces.
+Development dependencies target Pi 0.87.0 and the full subprocess/lifecycle suite is the compatibility gate. New Pi/pico documentation is design evidence until the corresponding API exists and is verified; do not claim compatibility based on proposed interfaces.

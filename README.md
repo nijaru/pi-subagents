@@ -103,7 +103,7 @@ bun install --frozen-lockfile
 bun run check
 ```
 
-Pi loads the TypeScript extension directly; there is no build step. Node 22.19+ is required. Checks use the pinned Pi 0.85.1 packages, including real CLI foreground delegation, background RPC notification, and abrupt-parent-death tests against a local fake model endpoint. No live model calls are needed. The process-tree and death-watchdog tests are POSIX-only and skip on Windows.
+Pi loads the TypeScript extension directly; there is no build step. Node 22.19+ is required. Checks use the pinned Pi 0.87.0 packages, including real CLI foreground delegation, background RPC notification, and abrupt-parent-death tests against a local fake model endpoint. No live model calls are needed. The process-tree and death-watchdog tests are POSIX-only and skip on Windows.
 
 The subprocess boundary is kept separate from session ownership so a future native Pi child API can replace it; unreleased pico designs are not a supported backend.
 
