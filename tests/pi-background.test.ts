@@ -3,12 +3,18 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-// Keep the RPC parent alive after its first turn. Release the child only after
-// agent_end, proving completion starts a new parent turn without status polling.
-test.each([false, true])("real Pi background completion wakes an idle parent; next-tool accounting: %s", async (followUpTool) => {
+// Release the child only after settlement, including an invisible late abort.
+// A test-only command inspects completion without a provider request or a join.
+test.each([
+  { lateAbort: false, followUpTool: false },
+  { lateAbort: false, followUpTool: true },
+  { lateAbort: true, followUpTool: false },
+  { lateAbort: true, followUpTool: true },
+])("real Pi keeps idle completions unread until a natural turn: %j", async ({ lateAbort, followUpTool }) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-children-background-"));
   const parentIdle = Promise.withResolvers<void>();
   const notified = Promise.withResolvers<any>();
+  let parentRequests = 0;
   const finished = Promise.withResolvers<void>();
   const stats = Promise.withResolvers<any>();
   const server = Bun.serve({
@@ -17,6 +23,7 @@ test.each([false, true])("real Pi background completion wakes an idle parent; ne
       const body = await request.json() as any;
       const parent = (body.tools ?? []).some((tool: any) => tool.function.name === "subagent");
       const notice = JSON.stringify(body.messages).includes("Background child finished.");
+      if (parent) parentRequests++;
       let delta: any;
       let finish = "stop";
       if (!parent) {
@@ -51,7 +58,30 @@ test.each([false, true])("real Pi background completion wakes an idle parent; ne
   } } }));
   fs.writeFileSync(path.join(dir, "fixture.txt"), "A follow-up tool unrelated to subagent.");
   const extension = process.env.PI_CHILD_TEST_EXTENSION ?? path.resolve(import.meta.dir, "../extensions/pi-subagents/index.ts");
-  const proc = Bun.spawn([...invocation, "--mode", "rpc", "--no-session", "--extension", extension, "--tools", "read,subagent", "--model", "fixture/model"], {
+  const wrapper = path.join(dir, "wrapper.ts");
+  const readyFile = path.join(dir, "child-ready.json");
+  fs.writeFileSync(wrapper, `import extension from ${JSON.stringify(extension)};
+import {writeFileSync, renameSync} from "node:fs";
+export default function(pi) {
+  let tool;
+  extension({...pi, registerTool(value) { tool = value; pi.registerTool(value); }});
+  let aborted = false;
+  pi.on("agent_before_settle", (_event, ctx) => {
+    if (${lateAbort} && !aborted) { aborted = true; ctx.abort(); }
+  });
+  pi.registerCommand("await-child", {description:"Test probe", handler:async (_args, ctx) => {
+    let result;
+    const deadline = Date.now() + 10000;
+    do {
+      result = await tool.execute("probe", {command:"status"}, undefined, undefined, ctx);
+      if (result.details.results[0]?.state.status === "terminal") break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    } while (Date.now() < deadline);
+    writeFileSync(${JSON.stringify(readyFile + ".tmp")}, JSON.stringify(result));
+    renameSync(${JSON.stringify(readyFile + ".tmp")}, ${JSON.stringify(readyFile)});
+  }});
+}`);
+  const proc = Bun.spawn([...invocation, "--mode", "rpc", "--no-session", "--extension", wrapper, "--tools", "read,subagent", "--model", "fixture/model"], {
     cwd: dir,
     env: { HOME: dir, PATH: process.env.PATH, PI_CODING_AGENT_DIR: dir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_SUBAGENT_TIMEOUT_MS: "15000" },
     stdin: "pipe", stdout: "pipe", stderr: "pipe",
@@ -69,7 +99,7 @@ test.each([false, true])("real Pi background completion wakes an idle parent; ne
       while ((newline = pending.indexOf("\n")) >= 0) {
         const event = JSON.parse(pending.slice(0, newline));
         pending = pending.slice(newline + 1);
-        if (event.type === "agent_end") {
+        if (event.type === "agent_settled") {
           parentIdle.resolve();
           if (output.includes("NOTICE_RECEIVED")) finished.resolve();
         }
@@ -81,6 +111,17 @@ test.each([false, true])("real Pi background completion wakes an idle parent; ne
   const deadline = setTimeout(() => { timeout.reject(new Error(`Background test timed out. Output tail: ${output.slice(-2000)}`)); proc.kill(); }, 20000);
   try {
     proc.stdin.write(JSON.stringify({ type: "prompt", message: "Delegate a background task, then finish your turn without waiting." }) + "\n");
+    await Promise.race([parentIdle.promise, timeout.promise]);
+    proc.stdin.write(JSON.stringify({ type: "prompt", message: "/await-child" }) + "\n");
+    const readyDeadline = Date.now() + 10000;
+    while (!fs.existsSync(readyFile) && Date.now() < readyDeadline) await Bun.sleep(10);
+    expect(fs.existsSync(readyFile)).toBe(true);
+    const retained = JSON.parse(fs.readFileSync(readyFile, "utf8"));
+    expect(retained.details.results[0].output).toBe("BACKGROUND_RESULT");
+    await Bun.sleep(100); // Give an erroneous idle wake-up time to reach the provider.
+    expect(parentRequests).toBe(2);
+    expect(output).not.toContain("Background child finished.");
+    proc.stdin.write(JSON.stringify({ type: "prompt", message: "Continue and incorporate any pending child results." }) + "\n");
     const body = await Promise.race([notified.promise, timeout.promise]);
     expect(JSON.stringify(body.messages)).toContain("BACKGROUND_RESULT");
     expect(output).toContain("PARENT_IDLE");

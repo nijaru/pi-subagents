@@ -1,4 +1,4 @@
-import type { AgentBeforeSettleEvent, AgentEndEvent, BoundaryResult, ExtensionAPI, ExtensionContext, TurnEndEvent } from "@earendil-works/pi-coding-agent";
+import type { AgentBeforeSettleEvent, AgentEndEvent, BoundaryResult, ExtensionContext, TurnEndEvent } from "@earendil-works/pi-coding-agent";
 import { boundDetails, truncateOutput } from "./bounds.ts";
 import { SessionChildren } from "./children.ts";
 import { MAX_COMPLETION_BYTES, MAX_OUTPUT_BYTES } from "./limits.ts";
@@ -32,10 +32,9 @@ function completionMessage(results: ChildResult[]) {
 export class CompletionDelivery {
   private ctx?: ExtensionContext;
   private closed = false;
-  private scheduled = false;
-  private suppressWake = false;
+  private suppressDelivery = false;
 
-  constructor(private readonly pi: ExtensionAPI, private readonly children: SessionChildren) {}
+  constructor(private readonly children: SessionChildren) {}
 
   bind(ctx: ExtensionContext): void { this.ctx = ctx; }
 
@@ -47,13 +46,13 @@ export class CompletionDelivery {
 
   started(ctx: ExtensionContext): void {
     this.bind(ctx);
-    this.suppressWake = false;
+    this.suppressDelivery = false;
   }
 
   ended(event: AgentEndEvent, ctx: ExtensionContext): void {
     this.bind(ctx);
     const last = event.messages.findLast((message) => message.role === "assistant");
-    if (last?.role === "assistant" && (last.stopReason === "aborted" || last.stopReason === "error")) this.suppressWake = true;
+    if (last?.role === "assistant" && (last.stopReason === "aborted" || last.stopReason === "error")) this.suppressDelivery = true;
   }
 
   /** Called after a boundary has committed, not while its draft is being built. */
@@ -69,7 +68,7 @@ export class CompletionDelivery {
       }
     }
     const dropped = this.children.reconcileCompletions(ids);
-    if (dropped) this.suppressWake = true;
+    if (dropped) this.suppressDelivery = true;
     this.refreshStatus();
     return dropped;
   }
@@ -77,9 +76,9 @@ export class CompletionDelivery {
   boundary(event: TurnEndEvent | AgentBeforeSettleEvent, ctx: ExtensionContext): BoundaryResult | undefined {
     if (this.closed) return;
     this.reconcile(ctx);
-    this.suppressWake ||= event.outcome !== "completed";
+    this.suppressDelivery ||= event.outcome !== "completed";
     // Never turn an abort or provider failure into an automatic restart.
-    if (this.suppressWake) return;
+    if (this.suppressDelivery) return;
     const results = this.children.pendingCompletions();
     if (!results.length) return;
     const message = completionMessage(results);
@@ -94,36 +93,9 @@ export class CompletionDelivery {
     if (this.closed) return;
     this.reconcile(ctx);
     this.refreshStatus();
-    // Pi exposes no session abort signal after the low-level run. An abort
-    // during another async pre-settlement hook can therefore be invisible here.
-    // Never start work from settlement itself: late results remain visible in
-    // the status indicator until a natural turn or an explicit wait reads them.
-  }
-
-  ready(): void {
-    if (this.closed) return;
-    this.refreshStatus();
-    // Check idleness when completion occurs as well as when the microtask runs.
-    // Busy-to-idle transition alone must not resurrect an aborted parent.
-    if (this.scheduled || this.suppressWake || !this.ctx?.isIdle()) return;
-    this.scheduled = true;
-    queueMicrotask(() => {
-      this.scheduled = false;
-      if (this.closed || this.suppressWake || !this.ctx?.isIdle()) return;
-      const results = this.children.pendingCompletions();
-      if (!results.length) return;
-      // Only idle parents are woken directly. While busy, ownership stays here
-      // until a turn boundary or a tool result delivers the report.
-      try {
-        this.pi.sendMessage(completionMessage(results), { triggerTurn: true });
-        this.children.acknowledgeCompletions(results.map((result) => result.id));
-        this.refreshStatus();
-      } catch {
-        // Keep the report readable; presentation failures must not crash Pi or
-        // create an automatic retry loop while the host rejects messages.
-        this.suppressWake = true;
-      }
-    });
+    // Pi exposes no late session abort signal. Neither settlement nor a later
+    // completion may wake an idle parent: doing so can undo an invisible abort.
+    // Reports remain unread for an active-turn boundary or an explicit join.
   }
 
   close(): void {

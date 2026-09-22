@@ -14,6 +14,7 @@ interface Host {
   renderers: Map<string, any>;
   execute(params: any, signal?: AbortSignal, update?: (value: any) => void): Promise<any>;
   toolResult(event?: any): any;
+  boundary(): void;
   shutdown(): Promise<void>;
   restart(): Promise<void>;
 }
@@ -37,11 +38,21 @@ function host(active = ["read", "bash", "edit", "write", "web_search", "web_fetc
     sendMessage(message: any, options: any) { notices.push({ message, options }); },
   } as any);
   const cwd = tempDir();
-  const context = { cwd, hasUI: false, model: { provider: "parent", id: "model" }, thinkingLevel: "high", isIdle: () => true };
+  const entries: any[] = [];
+  const context = { cwd, hasUI: false, model: { provider: "parent", id: "model" }, thinkingLevel: "high", isIdle: () => true,
+    sessionManager: { getBranch: () => entries } };
   const instance = {
     tool, cwd, notices, renderers,
     execute: (params: any, signal?: AbortSignal, update?: (value: any) => void) => tool.execute("call", params, signal, update, context),
     toolResult: (event = { toolName: "subagent" }) => events.get("tool_result")!(event),
+    boundary: () => {
+      const result = events.get("turn_end")!({ type: "turn_end", outcome: "completed", entries: [] }, context);
+      for (const entry of result?.entries ?? []) {
+        entries.push(entry);
+        if (entry.customType === "subagent-complete") notices.push({ message: entry });
+      }
+      events.get("turn_start")!({}, context);
+    },
     shutdown: () => events.get("session_shutdown")!(),
     restart: () => events.get("session_start")!({}, context),
   };
@@ -177,13 +188,15 @@ describe("background lifecycle", () => {
     const interim = await h.execute({ command: "wait", id, timeoutMs: 1 });
     expect(first(interim).state.status).toBe("running");
     await captured(file);
-    // No waiter is active when the child finishes, so the armed notice delivers.
+    // No waiter is active; the result stays unread until a turn boundary.
     await Bun.sleep(400);
+    expect(h.notices).toHaveLength(0);
+    h.boundary();
     expect(h.notices).toHaveLength(1);
     expect(h.notices[0].message.content).toContain(id);
     expect(h.notices[0].message.content).toContain("finished later");
     expect(h.notices[0].message.content).not.toContain("use subagent wait");
-    expect(h.notices[0].options).toEqual({ triggerTurn: true });
+    expect(h.notices[0].options).toBeUndefined();
     const theme = { fg: (_: string, text: string) => text, bg: (_: string, text: string) => text };
     const notice = h.renderers.get("subagent-complete")(h.notices[0].message, { expanded: false, outputPad: 1 }, theme).render(100);
     expect(notice).toHaveLength(1);
@@ -206,6 +219,7 @@ describe("background lifecycle", () => {
     fakePi('await delay(50); final("y".repeat(20000));');
     await spawn(h);
     await Bun.sleep(300);
+    h.boundary();
     expect(h.notices).toHaveLength(1);
     expect(h.notices[0].message.content).toContain("use subagent wait");
     expect(Buffer.byteLength(h.notices[0].message.content)).toBeLessThanOrEqual(MAX_COMPLETION_BYTES + 2048);
@@ -219,6 +233,8 @@ describe("background lifecycle", () => {
     expect(value.content[0].text).toContain("Still running after");
     expect(h.notices).toHaveLength(0);
     await Bun.sleep(500);
+    expect(h.notices).toHaveLength(0);
+    h.boundary();
     expect(h.notices).toHaveLength(1);
     expect(h.notices[0].message.content).toContain("late result");
     expect(first(await h.execute({ command: "wait", id: first(value).id })).output).toBe("late result");
@@ -301,8 +317,8 @@ describe("usage delivery", () => {
     fakePi('await delay(50); final("background");');
     const id = await spawn(h);
     expect(h.toolResult()).toBeUndefined();
-    for (let i = 0; !h.notices.length && i < 200; i++) await Bun.sleep(10);
-    expect(h.notices).toHaveLength(1);
+    for (let i = 0; first(await h.execute({ command: "status", id })).state.status === "running" && i < 200; i++) await Bun.sleep(10);
+    expect(h.notices).toHaveLength(0);
     const existing = { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 3,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.5 } };
     const patch = h.toolResult({ toolName: "web_search", usage: existing });

@@ -31,8 +31,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerMessageRenderer("subagent-complete", renderChildCompletion);
   const createRuntime = () => {
     let delivery: CompletionDelivery;
-    const children = new SessionChildren(new SubprocessChildSupervisor(), () => delivery.ready());
-    delivery = new CompletionDelivery(pi, children);
+    const children = new SessionChildren(new SubprocessChildSupervisor(), () => delivery.refreshStatus());
+    delivery = new CompletionDelivery(children);
     return { children, delivery };
   };
   let runtime = createRuntime();
@@ -72,7 +72,7 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Give subagent children relevant evidence, scope, constraints, expected output and checks. Their conversations start fresh without parent history.",
       "Prefer direct work over subagent for routine or tightly coupled tasks. Do not duplicate delegated work; the parent owns integration and verification.",
-      "Background subagent children send completion notices. Use subagent wait only when the result blocks your next step. Cancelling wait does not stop the child; use subagent stop.",
+      "Background subagent completions are delivered at active-turn boundaries, never by waking an idle parent. Use subagent wait when the result blocks finishing your task. Cancelling wait does not stop the child; use subagent stop.",
       "subagent run joins within a bounded foreground budget; if it expires the child keeps working and reports completion like spawn, so never relaunch it as a duplicate.",
       "Give concurrent subagent writers separate worktrees, including parent-versus-child writers. Child processes share the selected working tree; subagent does not arbitrate write ownership.",
     ],
@@ -93,7 +93,7 @@ export default function (pi: ExtensionAPI) {
       }
       if (params.command === "wait") {
         const result = await owner.wait(params.id!, params.timeoutMs ?? DEFAULT_WAIT_MS, signal);
-        if (isRunning(result)) return answer("wait", [result], `${summary(result)}\nStill running; the wait budget expired. The child continues and will send a completion notice.`);
+        if (isRunning(result)) return answer("wait", [result], `${summary(result)}\nStill running; the wait budget expired. The child continues; completion will be delivered at an active-turn boundary. Use wait when its result blocks finishing your task.`);
         return outcome("wait", result);
       }
       if (signal?.aborted) throw new Error("Child launch cancelled.");
@@ -101,14 +101,14 @@ export default function (pi: ExtensionAPI) {
       const cwd = resolveCwd(ctx.cwd || process.cwd(), params.cwd);
       const foreground = params.command === "run";
       // A completed join reads the result; only unread results are eligible
-      // for automatic delivery at a parent boundary or an idle wake-up.
+      // for automatic delivery at an active parent boundary; never wake an idle parent.
       const run = owner.start({
         prompt: params.prompt!, tools, cwd, notify: true,
         model: params.model?.trim() ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
         thinking: ctx.thinkingLevel,
         emit: foreground ? (result, progress) => onUpdate?.(answer("run", [{ ...result, state: { status: "running" } }], progress)) : undefined,
       });
-      if (!foreground) return answer("spawn", [owner.snapshot(run)], `Started child ${run.result.id}. It will report completion automatically. Continue non-overlapping work; use status, wait or stop with this id.`);
+      if (!foreground) return answer("spawn", [owner.snapshot(run)], `Started child ${run.result.id}. Completion will be delivered at an active-turn boundary; idle parents are not woken. Continue non-overlapping work; use wait when its result blocks finishing your task, or status/stop with this id.`);
       const abort = () => run.controller.abort();
       signal?.addEventListener("abort", abort, { once: true });
       if (signal?.aborted) abort();
@@ -116,7 +116,7 @@ export default function (pi: ExtensionAPI) {
         const budget = foregroundBudgetMs();
         const result = await owner.wait(run.result.id, budget);
         if (isRunning(result)) {
-          return answer("run", [result], `${summary(result)}\nStill running after ${Math.round(budget / 1000)}s; it continues as background work and will send a completion notice. Use status, wait or stop with this id.`);
+          return answer("run", [result], `${summary(result)}\nStill running after ${Math.round(budget / 1000)}s; it continues as background work. Completion is delivered at an active-turn boundary, not by waking an idle parent. Use wait when its result blocks finishing your task, or status/stop with this id.`);
         }
         return outcome("run", result);
       } finally { signal?.removeEventListener("abort", abort); }

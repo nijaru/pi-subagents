@@ -27,7 +27,9 @@ Ask Pi to delegate a specific task, or use these tool-call shapes:
 {"command":"stop","id":"<child-id>"}
 ```
 
-Unread background results arrive at the next successful parent turn boundary, or wake the parent if it is idle. Results ready together share one completion message and continuation. Parent errors or cancellation leave unread results available for the next natural turn or an explicit `wait`, rather than restarting the parent automatically. Results finishing after the last delivery boundary also wait for the next natural turn; an unread-result status indicator keeps them visible without forcing another response. `wait` returns the retained final result, or reports that the child is still running when its wait budget expires. Cancelling a wait does **not** cancel the child; `stop` cancels it and waits for cleanup. Cancelling `run` cancels its child.
+Unread background results arrive at the next successful active-turn boundary. Results ready together share one completion message and continuation. **Completions never wake an idle parent.** Results finishing after the last boundary, or during parent errors or cancellation, remain unread until another natural turn or an explicit `wait`. The TUI status indicator shows the unread count. This avoids undoing a late abort that Pi 0.87 cannot expose to extensions.
+
+Use `wait` before finishing a task that depends on a child's result. It returns the retained final result, or reports that the child is still running when its wait budget expires. Cancelling a wait does **not** cancel the child; `stop` cancels it and waits for cleanup. Cancelling `run` cancels its child.
 
 `run`, `wait`, and `stop` mark the result they return as read, suppressing its pending automatic notice even if the child finished before the call. `status` only inspects state; it does not consume a report. Completion notices carry results inline and point at `wait` only when an excerpt was truncated. Once a report has entered the parent's transcript, explicitly reading it again still returns the retained copy but does not generate another notice.
 
@@ -100,7 +102,7 @@ Environment variables are allowlisted, with standard model credentials, `$VAR` r
 - Children now require Node and an installed Pi SDK; launching another Pi CLI through `PI_SUBAGENT_BIN` or `PI_BIN` is no longer supported. Unset these overrides. `PI_SUBAGENT_RUNNER` is a developer-only override for a compatible protocol runner, not a CLI path.
 - Use exact `provider/model-id` values. Missing child tools/models fail before the task rather than falling back or silently disappearing.
 - `ChildResult` adds optional `stdout` and `outputTruncation` fields. Handle the new terminal outcome `incomplete` for model output limits; its partial report remains available.
-- Completion delivery is batched and read-aware. There is no redundant follow-up for a result already returned by `run`, `wait`, or `stop`.
+- Completion delivery is batched, read-aware, and limited to active-turn boundaries. Idle parents are no longer woken automatically. Use `wait` when a child blocks finishing your task. There is no redundant follow-up for a result already returned by `run`, `wait`, or `stop`.
 
 ## Migration from the profile/workflow API
 
