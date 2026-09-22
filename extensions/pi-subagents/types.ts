@@ -1,6 +1,6 @@
 import type { Message, StopReason, Usage } from "@earendil-works/pi-ai";
 
-export type AgentOutcome = "completed" | "failed" | "cancelled" | "timed_out";
+export type AgentOutcome = "completed" | "incomplete" | "failed" | "cancelled" | "timed_out";
 
 /**
  * One discriminated lifecycle state. Everything that differs between a live
@@ -21,6 +21,13 @@ export interface UsageSummary extends Usage {
   turns: number;
 }
 
+export interface OutputTruncation {
+  truncated: boolean;
+  originalBytes: number;
+  /** UTF-8 bytes retained, including the truncation marker when present. */
+  retainedBytes: number;
+}
+
 export interface ChildResult {
   id: string;
   prompt: string;
@@ -28,6 +35,9 @@ export interface ChildResult {
   tools: string[];
   /** Final assistant text, kept separately from bounded diagnostics. */
   output?: string;
+  outputTruncation?: OutputTruncation;
+  /** Child stdout is diagnostic only; protocol travels on a private pipe. */
+  stdout?: string;
   /** Wall-clock launch time for user-visible runtime reporting. */
   startedAt?: number;
   state: ChildState;
@@ -101,37 +111,8 @@ export function isContentPart(value: unknown): value is { type: string; text?: u
   return false;
 }
 
-export function isMessage(value: unknown): value is Message {
-  if (!value || typeof value !== "object") return false;
-  const candidate = value as Record<string, unknown>;
-  if (candidate.role === "toolResult") {
-    const content = candidate.content;
-    const validContent = Array.isArray(content) && content.every((part) => {
-      if (!part || typeof part !== "object") return false;
-      const item = part as Record<string, unknown>;
-      return (item.type === "text" && typeof item.text === "string")
-        || (item.type === "image" && typeof item.data === "string" && typeof item.mimeType === "string");
-    });
-    return validContent
-      && typeof candidate.toolCallId === "string"
-      && typeof candidate.toolName === "string"
-      && typeof candidate.isError === "boolean"
-      && (candidate.usage === undefined || isUsage(candidate.usage));
-  }
-  const validContent = typeof candidate.content === "string"
-    || (Array.isArray(candidate.content) && candidate.content.every(isContentPart));
-  if (!validContent || (candidate.role !== "user" && candidate.role !== "assistant")) return false;
-  return candidate.role !== "assistant" || candidate.usage === undefined || isUsage(candidate.usage);
-}
-
 export function isStopReason(value: unknown): value is StopReason {
   return value === "stop" || value === "length" || value === "toolUse" || value === "error" || value === "aborted";
-}
-
-export function isFinalMessage(value: unknown): value is Message {
-  if (!isMessage(value)) return false;
-  if (value.role !== "assistant") return true;
-  return typeof value.model === "string" && isStopReason(value.stopReason) && isUsage(value.usage);
 }
 
 export function textFromMessage(message: Message): string {
