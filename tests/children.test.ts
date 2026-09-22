@@ -108,10 +108,24 @@ describe("session ownership", () => {
       c.requests[i]!.result.usage.input = 2;
       c.gates[i]!.resolve();
       await next.promise;
+      c.children.acknowledgeCompletions([next.result.id]);
     }
     expect(() => c.children.get(run.result.id)).toThrow("Unknown child");
     expect(c.children.takePendingUsage()?.input).toBe((MAX_RETAINED_RUNS + 1) * 2);
     expect(c.children.takePendingUsage()).toBeUndefined();
+    await c.children.close();
+  });
+  test("does not evict unread results to admit more work", async () => {
+    const c = controlled();
+    for (let i = 0; i < MAX_RETAINED_RUNS; i++) {
+      const run = c.start();
+      c.gates[i]!.resolve();
+      await run.promise;
+    }
+    expect(() => c.start()).toThrow("unread");
+    expect(c.children.pendingCompletions()).toHaveLength(MAX_RETAINED_RUNS);
+    await c.children.wait(c.children.list()[0]!.id, 1);
+    c.start();
     await c.children.close();
   });
   test("shutdown discards pending usage and fences charges from stopped children", async () => {

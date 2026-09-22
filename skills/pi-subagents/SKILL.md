@@ -10,9 +10,9 @@ Use one child for one concrete task. Keep routine or tightly coupled work local.
 ## Choose the lifecycle
 
 - **run**: join the child within a foreground budget (60 seconds by default) and get its final result. If the budget expires the child keeps working as background work and sends a completion notice, so never relaunch it. Cancelling the call cancels the child and joins cleanup.
-- **spawn**: return a child id and continue useful non-overlapping work. Completion sends a notice and requests a follow-up parent turn.
+- **spawn**: return a child id and continue useful non-overlapping work. Unread results are batched at a parent turn boundary or wake an idle parent; they do not queue a redundant follow-up after you read them.
 - **status**: inspect one id, or omit id to list retained children.
-- **wait**: retrieve the final result, waiting up to `timeoutMs` (default 30 seconds, maximum 120 seconds). Expiry or cancellation does not stop the child. A blocking wait or run claims the result it delivers, so it suppresses a redundant completion notice; do not call `wait` again for a result you already received.
+- **wait**: retrieve the final result, waiting up to `timeoutMs` (default 30 seconds, maximum 120 seconds). Expiry or cancellation does not stop the child. A completed `wait` or `run` marks the result read and suppresses its pending notice, including when the child finished before the call. Do not call `wait` again for a result you already received unless its notice was truncated.
 - **stop**: cancel the child and join cleanup. Safe to repeat.
 
 ```json
@@ -34,6 +34,6 @@ Give concurrent writers distinct worktrees through `cwd`. Children are separate 
 
 A failed `run` or completed `wait` is a tool error. Use `status` with its id to inspect the retained failure state. A wait-budget expiry means only that the child is still running; do not launch a duplicate replacement. Wait only when the result blocks your next step, not in a tight polling loop.
 
-Four children may be active. When admission is rejected, wait for or stop existing work rather than bypassing the limit. Up to 32 handles are retained; oldest completed handles are evicted. Quit, reload, or session replacement stops all children and discards handles. Background work needs a live parent process and does not survive restart, but a crashed or killed parent still stops its children rather than leaving them mutating the tree.
+Four children may be active. When admission is rejected, wait for or stop existing work rather than bypassing the limit. Up to 32 handles are retained; oldest completed, delivered handles are evicted. If unread results fill retention, read them with `wait` before starting more children. Quit, reload, or session replacement stops all children and discards handles. Background work needs a live parent process and does not survive restart, but a crashed or killed parent still stops its children rather than leaving them mutating the tree.
 
 Child deadlines default to 30 minutes (`PI_SUBAGENT_TIMEOUT_MS`, at most two hours). Prompts are capped at 100 KiB, responses and result details at 50 KiB each, and completion excerpts at 8 KiB; the prompt travels on the child's stdin, never in command arguments or a temporary file. A completion notice already contains the result unless it says the excerpt was truncated.

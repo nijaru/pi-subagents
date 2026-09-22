@@ -9,7 +9,8 @@ import { truncateOutput } from "./bounds.ts";
 
 export interface ChildRun {
   result: ChildResult;
-  notifyOnCompletion: boolean;
+  /** Result delivery is independent of process completion and waiter lifetime. */
+  delivery: "unread" | "offered" | "delivered";
   controller: AbortController;
   /** Terminal output is not publishable until process-tree cleanup finishes. */
   settled: boolean;
@@ -18,8 +19,6 @@ export interface ChildRun {
   waiters: Set<() => void>;
   /** In-flight joins. A blocking waiter claims delivery, so it suppresses the notice. */
   activeWaits: number;
-  /** Notification policy saved while joins are in flight; restored only if the child is still live. */
-  suspendedNotify: boolean;
 }
 
 export interface StartChild {
@@ -28,7 +27,7 @@ export interface StartChild {
   tools: string[];
   model?: string;
   thinking?: string;
-  /** Arm the completion notice. A blocking join suppresses it while it delivers. */
+  /** Make the completed result available for automatic delivery unless a join reads it. */
   notify: boolean;
   emit?: (result: ChildResult, progress: string) => void;
 }
@@ -39,15 +38,15 @@ export class SessionChildren {
   private closed = false;
   private pendingUsage: Usage | undefined;
 
-  constructor(private readonly supervisor: ChildSupervisor, private readonly completed: (result: ChildResult) => void) {}
+  constructor(private readonly supervisor: ChildSupervisor, private readonly available: (result: ChildResult) => void) {}
 
   start(options: StartChild): ChildRun {
     if (this.closed) throw new Error("The parent session is closing; no new children can start.");
     const active = [...this.runs.values()].filter((run) => !run.settled);
     if (active.length >= MAX_CONCURRENCY) throw new Error(`Too many active children (maximum ${MAX_CONCURRENCY}). Wait for or stop a child first.`);
     while (this.runs.size >= MAX_RETAINED_RUNS) {
-      const oldest = [...this.runs.values()].find((run) => run.settled);
-      if (!oldest) throw new Error("All retained child handles are active.");
+      const oldest = [...this.runs.values()].find((run) => run.settled && run.delivery === "delivered");
+      if (!oldest) throw new Error("Retained child results are unread or still running. Read completed results with wait before starting more children.");
       this.runs.delete(oldest.result.id);
     }
     const result: ChildResult = {
@@ -56,8 +55,8 @@ export class SessionChildren {
     };
     const completion = Promise.withResolvers<ChildResult>();
     const run: ChildRun = {
-      result, notifyOnCompletion: options.notify, controller: new AbortController(), settled: false,
-      promise: completion.promise, waiters: new Set(), activeWaits: 0, suspendedNotify: options.notify,
+      result, delivery: options.notify ? "unread" : "delivered", controller: new AbortController(), settled: false,
+      promise: completion.promise, waiters: new Set(), activeWaits: 0,
     };
     // Register before execution can emit, await, or invoke extension callbacks.
     this.runs.set(result.id, run);
@@ -92,10 +91,54 @@ export class SessionChildren {
       for (const complete of run.waiters) complete();
       run.waiters.clear();
     }
-    if (run.notifyOnCompletion && !this.closed) {
-      try { this.completed(copyResult(run.result)); } catch { /* The retained result remains available through wait/status. */ }
-    }
+    this.signalAvailable(run);
     return copyResult(run.result);
+  }
+
+  private signalAvailable(run: ChildRun): void {
+    if (!this.closed && run.settled && run.delivery === "unread" && run.activeWaits === 0) {
+      try { this.available(copyResult(run.result)); } catch { /* A later boundary or wait can still deliver it. */ }
+    }
+  }
+
+  /** Peek without transferring ownership into a host queue. */
+  pendingCompletions(): ChildResult[] {
+    if (this.closed) return [];
+    return [...this.runs.values()]
+      .filter((run) => run.settled && run.delivery === "unread" && run.activeWaits === 0)
+      .map((run) => this.snapshot(run));
+  }
+
+  /** Boundary drafts are provisional until Pi commits them to the transcript. */
+  offerCompletions(ids: string[]): void {
+    for (const id of ids) {
+      const run = this.runs.get(id);
+      if (run?.settled && run.delivery === "unread") run.delivery = "offered";
+    }
+  }
+
+  hasOfferedCompletions(): boolean {
+    return [...this.runs.values()].some((run) => run.delivery === "offered");
+  }
+
+  /** Return whether another boundary handler removed a proposed delivery. */
+  reconcileCompletions(committedIds: Set<string>): boolean {
+    let dropped = false;
+    for (const run of this.runs.values()) {
+      if (run.delivery !== "offered") continue;
+      const committed = committedIds.has(run.result.id);
+      run.delivery = committed ? "delivered" : "unread";
+      dropped ||= !committed;
+    }
+    return dropped;
+  }
+
+  /** Called only when results are supplied to the parent, not merely queued locally. */
+  acknowledgeCompletions(ids: string[]): void {
+    for (const id of ids) {
+      const run = this.runs.get(id);
+      if (run?.settled) run.delivery = "delivered";
+    }
   }
 
   /** Pi custom completion messages cannot carry usage; the next tool result does. */
@@ -125,33 +168,19 @@ export class SessionChildren {
   async stop(id: string): Promise<ChildResult> {
     const run = this.get(id);
     // stop itself returns the result; do not wake a second parent turn for it.
-    run.notifyOnCompletion = false;
+    run.delivery = "delivered";
     run.controller.abort();
     return run.promise;
   }
 
-  /**
-   * A blocking join is itself a delivery: while one is in flight the completion
-   * notice is suppressed, so a result cannot reach the parent twice.
-   */
-  private suspendDelivery(run: ChildRun): void {
-    if (run.activeWaits++ > 0) return;
-    run.suspendedNotify = run.notifyOnCompletion;
-    run.notifyOnCompletion = false;
-  }
-
-  private resumeDelivery(run: ChildRun): void {
-    if (--run.activeWaits > 0) return;
-    // A join that returned a terminal result already delivered it. Only an
-    // expired or cancelled join on a live child re-arms the notice.
-    if (!run.settled) run.notifyOnCompletion = run.suspendedNotify;
-  }
-
   async wait(id: string, timeoutMs: number, signal?: AbortSignal): Promise<ChildResult> {
     const run = this.get(id);
-    if (run.settled) return this.snapshot(run);
+    if (run.settled) {
+      run.delivery = "delivered";
+      return this.snapshot(run);
+    }
     if (signal?.aborted) throw new Error("Wait cancelled; the background child is still owned by the session. Use stop to cancel it.");
-    this.suspendDelivery(run);
+    run.activeWaits++;
     try {
       await new Promise<void>((resolve, reject) => {
         let settled = false;
@@ -169,10 +198,13 @@ export class SessionChildren {
         signal?.addEventListener("abort", abort, { once: true });
         run.waiters.add(complete);
       });
+      if (run.settled) run.delivery = "delivered";
+      return this.snapshot(run);
     } finally {
-      this.resumeDelivery(run);
+      run.activeWaits--;
+      // A cancelled join can race completion without having delivered it.
+      this.signalAvailable(run);
     }
-    return this.snapshot(run);
   }
 
   async close(): Promise<void> {

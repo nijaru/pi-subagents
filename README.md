@@ -27,9 +27,9 @@ Ask Pi to delegate a specific task, or use these tool-call shapes:
 {"command":"stop","id":"<child-id>"}
 ```
 
-Background children send a completion notice and request a follow-up parent turn. `wait` returns the retained final result, or reports that the child is still running when its wait budget expires. Cancelling a wait does **not** cancel the child; `stop` cancels it and waits for cleanup. Cancelling `run` cancels its child.
+Unread background results arrive at the next successful parent turn boundary, or wake the parent if it is idle. Results ready together share one completion message and continuation. Parent errors or cancellation leave unread results available for the next natural turn or an explicit `wait`, rather than restarting the parent automatically. Results finishing after the last delivery boundary also wait for the next natural turn; an unread-result status indicator keeps them visible without forcing another response. `wait` returns the retained final result, or reports that the child is still running when its wait budget expires. Cancelling a wait does **not** cancel the child; `stop` cancels it and waits for cleanup. Cancelling `run` cancels its child.
 
-A blocking `run` or `wait` claims the result it delivers: the completion notice is suppressed while a join is in flight and re-armed only if that join expires or is cancelled while the child is still running. The notice carries the final result inline and points at `wait` only when its excerpt was truncated. A notice queued before the join started can still arrive afterwards.
+`run`, `wait`, and `stop` mark the result they return as read, suppressing its pending automatic notice even if the child finished before the call. `status` only inspects state; it does not consume a report. Completion notices carry results inline and point at `wait` only when an excerpt was truncated. Once a report has entered the parent's transcript, explicitly reading it again still returns the retained copy but does not generate another notice.
 
 Handles belong to the current parent session. All children stop on quit, reload, or session replacement. Background work requires a live parent process; a one-shot print invocation is not a persistent worker host.
 
@@ -65,14 +65,14 @@ Children are separate processes that share your working tree. The extension coun
 | Resource | Limit |
 |---|---|
 | Active children | 4 per parent session; excess starts are rejected |
-| Retained handles | 32; oldest completed handles are evicted first |
+| Retained handles | 32; oldest completed, delivered handles are evicted first; unread results block admission rather than disappearing |
 | Foreground `run` | 60 seconds by default; `PI_SUBAGENT_FOREGROUND_MS` changes it, and expiry hands the child to background work |
 | Child execution | 30 minutes by default; `PI_SUBAGENT_TIMEOUT_MS` may set up to 2 hours |
 | One wait call | 30 seconds by default, at most 120 seconds; never extends the child deadline |
 | Task prompt | 100 KiB |
 | Tool response and result details | 50 KiB each |
 | Child stderr | 50 KiB, keeping both ends so the final stack trace survives |
-| Background completion excerpt | 8 KiB |
+| Background completion excerpt | At most 8 KiB per child within a 50 KiB aggregate message |
 
 All children use the same subprocess runner: `pi --mode json -p --no-session`. The task prompt travels on the child's stdin, not in command arguments and not through a temporary file. Normal completion and cancellation sweep the child's process group before releasing the concurrency slot. No profiles, workflow scheduler, recursive delegation, session persistence, or managed worktree creation is included.
 

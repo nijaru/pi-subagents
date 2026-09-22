@@ -3,21 +3,17 @@ import { Check } from "typebox/value";
 import { SessionChildren } from "./children.ts";
 import { SubprocessChildSupervisor, failed, resultText } from "./supervisor.ts";
 import { SubagentParamsSchema, resolveCwd, selectTools, validateCommand } from "./params.ts";
-import { DEFAULT_WAIT_MS, MAX_COMPLETION_BYTES, MAX_OUTPUT_BYTES, foregroundBudgetMs, isChildProcess } from "./limits.ts";
+import { DEFAULT_WAIT_MS, MAX_OUTPUT_BYTES, foregroundBudgetMs, isChildProcess } from "./limits.ts";
 import { boundDetails, truncateOutput } from "./bounds.ts";
 import { addUsage, isRunning } from "./types.ts";
 import type { ChildResult, SubagentDetails } from "./types.ts";
-import { renderChildCall, renderChildResult, renderChildCompletion, runtimeLabel } from "./render.ts";
+import { renderChildCall, renderChildResult, renderChildCompletion } from "./render.ts";
+import { childSummary as summary, CompletionDelivery } from "./delivery.ts";
 
 export { SubagentParamsSchema } from "./params.ts";
 export type { SubagentParams } from "./params.ts";
 export type { ChildResult, SubagentDetails, AgentOutcome, ChildState, UsageSummary } from "./types.ts";
 export { MAX_CONCURRENCY } from "./limits.ts";
-
-function summary(result: ChildResult): string {
-  const status = result.state.status === "running" ? "running" : result.state.outcome;
-  return `${result.id} [${status}]${runtimeLabel(result) ? ` · ${runtimeLabel(result)}` : ""}\n${truncateOutput(result.prompt, 256)}`;
-}
 
 function answer(command: SubagentDetails["command"], results: ChildResult[], text: string): AgentToolResult<SubagentDetails> {
   return { content: [{ type: "text", text: truncateOutput(text, MAX_OUTPUT_BYTES) }], details: boundDetails({ command, results }) };
@@ -33,34 +29,38 @@ function outcome(command: SubagentDetails["command"], result: ChildResult): Agen
 
 export default function (pi: ExtensionAPI) {
   pi.registerMessageRenderer("subagent-complete", renderChildCompletion);
-  const createChildren = () => new SessionChildren(new SubprocessChildSupervisor(), (result) => {
-    const output = resultText(result);
-    const excerpt = truncateOutput(output, MAX_COMPLETION_BYTES);
-    // The notice is the delivery for background work, so it carries the result
-    // inline. Only an actually truncated excerpt points at the retained copy,
-    // which keeps the same output from being pulled into context twice.
-    const guidance = excerpt === output ? "" : "\n\nExcerpt truncated; use subagent wait with this id for the full retained result.";
-    pi.sendMessage({
-      customType: "subagent-complete",
-      content: `Background child finished.\n${summary(result)}\n\n${excerpt}${guidance}`,
-      display: true,
-      details: boundDetails({ command: "wait", results: [result] }),
-    }, { triggerTurn: true, deliverAs: "followUp" });
-  });
-  let children = createChildren();
+  const createRuntime = () => {
+    let delivery: CompletionDelivery;
+    const children = new SessionChildren(new SubprocessChildSupervisor(), () => delivery.ready());
+    delivery = new CompletionDelivery(pi, children);
+    return { children, delivery };
+  };
+  let runtime = createRuntime();
   // Use the host's usage channel, including for thrown tool errors. Charging
   // snapshots or notices would duplicate costs on repeated wait/status calls.
   pi.on("tool_result", (event) => {
-    const usage = children.takePendingUsage();
+    runtime.delivery.refreshStatus();
+    const usage = runtime.children.takePendingUsage();
     if (!usage) return;
     if (event.usage) addUsage(usage, event.usage);
     return { usage };
   });
-  pi.on("session_shutdown", async () => { await children.close(); });
-  pi.on("session_start", async () => {
-    await children.close();
-    children = createChildren();
+  pi.on("session_shutdown", async () => {
+    runtime.delivery.close();
+    await runtime.children.close();
   });
+  pi.on("session_start", async (_event, ctx) => {
+    runtime.delivery.close();
+    await runtime.children.close();
+    runtime = createRuntime();
+    runtime.delivery.bind(ctx);
+  });
+  pi.on("agent_start", (_event, ctx) => runtime.delivery.started(ctx));
+  pi.on("agent_end", (event, ctx) => runtime.delivery.ended(event, ctx));
+  pi.on("turn_start", (_event, ctx) => { runtime.delivery.reconcile(ctx); });
+  pi.on("turn_end", (event, ctx) => runtime.delivery.boundary(event, ctx));
+  pi.on("agent_before_settle", (event, ctx) => runtime.delivery.boundary(event, ctx));
+  pi.on("agent_settled", (_event, ctx) => runtime.delivery.settled(ctx));
 
   pi.registerTool({
     name: "subagent",
@@ -81,7 +81,8 @@ export default function (pi: ExtensionAPI) {
       validateCommand(params);
       if (isChildProcess()) throw new Error("Children are leaves; nested subagent calls are not supported.");
       // Capture the owner: an old foreground call must never read a new session's registry.
-      const owner = children;
+      const owner = runtime.children;
+      runtime.delivery.bind(ctx);
       if (params.command === "status") {
         const results = params.id ? [owner.snapshot(owner.get(params.id))] : owner.list();
         return answer("status", results, results.length ? results.map(summary).join("\n\n") : "No retained children.");
@@ -99,9 +100,8 @@ export default function (pi: ExtensionAPI) {
       const tools = selectTools(params.tools, pi.getActiveTools());
       const cwd = resolveCwd(ctx.cwd || process.cwd(), params.cwd);
       const foreground = params.command === "run";
-      // Every child arms its completion notice. A blocking run joins with a
-      // budget, and the join itself suppresses the notice if it delivers; only
-      // a budget expiry leaves the notice armed and the child in the background.
+      // A completed join reads the result; only unread results are eligible
+      // for automatic delivery at a parent boundary or an idle wake-up.
       const run = owner.start({
         prompt: params.prompt!, tools, cwd, notify: true,
         model: params.model?.trim() ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),

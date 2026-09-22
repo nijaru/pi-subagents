@@ -49,7 +49,7 @@ test.each([false, true])("real Pi CLI delegates and accounts child usage, includ
     } } }));
     const cli = path.resolve(import.meta.dir, "../node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
     const invocation = process.env.PI_CHILD_TEST_CLI ? [process.env.PI_CHILD_TEST_CLI] : ["node", cli];
-    const extension = path.resolve(import.meta.dir, "../extensions/pi-subagents/index.ts");
+    const extension = process.env.PI_CHILD_TEST_EXTENSION ?? path.resolve(import.meta.dir, "../extensions/pi-subagents/index.ts");
     const child = Bun.spawn([...invocation, "--mode", "json", "-p", "--no-session", "--extension", extension, "--tools", "read,subagent", "--model", "fixture/model", "PARENT_HISTORY_SECRET: delegate the bounded task."], {
       cwd: dir,
       env: { HOME: dir, PATH: process.env.PATH, PI_CODING_AGENT_DIR: dir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_SUBAGENT_TIMEOUT_MS: "15000" },

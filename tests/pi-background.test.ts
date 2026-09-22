@@ -50,7 +50,8 @@ test.each([false, true])("real Pi background completion wakes an idle parent; ne
     baseUrl: `http://127.0.0.1:${server.port}/v1`, api: "openai-completions", apiKey: "test-only", models: [{ id: "model" }],
   } } }));
   fs.writeFileSync(path.join(dir, "fixture.txt"), "A follow-up tool unrelated to subagent.");
-  const proc = Bun.spawn([...invocation, "--mode", "rpc", "--no-session", "--extension", path.resolve(import.meta.dir, "../extensions/pi-subagents/index.ts"), "--tools", "read,subagent", "--model", "fixture/model"], {
+  const extension = process.env.PI_CHILD_TEST_EXTENSION ?? path.resolve(import.meta.dir, "../extensions/pi-subagents/index.ts");
+  const proc = Bun.spawn([...invocation, "--mode", "rpc", "--no-session", "--extension", extension, "--tools", "read,subagent", "--model", "fixture/model"], {
     cwd: dir,
     env: { HOME: dir, PATH: process.env.PATH, PI_CODING_AGENT_DIR: dir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_SUBAGENT_TIMEOUT_MS: "15000" },
     stdin: "pipe", stdout: "pipe", stderr: "pipe",

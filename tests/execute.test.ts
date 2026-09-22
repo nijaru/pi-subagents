@@ -37,13 +37,13 @@ function host(active = ["read", "bash", "edit", "write", "web_search", "web_fetc
     sendMessage(message: any, options: any) { notices.push({ message, options }); },
   } as any);
   const cwd = tempDir();
-  const context = { cwd, hasUI: false, model: { provider: "parent", id: "model" }, thinkingLevel: "high" };
+  const context = { cwd, hasUI: false, model: { provider: "parent", id: "model" }, thinkingLevel: "high", isIdle: () => true };
   const instance = {
     tool, cwd, notices, renderers,
     execute: (params: any, signal?: AbortSignal, update?: (value: any) => void) => tool.execute("call", params, signal, update, context),
     toolResult: (event = { toolName: "subagent" }) => events.get("tool_result")!(event),
     shutdown: () => events.get("session_shutdown")!(),
-    restart: () => events.get("session_start")!(),
+    restart: () => events.get("session_start")!({}, context),
   };
   hosts.push(instance);
   return instance;
@@ -181,7 +181,7 @@ describe("background lifecycle", () => {
     expect(h.notices[0].message.content).toContain(id);
     expect(h.notices[0].message.content).toContain("finished later");
     expect(h.notices[0].message.content).not.toContain("use subagent wait");
-    expect(h.notices[0].options).toEqual({ triggerTurn: true, deliverAs: "followUp" });
+    expect(h.notices[0].options).toEqual({ triggerTurn: true });
     const theme = { fg: (_: string, text: string) => text, bg: (_: string, text: string) => text };
     const notice = h.renderers.get("subagent-complete")(h.notices[0].message, { expanded: false, outputPad: 1 }, theme).render(100);
     expect(notice).toHaveLength(1);

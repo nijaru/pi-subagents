@@ -21,7 +21,8 @@ Release through the manual `publish` workflow, never from a working tree. Verify
 ## Ownership and contracts
 
 - `extensions/pi-subagents/index.ts`: registration, parent session lifecycle, completion notices, command dispatch, rendering.
-- `children.ts`: session-owned handles, synchronous admission, wait/stop, delivery arbitration, retention, shutdown fencing.
+- `children.ts`: session-owned handles, synchronous admission, wait/stop, unread/offered/delivered result state, usage accounting, retention, shutdown fencing.
+- `delivery.ts`: host turn-boundary batching and idle wake-ups. Boundary drafts remain provisional until confirmed in the transcript; no busy-parent follow-up queue.
 - `supervisor.ts`: the single child execution boundary used by both run and spawn; it fills derived output/usage/diagnostics and returns an execution outcome. No session registry here, and no lifecycle state ownership.
 - `subprocess.ts`: Pi invocation, stdin prompt transport, bounded JSON framing, process-tree cancellation and normal-exit sweep, and the parent-death watchdog.
 - `params.ts`: command/tool policy and working-directory resolution.
@@ -34,7 +35,7 @@ Admission must happen before asynchronous setup or extension callbacks. Keep the
 
 Default tools are known coding/research tools active in the parent; explicit tools can only select active parent tools. Tool lists, effect metadata, and subprocesses are not sandboxes: a child with shell access can produce effects outside the managed process group. Concurrent writers, including parent-versus-child writers, need separate worktrees; admission counts slots and does not arbitrate write ownership. Child Pi reloads its own integrations; runtime-only parent tools, credentials, providers, and permission hooks are not cloned.
 
-Preserve bounded output/protocol framing, meaningful failure states, deadlines, and process-tree cleanup. A blocking join owns the result it delivers: while `run` or `wait` is in flight the completion notice stays suppressed. Only `SessionChildren` may publish lifecycle state; the supervisor returns an outcome. Changes to removed v0 APIs must update the migration section and agent-facing skill together; do not add silent aliases.
+Preserve bounded output/protocol framing, meaningful failure states, deadlines, and process-tree cleanup. A completed join owns the result it delivers, even if completion preceded the call. Busy-parent results stay retractable until a turn boundary; never evict unread reports or restart an aborted/error parent just to announce completion. Only `SessionChildren` may publish lifecycle state; the supervisor returns an outcome. Changes to removed v0 APIs must update the migration section and agent-facing skill together; do not add silent aliases.
 
 Process-tree guarantees are POSIX-first. Windows has no equivalent of the detached pipe watchdog without a native job object, so only graceful shutdown, the leader process, and a best-effort `taskkill /T` sweep are guaranteed there; keep the documentation and the skipped regression test honest about that.
 
