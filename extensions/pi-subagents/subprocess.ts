@@ -2,12 +2,15 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import type { Message, StopReason } from "@earendil-works/pi-ai";
+import type { StopReason } from "@earendil-works/pi-ai";
+import { getPackageDir } from "@earendil-works/pi-coding-agent";
+import { fileURLToPath } from "node:url";
+import type { Readable } from "node:stream";
+import { parseChildEvent, type ChildBootstrap, type ChildEvent } from "./child-protocol.ts";
 
-import { MAX_OUTPUT_BYTES, MAX_PROTOCOL_LINE_BYTES, MAX_STDERR_BYTES } from "./limits.ts";
-import { addUsage, isFinalMessage, textFromMessage } from "./types.ts";
-import type { ChildResult, AgentOutcome, UsageSummary } from "./types.ts";
-import { boundedDiagnostic, capStderr, truncateHeadTail, truncateOutput } from "./bounds.ts";
+import { MAX_PROTOCOL_LINE_BYTES, MAX_STDERR_BYTES } from "./limits.ts";
+import type { AgentOutcome } from "./types.ts";
+import { capStderr, truncateHeadTail } from "./bounds.ts";
 import { processTimeoutMs } from "./limits.ts";
 import { setTimeout as delay } from "node:timers/promises";
 import { childEnvironment } from "./env.ts";
@@ -41,82 +44,22 @@ export function findOnPath(name: string): string | undefined {
 }
 
 /**
- * Invoke the same pi CLI as the parent process. All returned commands are
- * absolute, avoiding cwd/PATH changes inside a delegated task.
+ * Run the packaged SDK bootstrap with absolute runtime and SDK paths.
+ * PI_SUBAGENT_RUNNER is an explicit protocol-runner override (also used by tests).
  */
-export function getPiInvocation(args: string[]): PiInvocation {
-  const configured = process.env.PI_SUBAGENT_BIN ?? process.env.PI_BIN;
-  if (configured) {
-    const absolute = path.resolve(configured);
-    if (executable(absolute)) return { command: fs.realpathSync.native(absolute), args };
+export function getChildInvocation(): PiInvocation {
+  if (process.env.PI_SUBAGENT_BIN || process.env.PI_BIN) {
+    throw new Error("PI_SUBAGENT_BIN/PI_BIN CLI overrides are no longer supported; children use the installed Pi SDK. Protocol tests may set PI_SUBAGENT_RUNNER.");
   }
-
   const runtime = path.basename(process.execPath).toLowerCase();
-  const genericRuntime = /^(node|bun|deno)(\.exe)?$/.test(runtime);
-  const currentScript = process.argv[1] ? path.resolve(process.argv[1]) : undefined;
-
-  if (!genericRuntime && executable(process.execPath)) {
-    return { command: fs.realpathSync.native(process.execPath), args };
-  }
-  if (currentScript && fs.existsSync(currentScript) && /\.(?:mjs|cjs|js|ts)$/.test(currentScript)) {
-    return { command: fs.realpathSync.native(process.execPath), args: [currentScript, ...args] };
-  }
-
-  const piPath = findOnPath("pi");
-  if (piPath) return { command: piPath, args };
-  throw new Error("Unable to resolve an absolute pi executable for subagent delegation.");
-}
-
-export interface ParsedJsonEvent {
-  kind: "message" | "messages" | "progress" | "error";
-  message?: Message;
-  messages?: Message[];
-  text?: string;
-  errorMessage?: string;
-}
-
-/** Parse one JSON-mode line; malformed/non-event lines are safely ignored. */
-export function parseJsonEventLine(line: string): ParsedJsonEvent | undefined {
-  if (!line.trim()) return undefined;
-  let event: unknown;
-  try {
-    event = JSON.parse(line);
-  } catch {
-    return undefined;
-  }
-  if (!event || typeof event !== "object") return undefined;
-  const candidate = event as Record<string, unknown>;
-  if (candidate.type === "message_end" && isFinalMessage(candidate.message)) {
-    return { kind: "message", message: candidate.message };
-  }
-  if (candidate.type === "tool_execution_end") {
-    const toolName = typeof candidate.toolName === "string" ? candidate.toolName : "tool";
-    return { kind: "progress", text: `Finished ${truncateOutput(toolName, 256)}.` };
-  }
-  if (candidate.type === "agent_end" && Array.isArray(candidate.messages)) {
-    const messages = candidate.messages.filter(isFinalMessage);
-    return messages.length > 0 ? { kind: "messages", messages } : undefined;
-  }
-  if (candidate.type === "message_update") {
-    // Pi 0.84 emits token-level deltas here. They are useful to a dedicated
-    // streaming transcript, but forwarding each one as a parent tool update
-    // makes the subagent preview flicker word by word and can recreate the
-    // parent-side render/serialization storm this parser is meant to avoid.
-    // message_end remains authoritative; tool lifecycle events below provide
-    // coarse progress without replaying model tokens into the parent preview.
-    return undefined;
-  }
-  if (candidate.type === "tool_execution_start" || candidate.type === "tool_execution_update") {
-    const toolName = typeof candidate.toolName === "string" ? candidate.toolName : "tool";
-    return { kind: "progress", text: `Running ${truncateOutput(toolName, 256)}...` };
-  }
-  if (candidate.type === "error") {
-    const errorMessage = typeof candidate.errorMessage === "string"
-      ? candidate.errorMessage
-      : typeof candidate.message === "string" ? candidate.message : "Subagent process reported an error.";
-    return { kind: "error", errorMessage };
-  }
-  return undefined;
+  const command = /^node(\.exe)?$/.test(runtime) ? process.execPath : findOnPath("node");
+  if (!command) throw new Error("Child SDK runner requires Node.js on PATH.");
+  const sdk = path.join(getPackageDir(), "dist", "index.js");
+  if (!fs.existsSync(sdk)) throw new Error("Child runner requires an installed Pi SDK (dist/index.js); standalone Pi binaries are not supported.");
+  const runner = process.env.PI_SUBAGENT_RUNNER
+    ? path.resolve(process.env.PI_SUBAGENT_RUNNER)
+    : fileURLToPath(new URL("./child-bootstrap.mjs", import.meta.url));
+  return { command: fs.realpathSync.native(command), args: [runner, sdk] };
 }
 
 export interface ProcessResult {
@@ -125,6 +68,7 @@ export interface ProcessResult {
   outcome: AgentOutcome;
   errorMessage?: string;
   stderr: string;
+  stdout?: string;
 }
 
 export function descendantPids(pid: number): number[] {
@@ -280,68 +224,27 @@ export async function sweepRootProcessGroup(child: ChildProcess): Promise<void> 
   await waitForGroupExit(1000);
 }
 
-export function addMessageUsage(usage: UsageSummary, message: Message): void {
-  if (message.role !== "assistant" && message.role !== "toolResult") return;
-  if (message.role === "assistant") usage.turns++;
-  if (message.usage) addUsage(usage, message.usage);
-}
-
-/** Facts derived from one protocol message that the caller must fold into liveness. */
-export interface MessageEffect {
-  outcome?: AgentOutcome;
-  stopReason?: StopReason;
-}
-
-/**
- * Fold one protocol message into the child result. Messages are processed
- * transiently: only the derived output, usage, model, and diagnostics are
- * retained, so a long transcript cannot pin message payloads in memory.
- */
-export function applyMessage(result: ChildResult, message: Message): MessageEffect {
-  addMessageUsage(result.usage, message);
-  if (message.role !== "assistant") return {};
-  const effect: MessageEffect = {};
-  const output = textFromMessage(message);
-  if (typeof message.model === "string" && message.model) result.model = truncateOutput(message.model, 256);
-  if (message.stopReason === "stop" || message.stopReason === "length" || message.stopReason === "toolUse" || message.stopReason === "error" || message.stopReason === "aborted") {
-    effect.stopReason = message.stopReason;
-  }
-  // Only terminal assistant messages are authoritative output. Text attached
-  // to a toolUse turn is progress, not a completed report.
-  if (message.stopReason === "stop" || message.stopReason === "length") {
-    effect.outcome = "completed";
-    if (output) result.output = truncateOutput(output, MAX_OUTPUT_BYTES);
-  } else if (message.stopReason === "aborted") {
-    effect.outcome = "cancelled";
-  } else if (message.stopReason === "error") {
-    effect.outcome = "failed";
-  }
-  if (typeof message.errorMessage === "string" && message.errorMessage) result.errorMessage = boundedDiagnostic(message.errorMessage);
-  return effect;
-}
-
 export interface PiProcessRequest {
-  args: string[];
-  /** Task text delivered on stdin; Pi reads a piped prompt as its initial message. */
-  prompt: string;
+  bootstrap: ChildBootstrap;
   cwd: string;
   childRunId: string;
   signal?: AbortSignal;
-  onEvent: (event: ParsedJsonEvent) => void;
+  onEvent: (event: ChildEvent) => void;
 }
 
 export async function runPiProcess(request: PiProcessRequest): Promise<ProcessResult> {
-  const { args, prompt, cwd, childRunId, signal, onEvent } = request;
+  const { bootstrap, cwd, childRunId, signal, onEvent } = request;
   if (signal?.aborted) return { exitCode: 1, stopReason: "aborted", outcome: "cancelled", errorMessage: "Subagent aborted.", stderr: "" };
   const timeoutMs = processTimeoutMs();
 
-  const invocation = getPiInvocation(args);
+  const invocation = getChildInvocation();
   return new Promise((resolve) => {
     let settled = false;
     let finishing = false;
     let rootSweepPromise: Promise<void> | undefined;
     let aborted = false;
     let stderr = "";
+    let stdout = "";
     let trailing = "";
     let discardingLine = false;
     let killTimer: ReturnType<typeof setTimeout> | undefined;
@@ -370,7 +273,12 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
         if (killTimer) clearTimeout(killTimer);
         if (processTimer) clearTimeout(processTimer);
         if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
-        resolve({ ...result, stderr: truncateHeadTail(stderr, MAX_STDERR_BYTES) });
+        // Cancellation/deadline during the cleanup join is still authoritative.
+        const termination = timedOut
+          ? { outcome: "timed_out" as const, exitCode: 1, stopReason: "error" as const, errorMessage: `Subagent timed out after ${timeoutMs} ms.` }
+          : aborted || signal?.aborted
+            ? { outcome: "cancelled" as const, exitCode: 1, stopReason: "aborted" as const, errorMessage: "Subagent aborted." } : {};
+        resolve({ ...result, ...termination, stderr: truncateHeadTail(stderr, MAX_STDERR_BYTES), stdout: truncateHeadTail(stdout, MAX_STDERR_BYTES) });
       })();
     };
 
@@ -383,7 +291,7 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
         // A child gets its own process group; cleanup includes the commands it starts.
         detached: true,
         // The task travels on stdin, so no temporary prompt file can leak.
-        stdio: ["pipe", "pipe", "pipe"],
+        stdio: ["pipe", "pipe", "pipe", "pipe"],
       });
       activeChildren.add(child);
       let rootGroupSwept = false;
@@ -421,10 +329,11 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
       }, 5000);
     };
     processTimer = setTimeout(stopForTimeout, timeoutMs);
-    const deliverEvent = (event: ParsedJsonEvent) => {
+    const deliverLine = (line: string, oversized = false) => {
       if (settled || eventError) return;
       try {
-        onEvent(event);
+        if (oversized) throw new Error("Oversized child protocol frame.");
+        onEvent(parseChildEvent(line));
       } catch (error) {
         eventError = error instanceof Error ? error.message : String(error);
         terminateProcessTree(child, "SIGTERM");
@@ -439,9 +348,9 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
     // The child may exit before it drains the prompt; an EPIPE here is already
     // reflected by the close/exit handling below.
     child.stdin?.on("error", () => {});
-    child.stdin?.end(prompt);
+    child.stdin?.end(JSON.stringify(bootstrap));
 
-    const consumeStdoutText = (text: string) => {
+    const consumeProtocolText = (text: string) => {
       let cursor = 0;
       while (cursor < text.length) {
         if (discardingLine) {
@@ -456,8 +365,8 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
         if (newline < 0) {
           const segment = text.slice(cursor);
           if (Buffer.byteLength(trailing, "utf8") + Buffer.byteLength(segment, "utf8") > MAX_PROTOCOL_LINE_BYTES) {
-            // Drop the rest of an oversized unterminated line, but keep reading
-            // until its newline so a later valid event can still complete.
+            // A dedicated protocol pipe cannot legitimately contain oversized noise.
+            deliverLine("", true);
             trailing = "";
             discardingLine = true;
           } else {
@@ -469,16 +378,20 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
         const segment = text.slice(cursor, newline);
         const lineBytes = Buffer.byteLength(trailing, "utf8") + Buffer.byteLength(segment, "utf8");
         if (lineBytes <= MAX_PROTOCOL_LINE_BYTES) {
-          const event = parseJsonEventLine(trailing + segment);
-          if (event) deliverEvent(event);
+          deliverLine(trailing + segment);
+        } else {
+          deliverLine("", true);
         }
         trailing = "";
         cursor = newline + 1;
       }
     };
 
+    (child.stdio[3] as Readable).on("data", (chunk: Buffer | string) => {
+      consumeProtocolText(decoder.write(chunk));
+    });
     child.stdout?.on("data", (chunk: Buffer | string) => {
-      consumeStdoutText(decoder.write(chunk));
+      stdout = capStderr(stdout, typeof chunk === "string" ? chunk : chunk.toString("utf8"));
     });
     child.stderr?.on("data", (chunk: Buffer | string) => {
       stderr = capStderr(stderr, typeof chunk === "string" ? chunk : chunk.toString("utf8"));
@@ -486,27 +399,20 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
     child.on("error", (error) => {
       activeChildren.delete(child);
       const message = error instanceof Error ? error.message : String(error);
-      if (eventError) {
-        finish({ exitCode: 1, stopReason: "error", outcome: "failed", errorMessage: `Subagent event handling failed: ${eventError}`, stderr });
-      } else if (timedOut) {
+      if (timedOut) {
         finish({ exitCode: 1, stopReason: "error", outcome: "timed_out", errorMessage: `Subagent timed out after ${timeoutMs} ms.`, stderr });
       } else if (aborted) {
         finish({ exitCode: 1, stopReason: "aborted", outcome: "cancelled", errorMessage: "Subagent aborted.", stderr });
       } else {
-        finish({ exitCode: 1, stopReason: "error", outcome: "failed", errorMessage: message, stderr });
+        finish({ exitCode: 1, stopReason: "error", outcome: "failed", errorMessage: eventError ? `Subagent event handling failed: ${eventError}` : message, stderr });
       }
     });
     child.on("close", (code) => {
       activeChildren.delete(child);
       const finalText = decoder.end();
-      if (finalText && !discardingLine) consumeStdoutText(finalText);
+      if (finalText && !discardingLine) consumeProtocolText(finalText);
       if (trailing.trim() && !discardingLine && Buffer.byteLength(trailing, "utf8") <= MAX_PROTOCOL_LINE_BYTES) {
-        const event = parseJsonEventLine(trailing);
-        if (event) deliverEvent(event);
-      }
-      if (eventError) {
-        finish({ exitCode: 1, stopReason: "error", outcome: "failed", errorMessage: `Subagent event handling failed: ${eventError}`, stderr });
-        return;
+        deliverLine(trailing);
       }
       if (timedOut) {
         finish({ exitCode: 1, stopReason: "error", outcome: "timed_out", errorMessage: `Subagent timed out after ${timeoutMs} ms.`, stderr });
@@ -514,6 +420,10 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
       }
       if (aborted || signal?.aborted) {
         finish({ exitCode: code ?? 1, stopReason: "aborted", outcome: "cancelled", errorMessage: "Subagent aborted.", stderr });
+        return;
+      }
+      if (eventError) {
+        finish({ exitCode: 1, stopReason: "error", outcome: "failed", errorMessage: `Subagent event handling failed: ${eventError}`, stderr });
         return;
       }
       const exitCode = code ?? 1;
