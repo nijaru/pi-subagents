@@ -164,6 +164,16 @@ describe("session ownership", () => {
     expect((await children.wait(run.result.id, 1)).output).toBe("answer");
     await children.close();
   });
+  test("lifecycle state never duplicates execution diagnostics", async () => {
+    const children = new SessionChildren({ async run() {
+      return { outcome: "failed", exitCode: 1, stopReason: "error", errorMessage: "diagnostic".repeat(1000), stdout: "not lifecycle state" };
+    } }, () => {});
+    const run = children.start({ prompt: "x", tools: [], cwd: process.cwd(), notify: false });
+    const result = await run.promise;
+    expect(Object.keys(result.state).sort()).toEqual(["exitCode", "finishedAt", "outcome", "status", "stopReason"]);
+    expect(result.errorMessage).toContain("diagnostic");
+    await children.close();
+  });
   test("supervisor setup failures settle rather than leaking admission", async () => {
     const children = new SessionChildren({ async run() { throw new Error("setup failed"); } }, () => {});
     for (let i = 0; i < 8; i++) {

@@ -5,6 +5,7 @@ import { ToolExecutionComponent } from "../node_modules/@earendil-works/pi-codin
 import { initTheme } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 import extension from "../extensions/pi-subagents/index.ts";
 import { renderChildCall, renderChildResult, renderChildCompletion, stripTerminalControls } from "../extensions/pi-subagents/render.ts";
+import { boundDetails } from "../extensions/pi-subagents/bounds.ts";
 import { emptyUsage, type ChildResult, type SubagentDetails } from "../extensions/pi-subagents/types.ts";
 
 const theme = { fg: (_: string, text: string) => text, bg: (_: string, text: string) => text, bold: (text: string) => text } as Theme;
@@ -87,6 +88,27 @@ describe("compact child rendering", () => {
       expect(text).toContain("Reason for stopping");
       expect(text).not.toContain(child.output!);
     }
+  });
+  test("incomplete output and diagnostic streams remain visible on expansion", () => {
+    const incomplete: ChildResult = { ...child,
+      state: { status: "terminal", outcome: "incomplete", stopReason: "length", exitCode: 0, finishedAt: 8000 },
+      errorMessage: "Model output limit reached", stdout: "diagnostic stdout", stderr: "diagnostic stderr",
+      outputTruncation: { truncated: true, originalBytes: 1000, retainedBytes: Buffer.byteLength(child.output!) },
+    };
+    const text = lines("wait", { command: "wait", id: child.id }, true, [incomplete]).join("\n");
+    for (const label of ["! incomplete", child.output!, "Model output limit reached", "Output shortened", "diagnostic stdout", "diagnostic stderr"]) expect(text).toContain(label);
+  });
+  test("detail budgets preserve truthful truncation metadata and bounded diagnostics", () => {
+    const output = "界".repeat(1000);
+    const large: ChildResult = { ...child, output, stdout: "x".repeat(10000),
+      outputTruncation: { truncated: false, originalBytes: Buffer.byteLength(output), retainedBytes: Buffer.byteLength(output) },
+    };
+    const details = boundDetails({ command: "wait", results: [large] }, 1800);
+    const bounded = details.results[0]!;
+    expect(Buffer.byteLength(JSON.stringify(details))).toBeLessThanOrEqual(1800);
+    expect(bounded.outputTruncation).toEqual({ truncated: true, originalBytes: Buffer.byteLength(output), retainedBytes: Buffer.byteLength(bounded.output ?? "") });
+    expect(large.outputTruncation?.truncated).toBe(false);
+    expect(bounded.stdout).toBeDefined();
   });
   test("narrow terminals cap visual output rows and label truncation", () => {
     const long = { ...child, output: "wide界🙂 ".repeat(1000) };

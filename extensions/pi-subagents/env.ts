@@ -4,7 +4,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { findEnvKeys } from "@earendil-works/pi-ai/compat";
 import { getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 
-import { DEPTH_ENV, PASSTHROUGH_ENV, PI_BIN_ENV, RUN_ID_ENV, SUBAGENT_BIN_ENV, TIMEOUT_ENV } from "./limits.ts";
+import { DEPTH_ENV, PASSTHROUGH_ENV, RUN_ID_ENV, TIMEOUT_ENV } from "./limits.ts";
 
 // Keep the child useful for configured providers without copying arbitrary
 // shell/session state (SSH sockets, cloud metadata, and unrelated secrets).
@@ -13,7 +13,7 @@ export const SAFE_ENV_KEYS = new Set([
   "PWD", "OLDPWD", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM",
   "NO_COLOR", "TZ", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "BUN_INSTALL",
   "PI_OFFLINE", "PI_SKIP_VERSION_CHECK", "PI_TELEMETRY", "PI_CODING_AGENT_DIR", "PI_PACKAGE_DIR",
-  TIMEOUT_ENV, PASSTHROUGH_ENV, SUBAGENT_BIN_ENV, PI_BIN_ENV,
+  TIMEOUT_ENV, PASSTHROUGH_ENV,
   "ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "OPENAI_ORG_ID", "OPENROUTER_BASE_URL",
   "AZURE_OPENAI_ENDPOINT", "GOOGLE_APPLICATION_CREDENTIALS", "AWS_PROFILE",
   "AWS_REGION", "AWS_DEFAULT_REGION",
@@ -179,7 +179,5 @@ export function childEnvironment(childRunId: string, cwd: string): NodeJS.Proces
   env[RUN_ID_ENV] = childRunId;
   if (process.env[TIMEOUT_ENV] !== undefined) env[TIMEOUT_ENV] = process.env[TIMEOUT_ENV];
   if (process.env[PASSTHROUGH_ENV] !== undefined) env[PASSTHROUGH_ENV] = process.env[PASSTHROUGH_ENV];
-  if (process.env[SUBAGENT_BIN_ENV] !== undefined) env[SUBAGENT_BIN_ENV] = process.env[SUBAGENT_BIN_ENV];
-  if (process.env[PI_BIN_ENV] !== undefined) env[PI_BIN_ENV] = process.env[PI_BIN_ENV];
   return env;
 }

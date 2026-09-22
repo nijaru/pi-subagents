@@ -24,7 +24,7 @@ The prompt must carry the relevant evidence, decisions, scope, constraints, expe
 
 ## Assign tools and write ownership
 
-Omitted `tools` selects active parent coding and known research tools. Use an explicit list to narrow access, or `tools: []` for reasoning-only work. Research extensions must be installed in child Pi too; parent runtime-only tools and providers are not copied. `model` overrides the inherited parent model; thinking effort inherits the parent session level.
+Omitted `tools` selects active parent coding and known research tools. Use an explicit list to narrow access, or `tools: []` for reasoning-only work. Research extensions must be installed in child Pi too; parent runtime-only tools and providers are not copied. `model` must be an exact `provider/model-id` and overrides the inherited parent model; thinking effort inherits the parent session level. Child startup fails if that model or any requested tool is unavailable in the child's own configuration. Do not retry the same unavailable capability unchanged.
 
 Tools must be active in the parent. `subagent` itself is forbidden: children are leaves. These are access controls, not a sandbox or a transfer of parent permission-hook state. The child loads its own Pi extensions regardless of the tool allowlist, so extension code beyond provider tools still runs in it.
 
@@ -32,8 +32,8 @@ Give concurrent writers distinct worktrees through `cwd`. Children are separate 
 
 ## Failure and recovery
 
-A failed `run` or completed `wait` is a tool error. Use `status` with its id to inspect the retained failure state. A wait-budget expiry means only that the child is still running; do not launch a duplicate replacement. Wait only when the result blocks your next step, not in a tight polling loop.
+A failed `run` or completed `wait` is a tool error. Model output limits produce `incomplete`, not success; inspect the partial report and narrow or split the task if more work is needed. Use `status` with its id to inspect the retained failure state. A wait-budget expiry means only that the child is still running; do not launch a duplicate replacement. Wait only when the result blocks your next step, not in a tight polling loop.
 
 Four children may be active. When admission is rejected, wait for or stop existing work rather than bypassing the limit. Up to 32 handles are retained; oldest completed, delivered handles are evicted. If unread results fill retention, read them with `wait` before starting more children. Quit, reload, or session replacement stops all children and discards handles. Background work needs a live parent process and does not survive restart, but a crashed or killed parent still stops its children rather than leaving them mutating the tree.
 
-Child deadlines default to 30 minutes (`PI_SUBAGENT_TIMEOUT_MS`, at most two hours). Prompts are capped at 100 KiB, responses and result details at 50 KiB each, and completion excerpts at 8 KiB; the prompt travels on the child's stdin, never in command arguments or a temporary file. A completion notice already contains the result unless it says the excerpt was truncated.
+Child deadlines default to 30 minutes (`PI_SUBAGENT_TIMEOUT_MS`, at most two hours). Prompts are capped at 100 KiB, responses and result details at 50 KiB each, and completion excerpts at 8 KiB; the prompt travels on the child's stdin, never in command arguments or a temporary file. A completion notice already contains the result unless it says the excerpt was truncated. Text beyond the report retention limit is not recoverable; `outputTruncation` describes the loss. Task text is literal, so a leading slash does not execute a Pi command. See the README migration section for SDK installation requirements and removed CLI overrides.

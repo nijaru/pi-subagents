@@ -85,7 +85,10 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
 
 export function classifyExecution(process: ProcessResult, report?: ChildReport, protocolFailure?: string): ChildExecutionOutcome {
   // External termination remains authoritative even if an earlier assistant failed.
-  if (process.outcome === "timed_out" || process.outcome === "cancelled") return process;
+  if (process.outcome === "timed_out" || process.outcome === "cancelled") return {
+    outcome: process.outcome, exitCode: process.exitCode, stopReason: process.stopReason,
+    errorMessage: boundedDiagnostic(process.errorMessage),
+  };
   if (protocolFailure || process.outcome !== "completed") return {
     outcome: "failed", exitCode: process.exitCode || 1, stopReason: "error",
     errorMessage: boundedDiagnostic(protocolFailure ?? process.errorMessage) ?? "Child failed.",

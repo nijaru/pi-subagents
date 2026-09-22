@@ -41,7 +41,20 @@ describe("compact child protocol", () => {
   });
   test("timeouts and cancellation outrank assistant and protocol errors", () => {
     for (const outcome of ["timed_out", "cancelled"] as const) {
-      expect(classifyExecution({ outcome, exitCode: 1, stderr: "" }, assistantReport({ ...assistant, stopReason: "error", errorMessage: "earlier" }), "protocol").outcome).toBe(outcome);
+      const classified = classifyExecution({ outcome, exitCode: 1, stderr: "diagnostic", stdout: "stdout diagnostic" }, assistantReport({ ...assistant, stopReason: "error", errorMessage: "earlier" }), "protocol");
+      expect(classified.outcome).toBe(outcome);
+      expect(classified).not.toHaveProperty("stderr");
+      expect(classified).not.toHaveProperty("stdout");
+    }
+  });
+  test("rejects inconsistent output truncation metadata", () => {
+    for (const outputTruncation of [
+      { truncated: false, originalBytes: 10, retainedBytes: 5 },
+      { truncated: true, originalBytes: 1, retainedBytes: 5 },
+      { truncated: true, originalBytes: -1, retainedBytes: 5 },
+    ]) {
+      const report = { ...assistantReport(assistant), outputTruncation };
+      expect(() => parseChildEvent(JSON.stringify({ version: 1, kind: "result", report, usage: emptyUsage() }))).toThrow();
     }
   });
   test("length is incomplete, not successful; completed retry has no stale error", () => {

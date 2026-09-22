@@ -49,22 +49,23 @@ function host(active = ["read", "bash", "edit", "write", "web_search", "web_fetc
   return instance;
 }
 function fakePi(body = 'final("done");'): string {
-  const file = path.join(tempDir(), "pi");
-  fs.writeFileSync(file, `#!/usr/bin/env bun
-import * as fs from "node:fs";
+  const file = path.join(tempDir(), "runner.mjs");
+  fs.writeFileSync(file, `import * as fs from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
 const args = process.argv.slice(2);
-const decoder = new TextDecoder();
-let prompt = "";
-for await (const chunk of Bun.stdin.stream()) prompt += decoder.decode(chunk, { stream: true });
-fs.writeFileSync(import.meta.filename + ".capture", JSON.stringify({ args, cwd: process.cwd(), prompt, depth: process.env.PI_SUBAGENT_DEPTH }));
-const usage = { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, totalTokens: 9, cost: { input: 0.1, output: 0.2, cacheRead: 0.3, cacheWrite: 0.4, total: 1 } };
-const message = (text, stopReason = "stop", extra = {}) => ({ role: "assistant", content: [{ type: "text", text }], model: "fake/model", usage, stopReason, timestamp: 0, ...extra });
-const emit = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
-const final = (text, stopReason = "stop", extra = {}) => emit({ type: "message_end", message: message(text, stopReason, extra) });
+let input = "";
+process.stdin.setEncoding("utf8");
+for await (const chunk of process.stdin) input += chunk;
+const request = JSON.parse(input);
+fs.writeFileSync(process.argv[1] + ".capture", JSON.stringify({ ...request, args, cwd: process.cwd(), depth: process.env.PI_SUBAGENT_DEPTH }));
+const usage = { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, totalTokens: 9, cost: { input: 0.1, output: 0.2, cacheRead: 0.3, cacheWrite: 0.4, total: 1 }, turns: 1 };
+const emit = (event) => fs.writeSync(3, JSON.stringify({ version: 1, ...event }) + "\\n");
+const report = (text, stopReason = "stop", extra = {}) => ({ output: text, stopReason, outputTruncation: { truncated: false, originalBytes: Buffer.byteLength(text), retainedBytes: Buffer.byteLength(text) }, ...extra });
+const final = (text, stopReason = "stop", extra = {}) => emit({ kind: "result", report: report(text, stopReason, extra), usage });
+emit({ kind: "ready", model: request.model, tools: request.tools });
 ${body}
 `);
-  fs.chmodSync(file, 0o755);
-  process.env.PI_SUBAGENT_BIN = file;
+  process.env.PI_SUBAGENT_RUNNER = file;
   return file;
 }
 async function captured(file: string) {
@@ -85,6 +86,9 @@ beforeEach(() => {
   delete process.env.PI_SUBAGENT_DEPTH;
   delete process.env.PI_SUBAGENT_TIMEOUT_MS;
   delete process.env.PI_SUBAGENT_FOREGROUND_MS;
+  delete process.env.PI_SUBAGENT_BIN;
+  delete process.env.PI_BIN;
+  delete process.env.PI_SUBAGENT_RUNNER;
 });
 afterEach(async () => {
   await Promise.all(hosts.splice(0).map((h) => h.shutdown()));
@@ -106,13 +110,11 @@ describe("task-first tool", () => {
     const capture = await captured(file);
     expect(capture.prompt).toBe("Read exactly these facts; no parent history.");
     expect(capture.depth).toBe("1");
-    expect(capture.args).toContain("--no-session");
-    expect(capture.args).toContain("parent/model");
-    expect(capture.args).toContain("high");
-    expect(capture.args).not.toContain("--append-system-prompt");
+    expect(capture.version).toBe(1);
+    expect(capture.model).toBe("parent/model");
+    expect(capture.thinking).toBe("high");
     expect(capture.args).not.toContain(capture.prompt);
-    expect(capture.args).toContain("read,bash,edit,write,web_search,web_fetch,web_research,query-docs");
-    expect(capture.args.some((arg: string) => arg.startsWith("@"))).toBe(false);
+    expect(capture.tools).toEqual(["read", "bash", "edit", "write", "web_search", "web_fetch", "web_research", "query-docs"]);
     expect(first(value).output).toBe("done");
     expect(first(value).usage.cost.total).toBe(1);
     expect(h.notices).toHaveLength(0);
@@ -124,8 +126,8 @@ describe("task-first tool", () => {
     fs.mkdirSync(path.join(h.cwd, "nested"));
     const value = await h.execute({ command: "run", prompt: "reason", tools: [], model: "custom/model", cwd: "nested" });
     const capture = await captured(file);
-    expect(capture.args).toContain("--no-tools");
-    expect(capture.args).toContain("custom/model");
+    expect(capture.tools).toEqual([]);
+    expect(capture.model).toBe("custom/model");
     expect(capture.cwd).toBe(fs.realpathSync(path.join(h.cwd, "nested")));
     expect(first(value).tools).toEqual([]);
   });
@@ -170,7 +172,7 @@ describe("task-first tool", () => {
 describe("background lifecycle", () => {
   test("re-arms the notice after a wait expires, then delivers once without a waiter", async () => {
     const h = host();
-    const file = fakePi('await Bun.sleep(150); final("finished later");');
+    const file = fakePi('await delay(150); final("finished later");');
     const id = await spawn(h);
     const interim = await h.execute({ command: "wait", id, timeoutMs: 1 });
     expect(first(interim).state.status).toBe("running");
@@ -192,7 +194,7 @@ describe("background lifecycle", () => {
   });
   test("a delivering wait claims the result and suppresses the notice", async () => {
     const h = host();
-    fakePi('await Bun.sleep(50); final("delivered by wait");');
+    fakePi('await delay(50); final("delivered by wait");');
     const id = await spawn(h);
     const value = await h.execute({ command: "wait", id });
     expect(first(value).output).toBe("delivered by wait");
@@ -201,7 +203,7 @@ describe("background lifecycle", () => {
   });
   test("points at the retained result only when the notice excerpt was truncated", async () => {
     const h = host();
-    fakePi('await Bun.sleep(50); final("y".repeat(20000));');
+    fakePi('await delay(50); final("y".repeat(20000));');
     await spawn(h);
     await Bun.sleep(300);
     expect(h.notices).toHaveLength(1);
@@ -211,7 +213,7 @@ describe("background lifecycle", () => {
   test("run degrades to background work when the foreground budget expires", async () => {
     const h = host();
     process.env.PI_SUBAGENT_FOREGROUND_MS = "50";
-    fakePi('await Bun.sleep(250); final("late result");');
+    fakePi('await delay(250); final("late result");');
     const value = await h.execute({ command: "run", prompt: "x" });
     expect(first(value).state.status).toBe("running");
     expect(value.content[0].text).toContain("Still running after");
@@ -223,7 +225,7 @@ describe("background lifecycle", () => {
   });
   test("cancelling wait leaves the child running; stop joins and is idempotent", async () => {
     const h = host();
-    const file = fakePi("await Bun.sleep(10000);");
+    const file = fakePi("await delay(10000);");
     const id = await spawn(h);
     await captured(file);
     const controller = new AbortController();
@@ -238,7 +240,7 @@ describe("background lifecycle", () => {
   });
   test("run propagates abort and preserves the cancelled result in status", async () => {
     const h = host();
-    const file = fakePi("await Bun.sleep(10000);");
+    const file = fakePi("await delay(10000);");
     const controller = new AbortController();
     const pending = h.execute({ command: "run", prompt: "x" }, controller.signal);
     await captured(file); controller.abort();
@@ -247,7 +249,7 @@ describe("background lifecycle", () => {
   });
   test("shutdown drains children, suppresses stale notices, and session start drops old handles", async () => {
     const h = host();
-    const file = fakePi("await Bun.sleep(10000);");
+    const file = fakePi("await delay(10000);");
     const id = await spawn(h); await captured(file);
     await h.shutdown();
     expect(activeChildren.size).toBe(0);
@@ -259,13 +261,13 @@ describe("background lifecycle", () => {
     expect(first(await h.execute({ command: "run", prompt: "new session" })).state).toMatchObject({ outcome: "completed" });
   });
   test("enforces one shared capacity limit across sibling spawn/run calls", async () => {
-    const h = host(); fakePi("await Bun.sleep(10000);");
+    const h = host(); fakePi("await delay(10000);");
     await Promise.all(Array.from({ length: 4 }, () => spawn(h)));
     await expect(h.execute({ command: "run", prompt: "fifth", tools: ["read"] })).rejects.toThrow("maximum 4");
     expect((await h.execute({ command: "status" })).details.results).toHaveLength(4);
   });
   test("admits concurrent writers in one root and one worktree", async () => {
-    const h = host(); fakePi("await Bun.sleep(10000);");
+    const h = host(); fakePi("await delay(10000);");
     fs.mkdirSync(path.join(h.cwd, ".git"));
     for (const name of ["one", "two"]) {
       fs.mkdirSync(path.join(h.cwd, name));
@@ -296,7 +298,7 @@ describe("usage delivery", () => {
   });
   test("merges background usage into the next tool result without mutating its usage", async () => {
     const h = host();
-    fakePi('await Bun.sleep(50); final("background");');
+    fakePi('await delay(50); final("background");');
     const id = await spawn(h);
     expect(h.toolResult()).toBeUndefined();
     for (let i = 0; !h.notices.length && i < 200; i++) await Bun.sleep(10);
@@ -313,7 +315,7 @@ describe("usage delivery", () => {
   });
   test("accounts paid work when a foreground child is cancelled", async () => {
     const h = host();
-    fakePi('final("working", "toolUse"); await Bun.sleep(10000);');
+    fakePi('emit({kind:"usage", usage}); emit({kind:"progress",text:"Working"}); await delay(10000);');
     const controller = new AbortController();
     await expect(h.execute({ command: "run", prompt: "x" }, controller.signal, (value) => {
       if (first(value).usage.turns) controller.abort();
@@ -333,7 +335,7 @@ describe("subprocess regressions", () => {
   test.each([
     ["empty output", "", "terminal assistant output"],
     ["tool-use only", 'final("need tool", "toolUse");', "terminal assistant output"],
-    ["protocol error", 'emit({type:"error",message:"provider failed"}); final("not success");', "provider failed"],
+    ["protocol error", 'emit({kind:"error",errorMessage:"provider failed"});', "provider failed"],
     ["assistant error", 'final("", "error", {errorMessage:"assistant failed"});', "assistant failed"],
     ["nonzero exit", 'console.error("broken child"); process.exit(2);', "broken child"],
   ])("reports %s as failure", async (_name, body, error) => {
@@ -342,27 +344,29 @@ describe("subprocess regressions", () => {
     expect(first(await h.execute({ command: "status" })).state).toMatchObject({ outcome: "failed" });
   });
   test("distinguishes deadline expiry from cancellation", async () => {
-    const h = host(); fakePi("await Bun.sleep(10000);");
+    const h = host(); fakePi("await delay(10000);");
     process.env.PI_SUBAGENT_TIMEOUT_MS = "100";
     await expect(h.execute({ command: "run", prompt: "x" })).rejects.toThrow("timed out");
     expect(first(await h.execute({ command: "status" })).state).toMatchObject({ outcome: "timed_out" });
   });
   test.each([
-    'emit({type:"tool_execution_update",partialResult:"x".repeat(2*1024*1024)});',
+    'console.log(JSON.stringify({version:1,kind:"error",errorMessage:"stdout spoof"}));',
     'process.stdout.write("ignored line\\n".repeat(300000));',
     'process.stdout.write("x".repeat(2*1024*1024)+"\\n");',
-  ])("recovers after oversized or ignored protocol traffic", async (body) => {
+  ])("diagnostic stdout cannot corrupt the private result protocol", async (body) => {
     const h = host(); fakePi(body + 'final("recovered");');
-    expect(first(await h.execute({ command: "run", prompt: "x" })).output).toBe("recovered");
+    const value = await h.execute({ command: "run", prompt: "x" });
+    expect(first(value).output).toBe("recovered");
+    expect(first(value).state).toMatchObject({ outcome: "completed" });
   });
   test("preserves UTF-8 split across chunks and a final event without newline", async () => {
     const h = host();
-    fakePi('const bytes=Buffer.from(JSON.stringify({type:"message_end",message:message("😀漢字")})); const i=bytes.indexOf(Buffer.from("😀")); process.stdout.write(bytes.subarray(0,i+1)); await Bun.sleep(10); process.stdout.write(bytes.subarray(i+1));');
+    fakePi('const bytes=Buffer.from(JSON.stringify({version:1,kind:"result",report:report("😀漢字"),usage})); const i=bytes.indexOf(Buffer.from("😀")); fs.writeSync(3,bytes.subarray(0,i+1)); await delay(10); fs.writeSync(3,bytes.subarray(i+1));');
     expect(first(await h.execute({ command: "run", prompt: "x" })).output).toBe("😀漢字");
   });
-  test("bounds model output, retained details, metadata and delta updates", async () => {
+  test("bounds returned reports and details independently of diagnostic volume", async () => {
     const h = host();
-    fakePi('for(let i=0;i<60;i++)emit({type:"message_update",assistantMessageEvent:{type:"text_delta",delta:"x".repeat(500)}}); final("x".repeat(100000), "stop", {providerMetadata:"x".repeat(20000)});');
+    fakePi('process.stdout.write("x".repeat(100000)); final("x".repeat(50*1024));');
     let updates = 0;
     const value = await h.execute({ command: "run", prompt: "x" }, undefined, () => updates++);
     expect(updates).toBeLessThan(10);
@@ -371,27 +375,21 @@ describe("subprocess regressions", () => {
     expect("messages" in first(value)).toBe(false);
     expect(first(value).output.length).toBeGreaterThan(1000);
   });
-  test("counts usage once when agent_end repeats an already-seen message", async () => {
+  test("cumulative usage frames and the final snapshot are counted once", async () => {
     const h = host();
-    fakePi('const m=message("x".repeat(1000),"stop",{providerMetadata:"x".repeat(20000)}); emit({type:"message_end",message:m}); emit({type:"agent_end",messages:[m]});');
+    fakePi('emit({kind:"usage",usage}); emit({kind:"usage",usage}); final("done");');
     const value = await h.execute({ command: "run", prompt: "x" });
     expect(first(value).usage.turns).toBe(1);
     expect(first(value).usage.totalTokens).toBe(9);
-    expect(first(value).usage.cost.total).toBe(1);
+    expect(h.toolResult().usage.cost.total).toBe(1);
   });
-  test.each(["stream", "fallback", "tool-only-stream", "assistant-only-stream"])("counts nested tool usage once with %s events", async (mode) => {
+  test("retains incomplete output while reporting the token limit as a tool error", async () => {
     const h = host();
-    fakePi(`const a = message("done");
-const t = {role:"toolResult",toolCallId:"nested",toolName:"research",content:[{type:"text",text:"answer"}],isError:false,timestamp:0,usage};
-${mode === "stream" || mode === "tool-only-stream" ? 'emit({type:"message_end",message:t});' : ""}
-${mode === "stream" || mode === "assistant-only-stream" ? 'emit({type:"message_end",message:a});' : ""}
-emit({type:"agent_end",messages:[t,a]});`);
-    const value = await h.execute({ command: "run", prompt: "x" });
-    expect(first(value).output).toBe("done");
-    expect(first(value).usage.turns).toBe(1);
-    expect(first(value).usage.totalTokens).toBe(18);
-    expect(first(value).usage.cost.total).toBe(2);
-    expect(h.toolResult().usage.totalTokens).toBe(18);
+    fakePi('final("partial findings", "length");');
+    await expect(h.execute({ command: "run", prompt: "x" })).rejects.toThrow("model output limit");
+    const value = first(await h.execute({ command: "status" }));
+    expect(value.state).toMatchObject({ outcome: "incomplete", stopReason: "length" });
+    expect(value.output).toBe("partial findings");
   });
   test("a failing update handler does not fail or terminate the child", async () => {
     const h = host(); fakePi();
@@ -403,7 +401,7 @@ emit({type:"agent_end",messages:[t,a]});`);
     expect(activeChildren.size).toBe(0);
   });
   test("emits coarse heartbeats while foreground work is running", async () => {
-    const h = host(); fakePi('await Bun.sleep(1150); final("done");');
+    const h = host(); fakePi('await delay(1150); final("done");');
     const updates: string[] = [];
     await h.execute({ command: "run", prompt: "x" }, undefined, (value) => updates.push(value.content[0].text));
     expect(updates.filter((text) => text === "Working...").length).toBeGreaterThan(1);
@@ -412,7 +410,7 @@ emit({type:"agent_end",messages:[t,a]});`);
     if (process.platform === "win32") return;
     const h = host();
     const marker = path.join(tempDir(), "swept");
-    fakePi(`const child=Bun.spawn(["sh","-c",${JSON.stringify(`trap 'printf swept > '${JSON.stringify(marker)}'; exit 0' TERM; printf ready; while :; do sleep 1; done`)}],{stdout:"pipe",stderr:"inherit"}); const reader=child.stdout.getReader(); await reader.read(); final("done"); process.exit(0);`);
+    fakePi(`const {spawn}=await import("node:child_process"); const child=spawn("sh",["-c",${JSON.stringify(`trap 'printf swept > '${JSON.stringify(marker)}'; exit 0' TERM; printf ready; while :; do sleep 1; done`)}],{stdio:["ignore","pipe","inherit"]}); await new Promise(resolve=>child.stdout.once("data",resolve)); final("done"); process.exit(0);`);
     const value = await h.execute({ command: "run", prompt: "x" });
     expect(first(value).state).toMatchObject({ outcome: "completed" });
     expect(fs.existsSync(marker)).toBe(true);
@@ -422,18 +420,15 @@ emit({type:"agent_end",messages:[t,a]});`);
     const dir = tempDir();
     const started = path.join(dir, "started");
     const marker = path.join(dir, "mutation");
-    const pi = path.join(dir, "pi");
+    const runner = path.join(dir, "runner.mjs");
     // A real child that outlives its parent long enough to mutate the tree.
-    fs.writeFileSync(pi, `#!/usr/bin/env bun
-import * as fs from "node:fs";
-const decoder = new TextDecoder();
-let prompt = "";
-for await (const chunk of Bun.stdin.stream()) prompt += decoder.decode(chunk, { stream: true });
+    fs.writeFileSync(runner, `import * as fs from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
+for await (const chunk of process.stdin) {};
 fs.writeFileSync(${JSON.stringify(started)}, "1");
-await Bun.sleep(1500);
+await delay(1500);
 fs.writeFileSync(${JSON.stringify(marker)}, "mutated");
 `);
-    fs.chmodSync(pi, 0o755);
     const parentScript = path.join(dir, "parent.ts");
     fs.writeFileSync(parentScript, `import { SubprocessChildSupervisor } from ${JSON.stringify(path.resolve(import.meta.dir, "../extensions/pi-subagents/supervisor.ts"))};
 const result: any = { id: "orphan-check", prompt: "task", cwd: process.cwd(), tools: [], state: { status: "running" }, stderr: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, turns: 0 } };
@@ -441,7 +436,7 @@ await new SubprocessChildSupervisor().run({ result, signal: new AbortController(
 `);
     const proc = Bun.spawn([process.execPath, parentScript], {
       cwd: dir,
-      env: { ...process.env, PI_SUBAGENT_BIN: pi },
+      env: { ...process.env, PI_SUBAGENT_RUNNER: runner },
       stdout: "ignore", stderr: "pipe",
     });
     try {
@@ -466,14 +461,7 @@ await new SubprocessChildSupervisor().run({ result, signal: new AbortController(
     expect(status.stderr).toContain("EARLY_DIAGNOSTIC");
     expect(status.stderr).toContain("FINAL_STACK_TRACE");
   });
-  test("still accepts a terminal assistant message delivered only by agent_end", async () => {
-    const h = host();
-    // A non-assistant message event must not suppress the fallback path.
-    fakePi('emit({type:"message_end",message:{role:"user",content:"task",timestamp:0}}); emit({type:"agent_end",messages:[message("from agent_end")]});');
-    const value = await h.execute({ command: "run", prompt: "x" });
-    expect(first(value).output).toBe("from agent_end");
-    expect(first(value).state).toMatchObject({ outcome: "completed" });
-  });
+
   test("renders current results and safely falls back for old transcripts", async () => {
     const h = host(); fakePi();
     const value = await h.execute({ command: "run", prompt: "render me" });

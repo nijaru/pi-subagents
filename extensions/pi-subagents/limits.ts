@@ -20,8 +20,6 @@ export const RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
 export const TIMEOUT_ENV = "PI_SUBAGENT_TIMEOUT_MS";
 export const FOREGROUND_ENV = "PI_SUBAGENT_FOREGROUND_MS";
 export const PASSTHROUGH_ENV = "PI_SUBAGENT_PASSTHROUGH_ENV";
-export const SUBAGENT_BIN_ENV = "PI_SUBAGENT_BIN";
-export const PI_BIN_ENV = "PI_BIN";
 
 export function processTimeoutMs(): number {
   const configured = Number(process.env[TIMEOUT_ENV]);

@@ -1,11 +1,11 @@
 import type { AgentToolResult, MessageRenderer, Theme } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme, keyText } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Markdown, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
-import { truncateOutput } from "./bounds.ts";
+import { truncateHeadTail, truncateOutput } from "./bounds.ts";
 import { MAX_OUTPUT_BYTES, MAX_RETAINED_RUNS } from "./limits.ts";
 import { failed, resultText } from "./supervisor.ts";
 import type { SubagentDetails } from "./types.ts";
-import { isFiniteNumber } from "./types.ts";
+import { isFiniteNumber, isOutputTruncation } from "./types.ts";
 import type { ChildResult, UsageSummary } from "./types.ts";
 
 interface ChildRenderContext {
@@ -30,12 +30,14 @@ export function isRenderableChildResult(value: unknown): value is ChildResult {
     && typeof result.cwd === "string"
     && Array.isArray(result.tools) && result.tools.every((tool) => typeof tool === "string")
     && (result.output === undefined || typeof result.output === "string")
+    && (result.stdout === undefined || typeof result.stdout === "string")
+    && (result.outputTruncation === undefined || isOutputTruncation(result.outputTruncation))
     && (result.errorMessage === undefined || typeof result.errorMessage === "string")
     && (result.model === undefined || typeof result.model === "string")
     && isFiniteNumber(result.startedAt ?? 0)
     && (result.state?.status === "running"
       || (result.state?.status === "terminal"
-        && (result.state.outcome === "completed" || result.state.outcome === "failed" || result.state.outcome === "cancelled" || result.state.outcome === "timed_out")
+        && (result.state.outcome === "completed" || result.state.outcome === "incomplete" || result.state.outcome === "failed" || result.state.outcome === "cancelled" || result.state.outcome === "timed_out")
         && isFiniteNumber(result.state.exitCode)
         && isFiniteNumber(result.state.finishedAt)))
     && typeof result.stderr === "string"
@@ -139,8 +141,8 @@ function childHeading(child: ChildResult, theme: Theme, options: { expanded: boo
   const active = child.state.status === "running";
   const outcome = child.state.status === "terminal" ? child.state.outcome : undefined;
   const status = active ? command === "spawn" ? "started" : "running" : outcome!.replaceAll("_", " ");
-  const color = active ? "muted" : outcome === "cancelled" ? "warning" : failed(child) ? "error" : "success";
-  const icon = active ? "○" : outcome === "cancelled" ? "−" : failed(child) ? "✗" : "✓";
+  const color = active ? "muted" : outcome === "cancelled" || outcome === "incomplete" ? "warning" : failed(child) ? "error" : "success";
+  const icon = active ? "○" : outcome === "cancelled" ? "−" : outcome === "incomplete" ? "!" : failed(child) ? "✗" : "✓";
   const id = showId ? `${theme.fg("accent", displayId(child.id, expanded))} ` : "";
   // Spawn/status/wait are snapshots, not live activity indicators.
   const duration = active && command !== "run" ? "" : runtimeLabel(child);
@@ -171,6 +173,15 @@ function renderChildren(details: unknown, expanded: boolean, theme: Theme, targe
       container.addChild(renderOutput(stripTerminalControls(output).trimEnd(), expanded, theme));
     }
     if (expanded) {
+      if (child.outputTruncation?.truncated) {
+        container.addChild(new Text(theme.fg("warning", `Output shortened: ${child.outputTruncation.retainedBytes}/${child.outputTruncation.originalBytes} UTF-8 bytes retained.`), 0, 0));
+      }
+      for (const [label, value] of [["stderr", child.stderr], ["stdout", child.stdout]] as const) {
+        if (!value || value === resultText(child) || remaining <= 0) continue;
+        const diagnostic = truncateHeadTail(value, Math.min(remaining, 2048));
+        remaining -= Buffer.byteLength(diagnostic);
+        container.addChild(new Text(theme.fg("dim", `${label}: ${stripTerminalControls(diagnostic)}`), 0, 0));
+      }
       container.addChild(new Text(theme.fg("dim", `cwd: ${clean(child.cwd, 1024)}\ntools: ${clean(child.tools.join(", "), 1024) || "none"}`), 0, 0));
       if (!active) container.addChild(new Text(theme.fg("dim", formatUsage(child.usage, child.model ? clean(child.model, 256) : undefined)), 0, 0));
     }

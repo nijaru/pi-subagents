@@ -25,8 +25,7 @@ export interface PiInvocation {
 export function executable(pathname: string): boolean {
   try {
     fs.accessSync(pathname, fs.constants.X_OK);
-    // Directories carry the execute bit but cannot be spawned; a configured
-    // PI_SUBAGENT_BIN pointing at one must fall through to the next resolver.
+    // Directories carry the execute bit but cannot be spawned as runtimes.
     return fs.statSync(pathname).isFile();
   } catch {
     return false;

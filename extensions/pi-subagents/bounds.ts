@@ -101,6 +101,14 @@ export function jsonBytes(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value), "utf8");
 }
 
+function truncationFor(result: ChildResult, output: string) {
+  return result.outputTruncation ? {
+    ...result.outputTruncation,
+    truncated: result.outputTruncation.truncated || output !== (result.output ?? ""),
+    retainedBytes: Buffer.byteLength(output),
+  } : undefined;
+}
+
 export function minimalChildResult(result: ChildResult): ChildResult {
   return {
     id: result.id,
@@ -110,7 +118,9 @@ export function minimalChildResult(result: ChildResult): ChildResult {
     startedAt: result.startedAt,
     state: { ...result.state },
     errorMessage: boundedDiagnostic(result.errorMessage, 512),
+    outputTruncation: truncationFor(result, ""),
     stderr: "",
+    stdout: result.stdout === undefined ? undefined : "",
     usage: result.usage,
     model: boundedDiagnostic(result.model, 256),
   };
@@ -121,13 +131,14 @@ export function boundChildResult(result: ChildResult, maxBytes: number): ChildRe
   if (jsonBytes(bounded) >= maxBytes) return bounded;
   const addCandidate = (key: keyof ChildResult, value: unknown): boolean => {
     const next = { ...bounded, [key]: value } as ChildResult;
+    if (key === "output") next.outputTruncation = truncationFor(result, value as string);
     if (jsonBytes(next) > maxBytes) return false;
     bounded = next;
     return true;
   };
   // Account for object overhead and JSON escaping rather than dropping a
   // successful report merely because its full text fills the output budget.
-  const addText = (key: "output" | "prompt" | "stderr", value: string | undefined, cap: number, truncate: typeof truncateOutput = truncateOutput): void => {
+  const addText = (key: "output" | "prompt" | "stderr" | "stdout", value: string | undefined, cap: number, truncate: typeof truncateOutput = truncateOutput): void => {
     if (value === undefined) return;
     let low = 0;
     let high = Math.min(cap, Buffer.byteLength(value, "utf8"));
@@ -144,6 +155,7 @@ export function boundChildResult(result: ChildResult, maxBytes: number): ChildRe
   addText("prompt", result.prompt, MAX_DIAGNOSTIC_BYTES);
   // Stderr keeps both ends: its actionable evidence is the final exception.
   addText("stderr", result.stderr, MAX_DIAGNOSTIC_BYTES, truncateHeadTail);
+  addText("stdout", result.stdout, MAX_DIAGNOSTIC_BYTES, truncateHeadTail);
   return bounded;
 }
 

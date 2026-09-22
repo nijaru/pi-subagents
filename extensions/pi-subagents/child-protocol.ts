@@ -1,7 +1,7 @@
 import type { Message, StopReason } from "@earendil-works/pi-ai";
 import { boundedDiagnostic, truncateOutput } from "./bounds.ts";
 import { MAX_OUTPUT_BYTES, MAX_PROTOCOL_LINE_BYTES } from "./limits.ts";
-import { isStopReason, isUsage, textFromMessage, type OutputTruncation, type UsageSummary } from "./types.ts";
+import { isOutputTruncation, isStopReason, isUsage, textFromMessage, type OutputTruncation, type UsageSummary } from "./types.ts";
 
 export const CHILD_PROTOCOL_VERSION = 1;
 export interface ChildBootstrap {
@@ -56,8 +56,7 @@ export function parseChildEvent(line: string): ChildEvent {
     if (typeof report?.output === "string" && Buffer.byteLength(report.output) <= MAX_OUTPUT_BYTES
       && (report.stopReason === undefined || isStopReason(report.stopReason))
       && (report.errorMessage === undefined || typeof report.errorMessage === "string")
-      && typeof truncation?.truncated === "boolean"
-      && Number.isSafeInteger(truncation.originalBytes) && truncation.originalBytes >= 0
+      && isOutputTruncation(truncation)
       && truncation.retainedBytes === Buffer.byteLength(report.output)) return event;
   }
   throw new Error("Malformed child protocol frame.");

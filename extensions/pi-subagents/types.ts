@@ -90,6 +90,16 @@ export function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
+export function isOutputTruncation(value: unknown): value is OutputTruncation {
+  if (!value || typeof value !== "object") return false;
+  const data = value as OutputTruncation;
+  return typeof data.truncated === "boolean"
+    && Number.isSafeInteger(data.originalBytes) && data.originalBytes >= 0
+    && Number.isSafeInteger(data.retainedBytes) && data.retainedBytes >= 0
+    && data.retainedBytes <= data.originalBytes
+    && (data.truncated || data.retainedBytes === data.originalBytes);
+}
+
 export function isUsage(value: unknown): value is Usage {
   if (!value || typeof value !== "object") return false;
   const usage = value as Record<string, unknown>;

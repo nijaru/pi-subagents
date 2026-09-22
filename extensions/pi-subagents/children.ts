@@ -71,7 +71,10 @@ export class SessionChildren {
         emit: options.emit ? (result, progress) => { if (!this.closed) options.emit?.(result, progress); } : undefined,
       });
       if (outcome.errorMessage) run.result.errorMessage = outcome.errorMessage;
-      run.result.state = { status: "terminal", ...outcome, finishedAt: Date.now() };
+      run.result.state = {
+        status: "terminal", outcome: outcome.outcome, exitCode: outcome.exitCode,
+        stopReason: outcome.stopReason, finishedAt: Date.now(),
+      };
     } catch (error) {
       const cancelled = run.controller.signal.aborted;
       run.result.errorMessage = truncateOutput(error instanceof Error ? error.message : String(error), MAX_DIAGNOSTIC_BYTES);
