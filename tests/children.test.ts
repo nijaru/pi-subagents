@@ -92,6 +92,39 @@ describe("session ownership", () => {
     expect(() => c.children.get(firstCompleted)).toThrow("Unknown child");
     await c.children.close();
   });
+  test("charges completed executions once, independently of joins and eviction", async () => {
+    const c = controlled();
+    const run = c.start();
+    c.requests[0]!.result.usage.input = 5;
+    expect(c.children.takePendingUsage()).toBeUndefined(); // cleanup still running
+    c.gates[0]!.resolve();
+    await run.promise;
+    await c.children.wait(run.result.id, 1);
+    await c.children.stop(run.result.id);
+    expect(c.children.takePendingUsage()?.input).toBe(5);
+    expect(c.children.takePendingUsage()).toBeUndefined();
+    for (let i = 1; i <= MAX_RETAINED_RUNS + 1; i++) {
+      const next = c.start();
+      c.requests[i]!.result.usage.input = 2;
+      c.gates[i]!.resolve();
+      await next.promise;
+    }
+    expect(() => c.children.get(run.result.id)).toThrow("Unknown child");
+    expect(c.children.takePendingUsage()?.input).toBe((MAX_RETAINED_RUNS + 1) * 2);
+    expect(c.children.takePendingUsage()).toBeUndefined();
+    await c.children.close();
+  });
+  test("shutdown discards pending usage and fences charges from stopped children", async () => {
+    const c = controlled();
+    const completed = c.start();
+    c.requests[0]!.result.usage.input = 5;
+    c.gates[0]!.resolve();
+    await completed.promise;
+    c.start();
+    c.requests[1]!.result.usage.input = 7;
+    await c.children.close();
+    expect(c.children.takePendingUsage()).toBeUndefined();
+  });
   test("session closure fences completion and rejects subsequent admission", async () => {
     const c = controlled();
     c.start();

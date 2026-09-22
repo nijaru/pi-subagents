@@ -62,7 +62,7 @@ export function emptyUsage(): UsageSummary {
   };
 }
 
-export function addUsage(target: UsageSummary, usage: Usage): void {
+export function addUsage(target: Usage, usage: Usage): void {
   target.input += usage.input || 0;
   target.output += usage.output || 0;
   target.cacheRead += usage.cacheRead || 0;
@@ -115,7 +115,8 @@ export function isMessage(value: unknown): value is Message {
     return validContent
       && typeof candidate.toolCallId === "string"
       && typeof candidate.toolName === "string"
-      && typeof candidate.isError === "boolean";
+      && typeof candidate.isError === "boolean"
+      && (candidate.usage === undefined || isUsage(candidate.usage));
   }
   const validContent = typeof candidate.content === "string"
     || (Array.isArray(candidate.content) && candidate.content.every(isContentPart));

@@ -5,10 +5,12 @@ import * as path from "node:path";
 
 // Keep the RPC parent alive after its first turn. Release the child only after
 // agent_end, proving completion starts a new parent turn without status polling.
-test("real Pi background completion wakes an idle RPC parent", async () => {
+test.each([false, true])("real Pi background completion wakes an idle parent; next-tool accounting: %s", async (followUpTool) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-children-background-"));
   const parentIdle = Promise.withResolvers<void>();
   const notified = Promise.withResolvers<any>();
+  const finished = Promise.withResolvers<void>();
+  const stats = Promise.withResolvers<any>();
   const server = Bun.serve({
     hostname: "127.0.0.1", port: 0,
     async fetch(request) {
@@ -22,7 +24,12 @@ test("real Pi background completion wakes an idle RPC parent", async () => {
         delta = { content: "BACKGROUND_RESULT" };
       } else if (notice) {
         notified.resolve(body);
-        delta = { content: "NOTICE_RECEIVED" };
+        if (followUpTool && !body.messages.some((message: any) => message.role === "tool" && message.tool_call_id === "read_call")) {
+          delta = { tool_calls: [{ index: 0, id: "read_call", type: "function", function: {
+            name: "read", arguments: JSON.stringify({ path: "fixture.txt" }),
+          } }] };
+          finish = "tool_calls";
+        } else delta = { content: "NOTICE_RECEIVED" };
       } else if (body.messages.some((message: any) => message.role === "tool")) {
         delta = { content: "PARENT_IDLE" };
       } else {
@@ -31,7 +38,9 @@ test("real Pi background completion wakes an idle RPC parent", async () => {
         } }] };
         finish = "tool_calls";
       }
-      const chunk = (value: any, finish_reason: string | null) => `data: ${JSON.stringify({ id: "completion", object: "chat.completion.chunk", created: 0, model: "model", choices: [{ index: 0, delta: value, finish_reason }] })}\n\n`;
+      const chunk = (value: any, finish_reason: string | null) => `data: ${JSON.stringify({ id: "completion", object: "chat.completion.chunk", created: 0, model: "model", choices: [{ index: 0, delta: value, finish_reason }],
+        usage: finish_reason ? { prompt_tokens: parent ? 0 : 20, completion_tokens: parent ? 0 : 3, total_tokens: parent ? 0 : 23 } : undefined,
+      })}\n\n`;
       return new Response(chunk({ role: "assistant", ...delta }, null) + chunk({}, finish) + "data: [DONE]\n\n", { headers: { "Content-Type": "text/event-stream" } });
     },
   });
@@ -40,6 +49,7 @@ test("real Pi background completion wakes an idle RPC parent", async () => {
   fs.writeFileSync(path.join(dir, "models.json"), JSON.stringify({ providers: { fixture: {
     baseUrl: `http://127.0.0.1:${server.port}/v1`, api: "openai-completions", apiKey: "test-only", models: [{ id: "model" }],
   } } }));
+  fs.writeFileSync(path.join(dir, "fixture.txt"), "A follow-up tool unrelated to subagent.");
   const proc = Bun.spawn([...invocation, "--mode", "rpc", "--no-session", "--extension", path.resolve(import.meta.dir, "../extensions/pi-subagents/index.ts"), "--tools", "read,subagent", "--model", "fixture/model"], {
     cwd: dir,
     env: { HOME: dir, PATH: process.env.PATH, PI_CODING_AGENT_DIR: dir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_SUBAGENT_TIMEOUT_MS: "15000" },
@@ -49,18 +59,37 @@ test("real Pi background completion wakes an idle RPC parent", async () => {
   let output = "";
   const reading = (async () => {
     const decoder = new TextDecoder();
+    let pending = "";
     for await (const chunk of proc.stdout) {
-      output += decoder.decode(chunk, { stream: true });
-      if (output.includes('"type":"agent_end"')) parentIdle.resolve();
+      const text = decoder.decode(chunk, { stream: true });
+      output += text;
+      pending += text;
+      let newline: number;
+      while ((newline = pending.indexOf("\n")) >= 0) {
+        const event = JSON.parse(pending.slice(0, newline));
+        pending = pending.slice(newline + 1);
+        if (event.type === "agent_end") {
+          parentIdle.resolve();
+          if (output.includes("NOTICE_RECEIVED")) finished.resolve();
+        }
+        if (event.type === "response" && event.id === "stats") stats.resolve(event.data);
+      }
     }
   })();
-  const deadline = setTimeout(() => { notified.reject(new Error(`Background notice did not reach parent. Output tail: ${output.slice(-2000)}`)); proc.kill(); }, 20000);
+  const timeout = Promise.withResolvers<never>();
+  const deadline = setTimeout(() => { timeout.reject(new Error(`Background test timed out. Output tail: ${output.slice(-2000)}`)); proc.kill(); }, 20000);
   try {
     proc.stdin.write(JSON.stringify({ type: "prompt", message: "Delegate a background task, then finish your turn without waiting." }) + "\n");
-    const body = await notified.promise;
+    const body = await Promise.race([notified.promise, timeout.promise]);
     expect(JSON.stringify(body.messages)).toContain("BACKGROUND_RESULT");
     expect(output).toContain("PARENT_IDLE");
     expect(output).toContain('"type":"agent_end"');
+    await Promise.race([finished.promise, timeout.promise]);
+    proc.stdin.write(JSON.stringify({ id: "stats", type: "get_session_stats" }) + "\n");
+    const totals = await Promise.race([stats.promise, timeout.promise]);
+    expect(totals.tokens.input).toBe(followUpTool ? 20 : 0);
+    expect(totals.tokens.output).toBe(followUpTool ? 3 : 0);
+    expect(totals.tokens.total).toBe(followUpTool ? 23 : 0);
   } finally {
     clearTimeout(deadline);
     parentIdle.resolve();

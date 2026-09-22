@@ -67,6 +67,16 @@ describe("JSON subprocess parsing", () => {
     expect(parseJsonEventLine(JSON.stringify({ type: "message_end", message: assistant }))?.kind).toBe("message");
   });
 
+  test("validates optional nested tool usage before accumulating it", () => {
+    const message = { role: "toolResult", toolCallId: "nested", toolName: "research", content: [], isError: false, timestamp: 0 };
+    const parse = (usage: unknown) => parseJsonEventLine(JSON.stringify({ type: "message_end", message: { ...message, usage } }));
+    expect(parse(assistant.usage)?.message).toMatchObject({ usage: assistant.usage });
+    expect(parse(undefined)?.kind).toBe("message");
+    for (const usage of [null, {}, { ...assistant.usage, input: "bad" }, { ...assistant.usage, cost: null }]) {
+      expect(parse(usage)).toBeUndefined();
+    }
+  });
+
   test("rejects malformed message content and usage", () => {
     expect(parseJsonEventLine(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [null] } }))).toBeUndefined();
     expect(parseJsonEventLine(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "x" }] } }))).toBeUndefined();

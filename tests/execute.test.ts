@@ -13,6 +13,7 @@ interface Host {
   notices: any[];
   renderers: Map<string, any>;
   execute(params: any, signal?: AbortSignal, update?: (value: any) => void): Promise<any>;
+  toolResult(event?: any): any;
   shutdown(): Promise<void>;
   restart(): Promise<void>;
 }
@@ -25,13 +26,13 @@ function tempDir(): string {
 }
 function host(active = ["read", "bash", "edit", "write", "web_search", "web_fetch", "web_research", "query-docs"]): Host {
   let tool: any;
-  const events = new Map<string, () => Promise<void>>();
+  const events = new Map<string, (...args: any[]) => any>();
   const notices: any[] = [];
   const renderers = new Map<string, any>();
   extension({
     registerTool(value: any) { tool = value; },
     registerMessageRenderer(name: string, renderer: any) { renderers.set(name, renderer); },
-    on(name: string, fn: () => Promise<void>) { events.set(name, fn); },
+    on(name: string, fn: (...args: any[]) => any) { events.set(name, fn); },
     getActiveTools() { return active; },
     sendMessage(message: any, options: any) { notices.push({ message, options }); },
   } as any);
@@ -40,6 +41,7 @@ function host(active = ["read", "bash", "edit", "write", "web_search", "web_fetc
   const instance = {
     tool, cwd, notices, renderers,
     execute: (params: any, signal?: AbortSignal, update?: (value: any) => void) => tool.execute("call", params, signal, update, context),
+    toolResult: (event = { toolName: "subagent" }) => events.get("tool_result")!(event),
     shutdown: () => events.get("session_shutdown")!(),
     restart: () => events.get("session_start")!(),
   };
@@ -92,8 +94,10 @@ afterEach(async () => {
 });
 
 describe("task-first tool", () => {
-  test("exposes only the lifecycle API", () => {
-    expect(Object.keys(host().tool.parameters.properties)).toEqual(["command", "prompt", "tools", "model", "cwd", "id", "timeoutMs"]);
+  test("exposes only the lifecycle API with unambiguous prompt guidelines", () => {
+    const tool = host().tool;
+    expect(Object.keys(tool.parameters.properties)).toEqual(["command", "prompt", "tools", "model", "cwd", "id", "timeoutMs"]);
+    expect(tool.promptGuidelines.every((line: string) => line.includes("subagent"))).toBe(true);
   });
   test("runs without profiles, inherits model/thinking, and delivers the prompt on stdin", async () => {
     const h = host();
@@ -275,6 +279,56 @@ describe("background lifecycle", () => {
   });
 });
 
+describe("usage delivery", () => {
+  test.each([false, true])("charges foreground usage once, including failures (%s)", async (fails) => {
+    const h = host();
+    fakePi(fails ? 'final("", "error", {errorMessage:"paid failure"});' : undefined);
+    if (fails) await expect(h.execute({ command: "run", prompt: "x" })).rejects.toThrow("paid failure");
+    else await h.execute({ command: "run", prompt: "x" });
+    expect(h.toolResult({ toolName: "subagent", isError: fails }).usage.cost.total).toBe(1);
+    const id = first(await h.execute({ command: "status" })).id;
+    expect(h.toolResult()).toBeUndefined();
+    if (fails) await expect(h.execute({ command: "wait", id })).rejects.toThrow("paid failure");
+    else await h.execute({ command: "wait", id });
+    expect(h.toolResult()).toBeUndefined();
+    await h.execute({ command: "stop", id });
+    expect(h.toolResult()).toBeUndefined();
+  });
+  test("merges background usage into the next tool result without mutating its usage", async () => {
+    const h = host();
+    fakePi('await Bun.sleep(50); final("background");');
+    const id = await spawn(h);
+    expect(h.toolResult()).toBeUndefined();
+    for (let i = 0; !h.notices.length && i < 200; i++) await Bun.sleep(10);
+    expect(h.notices).toHaveLength(1);
+    const existing = { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 3,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.5 } };
+    const patch = h.toolResult({ toolName: "web_search", usage: existing });
+    expect(patch.usage.input).toBe(3);
+    expect(patch.usage.cost.total).toBe(1.5);
+    expect(existing.cost.total).toBe(0.5);
+    expect(existing.input).toBe(1);
+    await h.execute({ command: "wait", id });
+    expect(h.toolResult()).toBeUndefined();
+  });
+  test("accounts paid work when a foreground child is cancelled", async () => {
+    const h = host();
+    fakePi('final("working", "toolUse"); await Bun.sleep(10000);');
+    const controller = new AbortController();
+    await expect(h.execute({ command: "run", prompt: "x" }, controller.signal, (value) => {
+      if (first(value).usage.turns) controller.abort();
+    })).rejects.toThrow("cancelled");
+    expect(h.toolResult({ toolName: "subagent", isError: true }).usage.cost.total).toBe(1);
+    expect(h.toolResult()).toBeUndefined();
+  });
+  test("does not carry undelivered costs into a replacement session", async () => {
+    const h = host(); fakePi();
+    await h.execute({ command: "run", prompt: "x" });
+    await h.restart();
+    expect(h.toolResult()).toBeUndefined();
+  });
+});
+
 describe("subprocess regressions", () => {
   test.each([
     ["empty output", "", "terminal assistant output"],
@@ -324,6 +378,20 @@ describe("subprocess regressions", () => {
     expect(first(value).usage.turns).toBe(1);
     expect(first(value).usage.totalTokens).toBe(9);
     expect(first(value).usage.cost.total).toBe(1);
+  });
+  test.each(["stream", "fallback", "tool-only-stream", "assistant-only-stream"])("counts nested tool usage once with %s events", async (mode) => {
+    const h = host();
+    fakePi(`const a = message("done");
+const t = {role:"toolResult",toolCallId:"nested",toolName:"research",content:[{type:"text",text:"answer"}],isError:false,timestamp:0,usage};
+${mode === "stream" || mode === "tool-only-stream" ? 'emit({type:"message_end",message:t});' : ""}
+${mode === "stream" || mode === "assistant-only-stream" ? 'emit({type:"message_end",message:a});' : ""}
+emit({type:"agent_end",messages:[t,a]});`);
+    const value = await h.execute({ command: "run", prompt: "x" });
+    expect(first(value).output).toBe("done");
+    expect(first(value).usage.turns).toBe(1);
+    expect(first(value).usage.totalTokens).toBe(18);
+    expect(first(value).usage.cost.total).toBe(2);
+    expect(h.toolResult().usage.totalTokens).toBe(18);
   });
   test("a failing update handler does not fail or terminate the child", async () => {
     const h = host(); fakePi();

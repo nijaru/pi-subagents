@@ -8,7 +8,7 @@ Delegate a self-contained task to a fresh [Pi](https://github.com/earendil-works
 pi install npm:@nijaru/pi-subagents
 ```
 
-Restart Pi or use `/reload`. The package registers one tool, `subagent`.
+Requires Pi 0.87.x and Node 22.19+. Restart Pi or use `/reload`. The package registers one tool, `subagent`.
 
 ## Usage
 
@@ -34,6 +34,12 @@ A blocking `run` or `wait` claims the result it delivers: the completion notice 
 Handles belong to the current parent session. All children stop on quit, reload, or session replacement. Background work requires a live parent process; a one-shot print invocation is not a persistent worker host.
 
 The TUI shows each prompt once, short IDs, and up to five visible output lines. Expand tool output for full IDs, working directory, tools, and usage. Short IDs are display-only; tool calls still require the full ID. Completion notices occupy one line, with results available on expansion.
+
+### Usage accounting
+
+Child usage includes assistant calls and usage reported by child tools. After cleanup finishes, each child's usage is added once to the next parent tool result, including failed results. Repeated `status`, `wait`, or `stop` calls do not charge it again. Pi includes this usage in its footer, `/session`, and RPC totals.
+
+Pi 0.87 cannot attach usage to a custom completion message. Background costs therefore enter native totals only when another parent tool finishes; until then, they remain visible in the child details. Quit, reload, or session replacement discards any unreported usage, including usage from children stopped during shutdown. No extra tool call or model turn is created just to report costs.
 
 ### Tools and context
 
@@ -105,6 +111,6 @@ bun run check
 
 Pi loads the TypeScript extension directly; there is no build step. Node 22.19+ is required. Checks use the pinned Pi 0.87.0 packages, including real CLI foreground delegation, background RPC notification, and abrupt-parent-death tests against a local fake model endpoint. No live model calls are needed. The process-tree and death-watchdog tests are POSIX-only and skip on Windows.
 
-The subprocess boundary is kept separate from session ownership so a future native Pi child API can replace it; unreleased pico designs are not a supported backend.
+The subprocess boundary is kept separate from session ownership so a future native Pi child API can replace it. Upstream's experimental Pico3/micro runtime is not a supported backend; this extension targets the normal coding-agent CLI.
 
 MIT licensed.

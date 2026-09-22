@@ -32,8 +32,9 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
   async run({ result, thinking, signal, emit }: ChildRunRequest): Promise<ChildExecutionOutcome> {
     let protocolFailure: string | undefined;
     // Usage and output are counted from authoritative message events. The
-    // agent_end snapshot is only a protocol fallback when none arrived.
-    let sawMessageEvent = false;
+    // agent_end is a fallback per usage-bearing role, never a second charge.
+    let sawAssistantEvent = false;
+    let sawToolResultEvent = false;
     let messageOutcome: AgentOutcome | undefined;
     let messageStopReason: StopReason | undefined;
     let presentationFailed = false;
@@ -72,13 +73,15 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
         signal,
         onEvent: (event) => {
           if (event.kind === "message" && event.message) {
-            // Only assistant messages are authoritative for output and usage, so
-            // only they suppress the agent_end fallback.
-            if (event.message.role === "assistant") sawMessageEvent = true;
+            if (event.message.role === "assistant") sawAssistantEvent = true;
+            if (event.message.role === "toolResult") sawToolResultEvent = true;
             note(event.message);
             report(result.output || "Child is working...");
-          } else if (event.kind === "messages" && event.messages && !sawMessageEvent) {
-            for (const message of event.messages) note(message);
+          } else if (event.kind === "messages" && event.messages) {
+            for (const message of event.messages) {
+              if (message.role === "assistant" && !sawAssistantEvent
+                || message.role === "toolResult" && !sawToolResultEvent) note(message);
+            }
             report(result.output || "Child finished...");
           } else if (event.kind === "progress") {
             report(event.text || "Child is working...");

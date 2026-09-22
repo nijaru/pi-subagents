@@ -280,9 +280,9 @@ export async function sweepRootProcessGroup(child: ChildProcess): Promise<void> 
   await waitForGroupExit(1000);
 }
 
-export function addAssistantUsage(usage: UsageSummary, message: Message): void {
-  if (message.role !== "assistant") return;
-  usage.turns++;
+export function addMessageUsage(usage: UsageSummary, message: Message): void {
+  if (message.role !== "assistant" && message.role !== "toolResult") return;
+  if (message.role === "assistant") usage.turns++;
   if (message.usage) addUsage(usage, message.usage);
 }
 
@@ -298,7 +298,7 @@ export interface MessageEffect {
  * retained, so a long transcript cannot pin message payloads in memory.
  */
 export function applyMessage(result: ChildResult, message: Message): MessageEffect {
-  addAssistantUsage(result.usage, message);
+  addMessageUsage(result.usage, message);
   if (message.role !== "assistant") return {};
   const effect: MessageEffect = {};
   const output = textFromMessage(message);

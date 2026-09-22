@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
+import type { Usage } from "@earendil-works/pi-ai";
 import type { ChildResult } from "./types.ts";
-import { emptyUsage } from "./types.ts";
+import { addUsage, emptyUsage } from "./types.ts";
 import type { ChildSupervisor } from "./supervisor.ts";
 import { copyResult } from "./supervisor.ts";
 import { MAX_CONCURRENCY, MAX_DIAGNOSTIC_BYTES, MAX_RETAINED_RUNS } from "./limits.ts";
@@ -36,6 +37,7 @@ export interface StartChild {
 export class SessionChildren {
   private readonly runs = new Map<string, ChildRun>();
   private closed = false;
+  private pendingUsage: Usage | undefined;
 
   constructor(private readonly supervisor: ChildSupervisor, private readonly completed: (result: ChildResult) => void) {}
 
@@ -80,6 +82,12 @@ export class SessionChildren {
       };
     } finally {
       run.result.prompt = truncateOutput(run.result.prompt, MAX_DIAGNOSTIC_BYTES);
+      // Account each execution once, independently of notices, repeated reads,
+      // and handle eviction. Closed sessions must never publish pending costs.
+      if (!this.closed) {
+        this.pendingUsage ??= emptyUsage();
+        addUsage(this.pendingUsage, run.result.usage);
+      }
       run.settled = true;
       for (const complete of run.waiters) complete();
       run.waiters.clear();
@@ -88,6 +96,13 @@ export class SessionChildren {
       try { this.completed(copyResult(run.result)); } catch { /* The retained result remains available through wait/status. */ }
     }
     return copyResult(run.result);
+  }
+
+  /** Pi custom completion messages cannot carry usage; the next tool result does. */
+  takePendingUsage(): Usage | undefined {
+    const usage = this.pendingUsage;
+    this.pendingUsage = undefined;
+    return usage;
   }
 
   get(id: string): ChildRun {
@@ -162,6 +177,7 @@ export class SessionChildren {
 
   async close(): Promise<void> {
     this.closed = true;
+    this.pendingUsage = undefined;
     for (const run of this.runs.values()) if (!run.settled) run.controller.abort();
     await Promise.allSettled([...this.runs.values()].map((run) => run.promise));
     this.runs.clear();

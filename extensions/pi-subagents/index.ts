@@ -5,7 +5,7 @@ import { SubprocessChildSupervisor, failed, resultText } from "./supervisor.ts";
 import { SubagentParamsSchema, resolveCwd, selectTools, validateCommand } from "./params.ts";
 import { DEFAULT_WAIT_MS, MAX_COMPLETION_BYTES, MAX_OUTPUT_BYTES, foregroundBudgetMs, isChildProcess } from "./limits.ts";
 import { boundDetails, truncateOutput } from "./bounds.ts";
-import { isRunning } from "./types.ts";
+import { addUsage, isRunning } from "./types.ts";
 import type { ChildResult, SubagentDetails } from "./types.ts";
 import { renderChildCall, renderChildResult, renderChildCompletion, runtimeLabel } from "./render.ts";
 
@@ -48,6 +48,14 @@ export default function (pi: ExtensionAPI) {
     }, { triggerTurn: true, deliverAs: "followUp" });
   });
   let children = createChildren();
+  // Use the host's usage channel, including for thrown tool errors. Charging
+  // snapshots or notices would duplicate costs on repeated wait/status calls.
+  pi.on("tool_result", (event) => {
+    const usage = children.takePendingUsage();
+    if (!usage) return;
+    if (event.usage) addUsage(usage, event.usage);
+    return { usage };
+  });
   pi.on("session_shutdown", async () => { await children.close(); });
   pi.on("session_start", async () => {
     await children.close();
@@ -62,11 +70,11 @@ export default function (pi: ExtensionAPI) {
     executionMode: "sequential",
     promptSnippet: "Use run for a fresh-context result, or spawn for independent work alongside useful local work.",
     promptGuidelines: [
-      "Give the child relevant evidence, scope, constraints, expected output and checks. Its conversation starts fresh; it does not receive parent history.",
-      "Prefer direct work for routine or tightly coupled tasks. Do not duplicate delegated work. The parent owns integration and verification.",
-      "Background children send completion notices. Wait only when their result blocks your next step. Cancelling wait does not stop the child; use stop.",
-      "run blocks only for a bounded foreground budget; if it expires the child keeps working and reports completion like spawn, so never relaunch it as a duplicate.",
-      "Use separate worktrees for concurrent writers, including parent-versus-child writers. Children are separate processes that share one working tree; the extension does not arbitrate write ownership.",
+      "Give subagent children relevant evidence, scope, constraints, expected output and checks. Their conversations start fresh without parent history.",
+      "Prefer direct work over subagent for routine or tightly coupled tasks. Do not duplicate delegated work; the parent owns integration and verification.",
+      "Background subagent children send completion notices. Use subagent wait only when the result blocks your next step. Cancelling wait does not stop the child; use subagent stop.",
+      "subagent run joins within a bounded foreground budget; if it expires the child keeps working and reports completion like spawn, so never relaunch it as a duplicate.",
+      "Give concurrent subagent writers separate worktrees, including parent-versus-child writers. Child processes share the selected working tree; subagent does not arbitrate write ownership.",
     ],
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       if (!Check(SubagentParamsSchema, params)) throw new Error("Invalid subagent parameters. Use command: run/spawn with prompt, or status/wait/stop with id. Named agents, tasks[], chain, workflow and background objects are no longer supported.");
