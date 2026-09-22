@@ -71,22 +71,26 @@ export function truncateOutput(value: string, maxBytes = MAX_OUTPUT_BYTES): stri
   const minimalMarker = "[Output truncated]";
   if (Buffer.byteLength(minimalMarker, "utf8") > maxBytes) return utf8Prefix(value, maxBytes);
 
-  let keptBytes = Math.min(totalBytes, maxBytes);
-  for (let attempt = 0; attempt < 8; attempt++) {
-    const marker = markerFor(keptBytes);
-    const budget = Math.max(0, maxBytes - Buffer.byteLength(marker, "utf8"));
-    const prefix = utf8Prefix(value, budget);
-    const nextKept = Buffer.byteLength(prefix, "utf8");
-    const finalMarker = markerFor(nextKept);
-    if (nextKept === keptBytes && Buffer.byteLength(finalMarker, "utf8") <= maxBytes) return prefix + finalMarker;
-    keptBytes = nextKept;
+  if (Buffer.byteLength(markerFor(0), "utf8") > maxBytes) return minimalMarker;
+
+  // Prefix bytes plus marker bytes are monotonic, including digit boundaries.
+  // Search for a fitting prefix rather than iterating a potentially oscillating
+  // marker reservation. Always describe the actual UTF-8 prefix we retain.
+  let low = 0;
+  let high = Math.floor(maxBytes);
+  let prefix = "";
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const candidate = utf8Prefix(value, middle);
+    const keptBytes = Buffer.byteLength(candidate, "utf8");
+    if (keptBytes + Buffer.byteLength(markerFor(keptBytes), "utf8") <= maxBytes) {
+      prefix = candidate;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
   }
-  const marker = markerFor(0);
-  if (Buffer.byteLength(marker, "utf8") <= maxBytes) {
-    return utf8Prefix(value, maxBytes - Buffer.byteLength(marker, "utf8")) + marker;
-  }
-  if (Buffer.byteLength(minimalMarker, "utf8") <= maxBytes) return minimalMarker;
-  return utf8Prefix(value, maxBytes);
+  return prefix + markerFor(Buffer.byteLength(prefix, "utf8"));
 }
 
 export function capStderr(current: string, next: string): string {
@@ -117,18 +121,19 @@ export function minimalChildResult(result: ChildResult): ChildResult {
     tools: [],
     startedAt: result.startedAt,
     state: { ...result.state },
-    errorMessage: boundedDiagnostic(result.errorMessage, 512),
     outputTruncation: truncationFor(result, ""),
     stderr: "",
     stdout: result.stdout === undefined ? undefined : "",
     usage: result.usage,
-    model: boundedDiagnostic(result.model, 256),
   };
 }
 
+/** Throw rather than silently exceed a budget too small for the required fields. */
 export function boundChildResult(result: ChildResult, maxBytes: number): ChildResult {
   let bounded = minimalChildResult(result);
-  if (jsonBytes(bounded) >= maxBytes) return bounded;
+  if (!Number.isFinite(maxBytes) || jsonBytes(bounded) > maxBytes) {
+    throw new RangeError("Child result budget cannot hold its minimal representation");
+  }
   const addCandidate = (key: keyof ChildResult, value: unknown): boolean => {
     const next = { ...bounded, [key]: value } as ChildResult;
     if (key === "output") next.outputTruncation = truncationFor(result, value as string);
@@ -138,7 +143,7 @@ export function boundChildResult(result: ChildResult, maxBytes: number): ChildRe
   };
   // Account for object overhead and JSON escaping rather than dropping a
   // successful report merely because its full text fills the output budget.
-  const addText = (key: "output" | "prompt" | "stderr" | "stdout", value: string | undefined, cap: number, truncate: typeof truncateOutput = truncateOutput): void => {
+  const addText = (key: "output" | "prompt" | "stderr" | "stdout" | "errorMessage" | "model", value: string | undefined, cap: number, truncate: typeof truncateOutput = truncateOutput): void => {
     if (value === undefined) return;
     let low = 0;
     let high = Math.min(cap, Buffer.byteLength(value, "utf8"));
@@ -149,6 +154,9 @@ export function boundChildResult(result: ChildResult, maxBytes: number): ChildRe
       else high = middle - 1;
     }
   };
+  // Optional metadata must pay for JSON escaping just like report text.
+  addText("errorMessage", result.errorMessage, 512);
+  addText("model", result.model, 256);
   addCandidate("tools", result.tools);
   addCandidate("cwd", result.cwd);
   addText("output", result.output, MAX_OUTPUT_BYTES);
@@ -163,8 +171,12 @@ export function boundDetails(details: SubagentDetails, maxBytes = MAX_OUTPUT_BYT
   const minimalResults = details.results.map(minimalChildResult);
   const bounded: SubagentDetails = { ...details, results: minimalResults };
   const baseBytes = jsonBytes(bounded);
-  if (baseBytes >= maxBytes || minimalResults.length === 0) return bounded;
-  const perResult = Math.max(1, Math.floor((maxBytes - baseBytes) / minimalResults.length));
+  // Never drop identities to satisfy an impossible caller-supplied budget.
+  if (!Number.isFinite(maxBytes) || baseBytes > maxBytes) {
+    throw new RangeError("Details budget cannot hold all minimal child representations");
+  }
+  if (baseBytes === maxBytes || minimalResults.length === 0) return bounded;
+  const perResult = Math.floor((maxBytes - baseBytes) / minimalResults.length);
   bounded.results = details.results.map((result) => boundChildResult(result, jsonBytes(minimalChildResult(result)) + perResult));
   // The allocation above is deterministic. A final minimal fallback keeps
   // the aggregate bounded even if JSON overhead differs across runtimes.
