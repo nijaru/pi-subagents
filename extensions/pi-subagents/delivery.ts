@@ -6,9 +6,10 @@ import { runtimeLabel } from "./render.ts";
 import { resultText } from "./supervisor.ts";
 import type { ChildResult, SubagentDetails } from "./types.ts";
 
-export function childSummary(result: ChildResult): string {
+export function childSummary(result: ChildResult, includePrompt = true): string {
   const status = result.state.status === "running" ? "running" : result.state.outcome;
-  return `${result.id} [${status}]${runtimeLabel(result) ? ` · ${runtimeLabel(result)}` : ""}\n${truncateOutput(result.prompt, 256)}`;
+  const head = `${result.id} [${status}]${runtimeLabel(result) ? ` · ${runtimeLabel(result)}` : ""}`;
+  return includePrompt ? `${head}\n${truncateOutput(result.prompt, 256)}` : head;
 }
 
 function completionMessage(results: ChildResult[]) {

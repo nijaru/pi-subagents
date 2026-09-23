@@ -97,6 +97,17 @@ function clean(value: string, bytes = MAX_OUTPUT_BYTES): string {
   return stripTerminalControls(truncateOutput(value, bytes));
 }
 
+function oneLine(text: string): string {
+  return stripTerminalControls(text).replace(/\s+/g, " ").trim();
+}
+
+/** Collapsed rows show one preview: the task label for status lists, the result text otherwise. */
+function collapsedPreview(child: ChildResult, command: SubagentDetails["command"] | undefined, notification: boolean): string {
+  const statusList = !notification && command === "status";
+  if (child.state.status === "running" && !statusList) return "";
+  return oneLine(statusList ? child.prompt : resultText(child));
+}
+
 /** IDs are abbreviated only for display; tool arguments and retained data stay exact. */
 function displayId(id: string, expanded = false): string {
   const text = clean(id, 256).replace(/\s+/g, " ");
@@ -158,21 +169,26 @@ function renderChildren(details: unknown, expanded: boolean, theme: Theme, targe
   for (const child of results) {
     const active = child.state.status === "running";
     const heading = childHeading(child, theme, { expanded, showId: notification || child.id !== targetId, notification, command: data?.command });
-    container.addChild(notification && !expanded ? singleLine(heading) : new Text(heading, 0, 0));
-    // Status lists need task labels; run/spawn already show the prompt in their call header.
-    if (data?.command !== "run" && data?.command !== "spawn" && (expanded || (!notification && data?.command === "status"))) {
-      const prompt = clean(child.prompt, expanded ? 8192 : 1024);
-      container.addChild(expanded ? new Text(theme.fg("dim", prompt), 0, 0) : singleLine(theme.fg("dim", prompt.replace(/\s+/g, " "))));
+    if (expanded) {
+      container.addChild(new Text(heading, 0, 0));
+    } else {
+      // One status line per child: outcome, duration, and a single-line preview.
+      const preview = collapsedPreview(child, data?.command, notification);
+      container.addChild(singleLine(preview ? `${heading} · ${theme.fg("dim", preview)}` : heading));
     }
     if (active && data?.command === "wait") {
       container.addChild(new Text(theme.fg("dim", "Wait expired; child continues."), 0, 0));
     }
-    if (!active && (expanded || (!notification && data?.command !== "status"))) {
-      const output = truncateOutput(resultText(child), remaining);
-      remaining = Math.max(0, remaining - Buffer.byteLength(output, "utf8"));
-      container.addChild(renderOutput(stripTerminalControls(output).trimEnd(), expanded, theme));
-    }
     if (expanded) {
+      // Status/wait/stop rows need task labels; run/spawn show the prompt in their call header.
+      if (data?.command !== "run" && data?.command !== "spawn") {
+        container.addChild(new Text(theme.fg("dim", clean(child.prompt, 8192)), 0, 0));
+      }
+      if (!active) {
+        const output = truncateOutput(resultText(child), remaining);
+        remaining = Math.max(0, remaining - Buffer.byteLength(output, "utf8"));
+        container.addChild(renderOutput(stripTerminalControls(output).trimEnd(), true, theme));
+      }
       if (child.outputTruncation?.truncated) {
         container.addChild(new Text(theme.fg("warning", `Output shortened: ${child.outputTruncation.retainedBytes}/${child.outputTruncation.originalBytes} UTF-8 bytes retained.`), 0, 0));
       }

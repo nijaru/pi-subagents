@@ -201,7 +201,7 @@ describe("background lifecycle", () => {
     const notice = h.renderers.get("subagent-complete")(h.notices[0].message, { expanded: false, outputPad: 1 }, theme).render(100);
     expect(notice).toHaveLength(1);
     expect(notice[0]).toContain(`subagent ${id.slice(0, 8)} completed`);
-    expect(notice[0]).not.toContain("finished later");
+    expect(notice[0]).toContain("finished later"); // one-line result preview
     expect(first(await h.execute({ command: "wait", id })).output).toBe("finished later");
     expect(h.notices).toHaveLength(1);
   });
@@ -358,6 +358,23 @@ describe("subprocess regressions", () => {
     const h = host(); fakePi(body);
     await expect(h.execute({ command: "run", prompt: "x" })).rejects.toThrow(error);
     expect(first(await h.execute({ command: "status" })).state).toMatchObject({ outcome: "failed" });
+  });
+  test("thrown tool errors reattach renderer details without duplicate prompts", async () => {
+    const theme = { fg: (_: string, text: string) => text, bg: (_: string, text: string) => text };
+    const h = host();
+    fakePi('final("", "error", {errorMessage:"assistant failed"});');
+    const error: Error = await h.execute({ command: "run", prompt: "unique task prompt", tools: ["read"] }).then(
+      () => { throw new Error("expected failure"); }, (cause: Error) => cause);
+    expect(error.message).toContain("assistant failed");
+    expect(error.message).not.toContain("unique task prompt");
+    const patch = h.toolResult({ toolName: "subagent", toolCallId: "call", isError: true });
+    expect(patch.details).toMatchObject({ command: "run", results: [{ errorMessage: "assistant failed" }] });
+    const rendered = h.tool.renderResult({ content: [{ type: "text", text: error.message }], details: patch.details }, { expanded: false }, theme).render(80).join("\n");
+    expect(rendered).toContain("failed");
+    expect(rendered).toContain("assistant failed");
+    expect(rendered).not.toContain("unique task prompt");
+    // Consumed exactly once: nothing left to patch, and no duplicate usage.
+    expect(h.toolResult({ toolName: "subagent", toolCallId: "call", isError: true })).toBeUndefined();
   });
   test("distinguishes deadline expiry from cancellation", async () => {
     const h = host(); fakePi("await delay(10000);");
