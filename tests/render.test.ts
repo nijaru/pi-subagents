@@ -31,7 +31,7 @@ describe("compact child rendering", () => {
     const row = new ToolExecutionComponent("subagent", "test-call", { command: "wait", id: child.id }, {}, tool, { requestRender() {} } as TUI, "/project");
     row.updateResult({ ...result("wait"), isError: false });
     const compact = row.render(80).map((line) => stripTerminalControls(line).trim()).filter(Boolean);
-    expect(compact).toEqual(["subagent wait 900c096e", "✓ completed · 8s · pi-subagents 0.1.0"]);
+    expect(compact).toEqual(["subagent wait 900c096e", "✓ completed · 8s"]);
     row.setExpanded(true);
     const full = stripTerminalControls(row.render(80).join("\n"));
     expect(full.match(new RegExp(child.id, "g"))).toHaveLength(1);
@@ -39,9 +39,9 @@ describe("compact child rendering", () => {
     row.setExpanded(false);
     expect(row.render(40).map((line) => stripTerminalControls(line).trim()).filter(Boolean)).toEqual(compact);
   });
-  test("foreground runs hide the delegated prompt and preview the result", () => {
+  test("foreground runs show status only; reports stay behind expansion", () => {
     expect(lines("run", { command: "run", prompt: child.prompt })).toEqual([
-      "subagent run", "✓ 900c096e completed · 8s · pi-subagents 0.1.0",
+      "subagent run", "✓ 900c096e completed · 8s",
     ]);
   });
   test("targeted status and wait show the ID only in the call header", () => {
@@ -49,7 +49,7 @@ describe("compact child rendering", () => {
       "subagent status 900c096e", "✓ completed · 8s · Read the package version.",
     ]);
     expect(lines("wait", { command: "wait", id: child.id })).toEqual([
-      "subagent wait 900c096e", "✓ completed · 8s · pi-subagents 0.1.0",
+      "subagent wait 900c096e", "✓ completed · 8s",
     ]);
   });
   test("status lists identify every child and task on one line each", () => {
@@ -131,7 +131,7 @@ describe("compact child rendering", () => {
     const message = { role: "custom" as const, customType: "subagent-complete", content: "Full model-facing message", display: true, timestamp: 0, details: result("wait").details };
     const before = JSON.stringify(message);
     const compact = renderChildCompletion(message, { expanded: false, outputPad: 1 }, theme)!;
-    expect(compact.render(80).map((line) => line.trim())).toEqual(["✓ subagent 900c096e completed · 8s · pi-subagents 0.1.0"]);
+    expect(compact.render(80).map((line) => line.trim())).toEqual(["✓ subagent 900c096e completed · 8s"]);
     expect(compact.render(20)).toHaveLength(1);
     const full = renderChildCompletion(message, { expanded: true, outputPad: 1 }, theme)!.render(80).join("\n");
     expect(full).toContain(child.id);

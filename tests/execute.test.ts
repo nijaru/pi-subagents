@@ -201,7 +201,7 @@ describe("background lifecycle", () => {
     const notice = h.renderers.get("subagent-complete")(h.notices[0].message, { expanded: false, outputPad: 1 }, theme).render(100);
     expect(notice).toHaveLength(1);
     expect(notice[0]).toContain(`subagent ${id.slice(0, 8)} completed`);
-    expect(notice[0]).toContain("finished later"); // one-line result preview
+    expect(notice[0]).not.toContain("finished later"); // status-only notice; report on expansion
     expect(first(await h.execute({ command: "wait", id })).output).toBe("finished later");
     expect(h.notices).toHaveLength(1);
   });
@@ -499,8 +499,11 @@ await new SubprocessChildSupervisor().run({ result, signal: new AbortController(
     const h = host(); fakePi();
     const value = await h.execute({ command: "run", prompt: "render me" });
     const theme = { fg: (_: string, text: string) => text, bold: (text: string) => text };
+    const collapsed = h.tool.renderResult(value, { expanded: false }, theme).render(120).join("\n");
+    expect(collapsed).toContain("completed");
+    expect(collapsed).not.toContain("done"); // agent-facing report stays behind expansion
     for (const expanded of [false, true]) {
-      expect(h.tool.renderResult(value, { expanded }, theme).render(120).join("\n")).toContain("done");
+      expect(h.tool.renderResult(value, { expanded }, theme).render(120).join("\n")).toContain(expanded ? "done" : "completed");
       expect(h.tool.renderResult({ content: [{ type: "text", text: "old output" }], details: { results: [{ agent: "worker" }] } }, { expanded }, theme).render(120).join("\n")).toContain("old output");
     }
     const malformed = { ...value, details: { ...value.details, results: [{ ...first(value), model: {} }] } };

@@ -101,11 +101,16 @@ function oneLine(text: string): string {
   return stripTerminalControls(text).replace(/\s+/g, " ").trim();
 }
 
-/** Collapsed rows show one preview: the task while it identifies live work or a listing, the result text once terminal. */
+/**
+ * Collapsed rows are human-facing: a task label while it identifies live work
+ * or a status listing, otherwise only a failure diagnostic. Successful reports
+ * are agent-facing content and stay behind expansion.
+ */
 function collapsedPreview(child: ChildResult, command: SubagentDetails["command"] | undefined, notification: boolean): string {
   const statusList = !notification && command === "status";
   if (child.state.status === "running" || statusList) return oneLine(child.prompt);
-  return oneLine(resultText(child));
+  if (child.state.outcome === "completed") return "";
+  return oneLine(clean(child.errorMessage || child.stderr || "", 1024));
 }
 
 /** IDs are abbreviated only for display; tool arguments and retained data stay exact. */

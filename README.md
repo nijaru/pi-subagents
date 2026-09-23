@@ -35,7 +35,7 @@ Use `wait` before finishing a task that depends on a child's result. It returns 
 
 Handles belong to the current parent session. All children stop on quit, reload, or session replacement. Background work requires a live parent process; a one-shot print invocation is not a persistent worker host.
 
-The TUI hides delegated prompt text behind expansion and reduces every child to one status line with a one-line preview: the task while it identifies live work or a status listing, the result once terminal. Expand tool output for the full prompt and report, full IDs, diagnostics, working directory, tools, and usage. Short IDs are display-only; tool calls still require the full ID. Completion notices occupy one line, with results available on expansion.
+The TUI hides agent-facing text — delegated prompts and child reports — behind expansion. Each child is one status line: live work and status listings carry a one-line task label, finished children show only outcome and duration, with the error message added for failures. Expand for the full prompt and report, full IDs, diagnostics, working directory, tools, and usage. Short IDs are display-only; tool calls still require the full ID. Completion notices occupy one line, with results available on expansion.
 
 ### Usage accounting
 
