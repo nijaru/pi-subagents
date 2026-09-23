@@ -101,11 +101,11 @@ function oneLine(text: string): string {
   return stripTerminalControls(text).replace(/\s+/g, " ").trim();
 }
 
-/** Collapsed rows show one preview: the task label for status lists, the result text otherwise. */
+/** Collapsed rows show one preview: the task while it identifies live work or a listing, the result text once terminal. */
 function collapsedPreview(child: ChildResult, command: SubagentDetails["command"] | undefined, notification: boolean): string {
   const statusList = !notification && command === "status";
-  if (child.state.status === "running" && !statusList) return "";
-  return oneLine(statusList ? child.prompt : resultText(child));
+  if (child.state.status === "running" || statusList) return oneLine(child.prompt);
+  return oneLine(resultText(child));
 }
 
 /** IDs are abbreviated only for display; tool arguments and retained data stay exact. */
@@ -124,11 +124,10 @@ export function renderChildCall(args: Record<string, unknown>, theme: Theme, con
   const id = typeof args.id === "string" ? ` ${displayId(args.id, expanded)}` : "";
   const container = new Container();
   container.addChild(new Text(theme.fg("toolTitle", theme.bold(`subagent ${command}${id}`)), 0, 0));
-  if (typeof args.prompt === "string" && args.prompt) {
-    const prompt = clean(args.prompt, expanded ? 8192 : 1024);
-    container.addChild(expanded
-      ? new Text(theme.fg("dim", prompt), 0, 0)
-      : singleLine(theme.fg("dim", prompt.replace(/\s+/g, " "))));
+  // The prompt is agent-facing instruction text; humans see it only on expansion.
+  // Running rows preview it as task identity until the result replaces it.
+  if (expanded && typeof args.prompt === "string" && args.prompt) {
+    container.addChild(new Text(theme.fg("dim", clean(args.prompt, 8192)), 0, 0));
   }
   return container;
 }

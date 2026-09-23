@@ -507,6 +507,7 @@ await new SubprocessChildSupervisor().run({ result, signal: new AbortController(
     expect(h.tool.renderResult(malformed, { expanded: true }, theme).render(120).join("\n")).toContain("done");
     const oversized = { ...value, details: { ...value.details, results: [{ ...first(value), output: "x".repeat(200000) }] } };
     expect(h.tool.renderResult(oversized, { expanded: true }, theme).render(120).join("\n").length).toBeLessThan(70000);
-    expect(h.tool.renderCall({ command: "run", prompt: "hello\x1b[31m" }, theme).render(120).join("\n")).toContain("hello");
+    expect(h.tool.renderCall({ command: "run", prompt: "hello\x1b[31m" }, theme).render(120).join("\n")).not.toContain("hello");
+    expect(h.tool.renderCall({ command: "run", prompt: "hello\x1b[31m" }, theme, { args: {}, expanded: true } as any).render(120).join("\n")).toContain("hello");
   });
 });

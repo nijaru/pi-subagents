@@ -39,9 +39,9 @@ describe("compact child rendering", () => {
     row.setExpanded(false);
     expect(row.render(40).map((line) => stripTerminalControls(line).trim()).filter(Boolean)).toEqual(compact);
   });
-  test("foreground prompt appears once, with a one-line result preview", () => {
+  test("foreground runs hide the delegated prompt and preview the result", () => {
     expect(lines("run", { command: "run", prompt: child.prompt })).toEqual([
-      "subagent run", child.prompt, "✓ 900c096e completed · 8s · pi-subagents 0.1.0",
+      "subagent run", "✓ 900c096e completed · 8s · pi-subagents 0.1.0",
     ]);
   });
   test("targeted status and wait show the ID only in the call header", () => {
@@ -63,13 +63,13 @@ describe("compact child rendering", () => {
     expect(text.match(new RegExp(child.id, "g"))).toHaveLength(1);
     for (const value of [child.prompt, child.output!, "cwd: /project", "tools: read", "2 turns", "test/model"]) expect(text).toContain(value);
   });
-  test("spawn omits duplicate prompt and wait expiry stays explicit", () => {
+  test("running rows carry the task label and wait expiry stays explicit", () => {
     const active = { ...child, state: { status: "running" } as const, startedAt: undefined };
     expect(lines("spawn", { command: "spawn", prompt: child.prompt }, false, [active])).toEqual([
-      "subagent spawn", child.prompt, "○ 900c096e started",
+      "subagent spawn", "○ 900c096e started · Read the package version.",
     ]);
     expect(lines("wait", { command: "wait", id: child.id }, false, [active])).toEqual([
-      "subagent wait 900c096e", "○ running", "Wait expired; child continues.",
+      "subagent wait 900c096e", "○ running · Read the package version.", "Wait expired; child continues.",
     ]);
   });
   test("old spawn and status snapshots do not acquire a live elapsed timer", () => {
@@ -118,12 +118,13 @@ describe("compact child rendering", () => {
       for (const row of rows) expect(visibleWidth(row)).toBeLessThanOrEqual(width);
     }
   });
-  test("multiline prompts occupy one preview row and controls are stripped", () => {
-    const rows = renderChildCall({ command: "run", prompt: "hello\n\tworld\x1b[31m " + "x".repeat(500) }, theme).render(40);
-    expect(rows).toHaveLength(2);
-    expect(rows[1]).toContain("hello world");
+  test("prompts are hidden until expansion, then shown without terminal controls", () => {
+    const args = { command: "run", prompt: "hello\n\tworld\x1b[31m " + "x".repeat(500) };
+    expect(renderChildCall(args, theme).render(40).map((line) => stripTerminalControls(line).trim())).toEqual(["subagent run"]);
+    const rows = renderChildCall(args, theme, context(args, true)).render(40);
+    expect(rows.length).toBeGreaterThan(2);
+    expect(rows.join(" ")).toContain("hello");
     expect(rows.join("")).not.toContain("\x1b[31m");
-    expect(visibleWidth(rows[1]!)).toBeLessThanOrEqual(40);
     expect(() => renderChildCall({ command: {}, prompt: 123, id: [] }, theme).render(40)).not.toThrow();
   });
   test("completion is a one-line notice with details available on expansion", () => {
