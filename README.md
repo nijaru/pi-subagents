@@ -122,7 +122,7 @@ bun install --frozen-lockfile
 bun run check
 ```
 
-Pi loads the TypeScript extension directly; there is no build step. The child bootstrap uses the same installation's SDK and TypeScript loader. Checks use pinned Pi 0.87.0 packages and exercise real CLI/RPC parents, SDK children, packed artifacts, project trust, cancellation, and abrupt parent death with local mock providers. No live model calls are needed. The process-tree and death-watchdog tests are POSIX-only and skip on Windows.
+Pi loads the TypeScript extension directly; there is no build step. The child bootstrap uses the same installation's SDK and TypeScript loader. Checks use pinned Pi 0.87.1 packages and exercise real CLI/RPC parents, SDK children, packed artifacts, project trust, cancellation, and abrupt parent death with local mock providers. No live model calls are needed. The process-tree and death-watchdog tests are POSIX-only and skip on Windows.
 
 Pi 0.87 does not publicly export its project-trust resolver. The bootstrap reuses that installation's internal resolver rather than duplicating policy or accepting the SDK's trusted-by-default setting. The pinned version and packed-artifact tests are the compatibility gate for this dependency.
 
