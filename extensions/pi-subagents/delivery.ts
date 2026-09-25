@@ -1,29 +1,14 @@
 import type { AgentBeforeSettleEvent, AgentEndEvent, BoundaryResult, ExtensionContext, TurnEndEvent } from "@earendil-works/pi-coding-agent";
-import { boundDetails, truncateOutput } from "./bounds.ts";
+import { boundDetails } from "./bounds.ts";
 import { SessionChildren } from "./children.ts";
-import { MAX_COMPLETION_BYTES, MAX_OUTPUT_BYTES } from "./limits.ts";
-import { runtimeLabel } from "./render.ts";
-import { resultText } from "./supervisor.ts";
+import { MAX_COMPLETION_BYTES } from "./limits.ts";
+import { childReports } from "./reports.ts";
 import type { ChildResult, SubagentDetails } from "./types.ts";
 
-export function childSummary(result: ChildResult, includePrompt = true): string {
-  const status = result.state.status === "running" ? "running" : result.state.outcome;
-  const head = `${result.id} [${status}]${runtimeLabel(result) ? ` · ${runtimeLabel(result)}` : ""}`;
-  return includePrompt ? `${head}\n${truncateOutput(result.prompt, 256)}` : head;
-}
-
 function completionMessage(results: ChildResult[]) {
-  // Keep every child represented within one aggregate model-context budget.
-  const perResult = Math.min(MAX_COMPLETION_BYTES, Math.floor(MAX_OUTPUT_BYTES / results.length) - 1024);
-  const reports = results.map((result) => {
-    const output = resultText(result);
-    const excerpt = truncateOutput(output, perResult);
-    const guidance = excerpt === output ? "" : "\n\nExcerpt truncated; use subagent wait with this id for the full retained result.";
-    return `${childSummary(result)}\n\n${excerpt}${guidance}`;
-  });
   return {
     customType: "subagent-complete",
-    content: `${results.length === 1 ? "Background child finished." : "Background children finished."}\n${reports.join("\n\n---\n\n")}`,
+    content: `${results.length === 1 ? "Background child finished." : "Background children finished."}\n${childReports(results, { maxReportBytes: MAX_COMPLETION_BYTES })}`,
     display: true,
     details: boundDetails({ command: "wait", results }),
   };

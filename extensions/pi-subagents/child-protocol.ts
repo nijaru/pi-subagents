@@ -1,15 +1,17 @@
-import type { Message, StopReason } from "@earendil-works/pi-ai";
+import type { Message, ModelThinkingLevel, StopReason } from "@earendil-works/pi-ai";
 import { boundedDiagnostic, truncateOutput } from "./bounds.ts";
 import { MAX_OUTPUT_BYTES, MAX_PROTOCOL_LINE_BYTES } from "./limits.ts";
-import { isOutputTruncation, isStopReason, isUsage, textFromMessage, type OutputTruncation, type UsageSummary } from "./types.ts";
+import { isOutputTruncation, isStopReason, isThinkingLevel, isUsage, textFromMessage, type OutputTruncation, type UsageSummary } from "./types.ts";
 
-export const CHILD_PROTOCOL_VERSION = 1;
+export const CHILD_PROTOCOL_VERSION = 2;
 export interface ChildBootstrap {
-  version: 1;
+  version: typeof CHILD_PROTOCOL_VERSION;
   prompt: string;
   tools: string[];
   model?: string;
-  thinking?: string;
+  thinking?: ModelThinkingLevel;
+  /** Explicit effort must be supported exactly; inherited effort may be clamped by Pi. */
+  strictThinking?: boolean;
 }
 export interface ChildReport {
   output: string;
@@ -18,11 +20,11 @@ export interface ChildReport {
   errorMessage?: string;
 }
 export type ChildEvent =
-  | { version: 1; kind: "ready"; model: string; tools: string[] }
-  | { version: 1; kind: "usage"; usage: UsageSummary }
-  | { version: 1; kind: "progress"; text: string }
-  | { version: 1; kind: "result"; report: ChildReport; usage: UsageSummary }
-  | { version: 1; kind: "error"; errorMessage: string };
+  | { version: typeof CHILD_PROTOCOL_VERSION; kind: "ready"; model: string; thinking: ModelThinkingLevel; tools: string[] }
+  | { version: typeof CHILD_PROTOCOL_VERSION; kind: "usage"; usage: UsageSummary }
+  | { version: typeof CHILD_PROTOCOL_VERSION; kind: "progress"; text: string }
+  | { version: typeof CHILD_PROTOCOL_VERSION; kind: "result"; report: ChildReport; usage: UsageSummary }
+  | { version: typeof CHILD_PROTOCOL_VERSION; kind: "error"; errorMessage: string };
 
 /** Strip thinking, signatures, tool arguments and provider metadata before serialization. */
 export function assistantReport(message: Message): ChildReport {
@@ -45,7 +47,7 @@ export function parseChildEvent(line: string): ChildEvent {
   const usageValid = (usage: unknown): usage is UsageSummary => isUsage(usage)
     && Number.isSafeInteger((usage as UsageSummary).turns) && (usage as UsageSummary).turns >= 0;
   if (event.kind === "ready" && typeof event.model === "string" && event.model.length <= 1024
-    && Array.isArray(event.tools) && event.tools.length <= 256
+    && isThinkingLevel(event.thinking) && Array.isArray(event.tools) && event.tools.length <= 256
     && event.tools.every((t: unknown) => typeof t === "string" && t.length <= 256)) return event;
   if (event.kind === "progress" && typeof event.text === "string") return event;
   if (event.kind === "error" && typeof event.errorMessage === "string") return event;

@@ -22,12 +22,12 @@ describe("compact child protocol", () => {
       { type: "thinking", thinking: "x".repeat(2_000_000), thinkingSignature: "y".repeat(2_000_000) },
       { type: "text", text: "hello" },
     ] });
-    const frame = JSON.stringify({ version: 1, kind: "result", report, usage: emptyUsage() });
+    const frame = JSON.stringify({ version: 2, kind: "result", report, usage: emptyUsage() });
     expect(frame.length).toBeLessThan(1000);
     expect(parseChildEvent(frame)).toMatchObject({ report: { output: "hello", outputTruncation: { truncated: false } } });
   });
   test("rejects legacy, malformed, wrong-version and oversized frames", () => {
-    for (const line of ["warning", "{}", '{"version":2}', '{"version":1,"kind":"result"}', "x".repeat(2_000_000)]) {
+    for (const line of ["warning", "{}", '{"version":1}', '{"version":2,"kind":"result"}', '{"version":2,"kind":"ready","model":"a/b","tools":[]}', "x".repeat(2_000_000)]) {
       expect(() => parseChildEvent(line)).toThrow();
     }
   });
@@ -54,7 +54,7 @@ describe("compact child protocol", () => {
       { truncated: true, originalBytes: -1, retainedBytes: 5 },
     ]) {
       const report = { ...assistantReport(assistant), outputTruncation };
-      expect(() => parseChildEvent(JSON.stringify({ version: 1, kind: "result", report, usage: emptyUsage() }))).toThrow();
+      expect(() => parseChildEvent(JSON.stringify({ version: 2, kind: "result", report, usage: emptyUsage() }))).toThrow();
     }
   });
   test("length is incomplete, not successful; completed retry has no stale error", () => {

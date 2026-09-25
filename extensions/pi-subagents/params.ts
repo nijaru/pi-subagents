@@ -2,20 +2,28 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
-import { MAX_TASK_BYTES, MAX_WAIT_MS } from "./limits.ts";
+import { MAX_RETAINED_RUNS, MAX_TASK_BYTES, MAX_WAIT_MS } from "./limits.ts";
+import { THINKING_LEVELS } from "./types.ts";
 
 export const SubagentParamsSchema = Type.Object({
   command: StringEnum(["run", "spawn", "status", "wait", "stop"] as const, {
-    description: "run waits for one fresh child; spawn returns its id; status inspects; wait joins without cancelling the child; stop cancels and joins",
+    description: "run/spawn require prompt: run joins for up to 60s then continues in background; spawn returns immediately. wait requires ids and returns when any finishes. status optionally takes id; stop requires id and cancels/joins cleanup.",
   }),
   prompt: Type.Optional(Type.String({ description: "Self-contained task: scope, relevant evidence, constraints, expected output and checks", minLength: 1, maxLength: MAX_TASK_BYTES })),
   tools: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 256, pattern: "^[A-Za-z][A-Za-z0-9_.:-]*$" }), {
     description: "Tool allowlist, restricted to the parent's active tools. Defaults to available coding and known research tools; [] means reasoning only. No nested subagent tool.", maxItems: 64, uniqueItems: true,
   })),
-  model: Type.Optional(Type.String({ description: "Optional provider/model-id; otherwise inherits the parent model", minLength: 1, maxLength: 512 })),
+  model: Type.Optional(Type.String({ description: "run/spawn only: exact provider/model-id; omitted inherits the parent model", minLength: 1, maxLength: 512 })),
+  thinking: Type.Optional(StringEnum(THINKING_LEVELS, {
+    description: "run/spawn only: reasoning effort supported by the selected model. Omitted inherits parent effort for the same model; a different model uses its Pi defaults. Unsupported explicit levels fail before prompting.",
+  })),
   cwd: Type.Optional(Type.String({ description: "Child working directory; relative to the parent cwd", minLength: 1, maxLength: 4096 })),
-  id: Type.Optional(Type.String({ description: "Session-scoped child id from run or spawn; omit for status to list retained children", minLength: 1, maxLength: 128 })),
-  timeoutMs: Type.Optional(Type.Integer({ description: "wait only: maximum wait duration, not the child's execution deadline; defaults to 30 seconds", minimum: 1, maximum: MAX_WAIT_MS })),
+  id: Type.Optional(Type.String({ description: "status/stop only: child id; omit for status to list retained children", minLength: 1, maxLength: 128 })),
+  ids: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128 }), {
+    description: "wait only: child ids to join. Returns all ready reports and identifies still-running children when any finishes. Wait again only on remaining ids when blocked.",
+    minItems: 1, maxItems: MAX_RETAINED_RUNS, uniqueItems: true,
+  })),
+  timeoutMs: Type.Optional(Type.Integer({ description: "wait only: shared wait budget, not a child deadline. Default 5 minutes, maximum 10; wakes early on completion. Cancelling wait leaves children running.", minimum: 1, maximum: MAX_WAIT_MS })),
 }, { additionalProperties: false });
 
 export type SubagentParams = Static<typeof SubagentParamsSchema>;
@@ -42,14 +50,19 @@ export function validateCommand(params: SubagentParams): void {
   if (start) {
     if (!params.prompt?.trim()) throw new Error(`${params.command} requires a non-blank prompt.`);
     if (Buffer.byteLength(params.prompt, "utf8") > MAX_TASK_BYTES) throw new Error(`Prompt must be at most ${MAX_TASK_BYTES} bytes.`);
-    if (params.id !== undefined || params.timeoutMs !== undefined) throw new Error(`${params.command} does not accept id or timeoutMs.`);
+    if (params.id !== undefined || params.ids !== undefined || params.timeoutMs !== undefined) throw new Error(`${params.command} accepts only prompt, tools, model, thinking and cwd.`);
     if (params.model !== undefined && !params.model.trim()) throw new Error("Model must not be blank.");
     if (params.cwd !== undefined && !params.cwd.trim()) throw new Error("Working directory must not be blank.");
   } else {
-    if (params.prompt !== undefined || params.tools !== undefined || params.model !== undefined || params.cwd !== undefined) throw new Error(`${params.command} does not accept child creation options.`);
-    if (params.command !== "status" && !params.id?.trim()) throw new Error(`${params.command} requires id.`);
-    if (params.id !== undefined && !params.id.trim()) throw new Error("Child id must not be blank.");
-    if (params.command !== "wait" && params.timeoutMs !== undefined) throw new Error("timeoutMs is only accepted by wait.");
+    if (params.prompt !== undefined || params.tools !== undefined || params.model !== undefined || params.thinking !== undefined || params.cwd !== undefined) throw new Error(`${params.command} does not accept child creation options.`);
+    if (params.command === "wait") {
+      if (params.id !== undefined || !params.ids?.length) throw new Error('wait requires ids: ["<child-id>", ...], not id.');
+      if (params.ids.some((id) => !id.trim())) throw new Error("Child ids must not be blank.");
+    } else {
+      if (params.command === "stop" && !params.id?.trim()) throw new Error("stop requires id.");
+      if (params.id !== undefined && !params.id.trim()) throw new Error("Child id must not be blank.");
+      if (params.ids !== undefined || params.timeoutMs !== undefined) throw new Error("ids and timeoutMs are only accepted by wait.");
+    }
   }
 }
 

@@ -1,4 +1,9 @@
-import type { Message, StopReason, Usage } from "@earendil-works/pi-ai";
+import type { Message, ModelThinkingLevel, StopReason, Usage } from "@earendil-works/pi-ai";
+
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const satisfies readonly ModelThinkingLevel[];
+export function isThinkingLevel(value: unknown): value is ModelThinkingLevel {
+  return typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value);
+}
 
 export type AgentOutcome = "completed" | "incomplete" | "failed" | "cancelled" | "timed_out";
 
@@ -45,10 +50,16 @@ export interface ChildResult {
   stderr: string;
   usage: UsageSummary;
   model?: string;
+  /** Effective Pi thinking level, reported only after child startup verification. */
+  thinking?: ModelThinkingLevel;
 }
 
 export function isRunning(result: ChildResult): boolean {
   return result.state.status === "running";
+}
+
+export function failed(result: ChildResult): boolean {
+  return result.state.status === "terminal" && result.state.outcome !== "completed";
 }
 
 export function outcomeOf(result: ChildResult): AgentOutcome | undefined {
@@ -58,6 +69,8 @@ export function outcomeOf(result: ChildResult): AgentOutcome | undefined {
 export interface SubagentDetails {
   command: "run" | "spawn" | "status" | "wait" | "stop";
   results: ChildResult[];
+  /** A wait budget expired with no selected child complete; not a child timeout. */
+  waitExpired?: boolean;
 }
 
 export function emptyUsage(): UsageSummary {

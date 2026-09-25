@@ -41,9 +41,10 @@ function host(active = ["read", "bash", "edit", "write", "web_search", "web_fetc
   const entries: any[] = [];
   const context = { cwd, hasUI: false, model: { provider: "parent", id: "model" }, thinkingLevel: "high", isIdle: () => true,
     sessionManager: { getBranch: () => entries } };
+  let calls = 0;
   const instance = {
     tool, cwd, notices, renderers,
-    execute: (params: any, signal?: AbortSignal, update?: (value: any) => void) => tool.execute("call", params, signal, update, context),
+    execute: (params: any, signal?: AbortSignal, update?: (value: any) => void) => tool.execute(calls++ ? `call-${calls}` : "call", params, signal, update, context),
     toolResult: (event = { toolName: "subagent" }) => events.get("tool_result")!(event),
     boundary: () => {
       const result = events.get("turn_end")!({ type: "turn_end", outcome: "completed", entries: [] }, context);
@@ -70,10 +71,10 @@ for await (const chunk of process.stdin) input += chunk;
 const request = JSON.parse(input);
 fs.writeFileSync(process.argv[1] + ".capture", JSON.stringify({ ...request, args, cwd: process.cwd(), depth: process.env.PI_SUBAGENT_DEPTH }));
 const usage = { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, totalTokens: 9, cost: { input: 0.1, output: 0.2, cacheRead: 0.3, cacheWrite: 0.4, total: 1 }, turns: 1 };
-const emit = (event) => fs.writeSync(3, JSON.stringify({ version: 1, ...event }) + "\\n");
+const emit = (event) => fs.writeSync(3, JSON.stringify({ version: 2, ...event }) + "\\n");
 const report = (text, stopReason = "stop", extra = {}) => ({ output: text, stopReason, outputTruncation: { truncated: false, originalBytes: Buffer.byteLength(text), retainedBytes: Buffer.byteLength(text) }, ...extra });
 const final = (text, stopReason = "stop", extra = {}) => emit({ kind: "result", report: report(text, stopReason, extra), usage });
-emit({ kind: "ready", model: request.model, tools: request.tools });
+emit({ kind: "ready", model: request.model, thinking: request.thinking ?? "medium", tools: request.tools });
 ${body}
 `);
   process.env.PI_SUBAGENT_RUNNER = file;
@@ -111,7 +112,8 @@ afterEach(async () => {
 describe("task-first tool", () => {
   test("exposes only the lifecycle API with unambiguous prompt guidelines", () => {
     const tool = host().tool;
-    expect(Object.keys(tool.parameters.properties)).toEqual(["command", "prompt", "tools", "model", "cwd", "id", "timeoutMs"]);
+    expect(Object.keys(tool.parameters.properties)).toEqual(["command", "prompt", "tools", "model", "thinking", "cwd", "id", "ids", "timeoutMs"]);
+    expect(tool.executionMode).toBe("parallel");
     expect(tool.promptGuidelines.every((line: string) => line.includes("subagent"))).toBe(true);
   });
   test("runs without profiles, inherits model/thinking, and delivers the prompt on stdin", async () => {
@@ -121,9 +123,12 @@ describe("task-first tool", () => {
     const capture = await captured(file);
     expect(capture.prompt).toBe("Read exactly these facts; no parent history.");
     expect(capture.depth).toBe("1");
-    expect(capture.version).toBe(1);
+    expect(capture.version).toBe(2);
     expect(capture.model).toBe("parent/model");
     expect(capture.thinking).toBe("high");
+    expect(capture.strictThinking).toBe(false);
+    expect(first(value).thinking).toBe("high");
+    expect(value.content[0].text).toContain("thinking: high");
     expect(capture.args).not.toContain(capture.prompt);
     expect(capture.tools).toEqual(["read", "bash", "edit", "write", "web_search", "web_fetch", "web_research", "query-docs"]);
     expect(first(value).output).toBe("done");
@@ -139,8 +144,19 @@ describe("task-first tool", () => {
     const capture = await captured(file);
     expect(capture.tools).toEqual([]);
     expect(capture.model).toBe("custom/model");
+    expect(capture.thinking).toBeUndefined();
+    expect(first(value).thinking).toBe("medium");
     expect(capture.cwd).toBe(fs.realpathSync(path.join(h.cwd, "nested")));
     expect(first(value).tools).toEqual([]);
+  });
+  test("supports explicit child effort without changing the parent", async () => {
+    const h = host();
+    const file = fakePi();
+    const value = await h.execute({ command: "run", prompt: "reason", model: "custom/model", thinking: "xhigh" });
+    expect(await captured(file)).toMatchObject({ thinking: "xhigh", strictThinking: true });
+    expect(first(value).thinking).toBe("xhigh");
+    const inherited = await h.execute({ command: "run", prompt: "same model", model: "parent/model" });
+    expect(first(inherited).thinking).toBe("high");
   });
   test("does not read repository or user role definitions", async () => {
     const h = host();
@@ -155,7 +171,10 @@ describe("task-first tool", () => {
     { command: "run", prompt: " " }, { command: "spawn", prompt: "x", id: "id" },
     { command: "status", prompt: "x" }, { command: "wait" }, { command: "stop" },
     { command: "run", prompt: "x", model: " " }, { command: "run", prompt: "x", cwd: " " },
-    { command: "wait", id: "x", timeoutMs: 0 }, { command: "wait", id: "x", timeoutMs: 120001 },
+    { command: "wait", ids: ["x"], timeoutMs: 0 }, { command: "wait", ids: ["x"], timeoutMs: 600001 },
+    { command: "wait", id: "x" }, { command: "wait", ids: [] }, { command: "wait", ids: ["x", "x"] },
+    { command: "wait", ids: [" "] }, { command: "stop", ids: ["x"] }, { command: "run", prompt: "x", thinking: "ultra" },
+    { command: "status", thinking: "high" },
     { command: "run", prompt: "x", tools: ["read", "read"] },
     { command: "run", prompt: "😀".repeat(26_000) },
   ])("rejects invalid or obsolete input before launch: %j", async (params) => {
@@ -185,7 +204,8 @@ describe("background lifecycle", () => {
     const h = host();
     const file = fakePi('await delay(150); final("finished later");');
     const id = await spawn(h);
-    const interim = await h.execute({ command: "wait", id, timeoutMs: 1 });
+    const interim = await h.execute({ command: "wait", ids: [id], timeoutMs: 1 });
+    expect(interim.details.waitExpired).toBe(true);
     expect(first(interim).state.status).toBe("running");
     await captured(file);
     // No waiter is active; the result stays unread until a turn boundary.
@@ -202,17 +222,38 @@ describe("background lifecycle", () => {
     expect(notice).toHaveLength(1);
     expect(notice[0]).toContain(`subagent ${id.slice(0, 8)} completed`);
     expect(notice[0]).not.toContain("finished later"); // status-only notice; report on expansion
-    expect(first(await h.execute({ command: "wait", id })).output).toBe("finished later");
+    expect(first(await h.execute({ command: "wait", ids: [id] })).output).toBe("finished later");
     expect(h.notices).toHaveLength(1);
   });
   test("a delivering wait claims the result and suppresses the notice", async () => {
     const h = host();
     fakePi('await delay(50); final("delivered by wait");');
     const id = await spawn(h);
-    const value = await h.execute({ command: "wait", id });
+    const value = await h.execute({ command: "wait", ids: [id] });
+    expect(value.details.waitExpired).toBe(false);
     expect(first(value).output).toBe("delivered by wait");
     await Bun.sleep(100);
     expect(h.notices).toHaveLength(0);
+  });
+  test("multi-child wait preserves successful reports alongside failures and charges each once", async () => {
+    const h = host();
+    fakePi('final(request.prompt.slice(0, 1).repeat(50000), request.prompt === "bad" ? "length" : "stop");');
+    // Keep each report within the protocol bound, but above its share of the reply.
+    const ids = await Promise.all([spawn(h, { prompt: "x" }), spawn(h, { prompt: "bad" })]);
+    const deadline = Date.now() + 3000;
+    while ((await h.execute({ command: "status" })).details.results.some((r: any) => r.state.status === "running") && Date.now() < deadline) await Bun.sleep(10);
+    const error = await h.execute({ command: "wait", ids }).then(() => { throw new Error("expected failure"); }, (cause: Error) => cause);
+    for (const id of ids) expect(error.message).toContain(id);
+    expect(error.message).toContain("completed");
+    expect(error.message).toContain("incomplete");
+    expect(error.message).toContain("model output limit");
+    expect(error.message).toContain("x".repeat(100));
+    expect(error.message).toContain("wait_expired: false");
+    expect(Buffer.byteLength(error.message)).toBeLessThanOrEqual(50 * 1024);
+    h.boundary();
+    expect(h.notices).toHaveLength(0);
+    expect(h.toolResult().usage.cost.total).toBe(2);
+    expect(h.toolResult()).toBeUndefined();
   });
   test("points at the retained result only when the notice excerpt was truncated", async () => {
     const h = host();
@@ -237,7 +278,7 @@ describe("background lifecycle", () => {
     h.boundary();
     expect(h.notices).toHaveLength(1);
     expect(h.notices[0].message.content).toContain("late result");
-    expect(first(await h.execute({ command: "wait", id: first(value).id })).output).toBe("late result");
+    expect(first(await h.execute({ command: "wait", ids: [first(value).id] })).output).toBe("late result");
   });
   test("cancelling wait leaves the child running; stop joins and is idempotent", async () => {
     const h = host();
@@ -245,7 +286,7 @@ describe("background lifecycle", () => {
     const id = await spawn(h);
     await captured(file);
     const controller = new AbortController();
-    const pending = h.execute({ command: "wait", id }, controller.signal);
+    const pending = h.execute({ command: "wait", ids: [id] }, controller.signal);
     controller.abort();
     await expect(pending).rejects.toThrow("use stop");
     expect(first(await h.execute({ command: "status", id })).state.status).toBe("running");
@@ -306,8 +347,8 @@ describe("usage delivery", () => {
     expect(h.toolResult({ toolName: "subagent", isError: fails }).usage.cost.total).toBe(1);
     const id = first(await h.execute({ command: "status" })).id;
     expect(h.toolResult()).toBeUndefined();
-    if (fails) await expect(h.execute({ command: "wait", id })).rejects.toThrow("paid failure");
-    else await h.execute({ command: "wait", id });
+    if (fails) await expect(h.execute({ command: "wait", ids: [id] })).rejects.toThrow("paid failure");
+    else await h.execute({ command: "wait", ids: [id] });
     expect(h.toolResult()).toBeUndefined();
     await h.execute({ command: "stop", id });
     expect(h.toolResult()).toBeUndefined();
@@ -326,7 +367,7 @@ describe("usage delivery", () => {
     expect(patch.usage.cost.total).toBe(1.5);
     expect(existing.cost.total).toBe(0.5);
     expect(existing.input).toBe(1);
-    await h.execute({ command: "wait", id });
+    await h.execute({ command: "wait", ids: [id] });
     expect(h.toolResult()).toBeUndefined();
   });
   test("accounts paid work when a foreground child is cancelled", async () => {
@@ -383,7 +424,7 @@ describe("subprocess regressions", () => {
     expect(first(await h.execute({ command: "status" })).state).toMatchObject({ outcome: "timed_out" });
   });
   test.each([
-    'console.log(JSON.stringify({version:1,kind:"error",errorMessage:"stdout spoof"}));',
+    'console.log(JSON.stringify({version:2,kind:"error",errorMessage:"stdout spoof"}));',
     'process.stdout.write("ignored line\\n".repeat(300000));',
     'process.stdout.write("x".repeat(2*1024*1024)+"\\n");',
   ])("diagnostic stdout cannot corrupt the private result protocol", async (body) => {
@@ -394,7 +435,7 @@ describe("subprocess regressions", () => {
   });
   test("preserves UTF-8 split across chunks and a final event without newline", async () => {
     const h = host();
-    fakePi('const bytes=Buffer.from(JSON.stringify({version:1,kind:"result",report:report("😀漢字"),usage})); const i=bytes.indexOf(Buffer.from("😀")); fs.writeSync(3,bytes.subarray(0,i+1)); await delay(10); fs.writeSync(3,bytes.subarray(i+1));');
+    fakePi('const bytes=Buffer.from(JSON.stringify({version:2,kind:"result",report:report("😀漢字"),usage})); const i=bytes.indexOf(Buffer.from("😀")); fs.writeSync(3,bytes.subarray(0,i+1)); await delay(10); fs.writeSync(3,bytes.subarray(i+1));');
     expect(first(await h.execute({ command: "run", prompt: "x" })).output).toBe("😀漢字");
   });
   test("bounds returned reports and details independently of diagnostic volume", async () => {
@@ -418,11 +459,11 @@ describe("subprocess regressions", () => {
   });
   test("retains incomplete output while reporting the token limit as a tool error", async () => {
     const h = host();
-    fakePi('final("partial findings", "length");');
+    fakePi('final("partial findings" + "x".repeat(50000), "length");');
     await expect(h.execute({ command: "run", prompt: "x" })).rejects.toThrow("model output limit");
     const value = first(await h.execute({ command: "status" }));
     expect(value.state).toMatchObject({ outcome: "incomplete", stopReason: "length" });
-    expect(value.output).toBe("partial findings");
+    expect(value.output).toStartWith("partial findings");
   });
   test("a failing update handler does not fail or terminate the child", async () => {
     const h = host(); fakePi();

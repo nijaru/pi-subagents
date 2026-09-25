@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Usage } from "@earendil-works/pi-ai";
+import type { ModelThinkingLevel, Usage } from "@earendil-works/pi-ai";
 import type { ChildResult } from "./types.ts";
 import { addUsage, emptyUsage } from "./types.ts";
 import type { ChildSupervisor } from "./supervisor.ts";
@@ -26,7 +26,8 @@ export interface StartChild {
   cwd: string;
   tools: string[];
   model?: string;
-  thinking?: string;
+  thinking?: ModelThinkingLevel;
+  strictThinking?: boolean;
   /** Make the completed result available for automatic delivery unless a join reads it. */
   notify: boolean;
   emit?: (result: ChildResult, progress: string) => void;
@@ -67,7 +68,7 @@ export class SessionChildren {
   private async execute(run: ChildRun, options: StartChild): Promise<ChildResult> {
     try {
       const outcome = await this.supervisor.run({
-        result: run.result, thinking: options.thinking, signal: run.controller.signal,
+        result: run.result, thinking: options.thinking, strictThinking: options.strictThinking, signal: run.controller.signal,
         emit: options.emit ? (result, progress) => { if (!this.closed) options.emit?.(result, progress); } : undefined,
       });
       if (outcome.errorMessage) run.result.errorMessage = outcome.errorMessage;
@@ -176,14 +177,18 @@ export class SessionChildren {
     return run.promise;
   }
 
-  async wait(id: string, timeoutMs: number, signal?: AbortSignal): Promise<ChildResult> {
-    const run = this.get(id);
-    if (run.settled) {
-      run.delivery = "delivered";
+  /** Join any selected child under one deadline; acknowledge only returned terminal reports. */
+  async wait(ids: readonly string[], timeoutMs: number, signal?: AbortSignal): Promise<ChildResult[]> {
+    if (!ids.length) throw new Error("wait requires at least one child id.");
+    // Resolve the entire selection before claiming reports or registering listeners.
+    const runs = [...new Set(ids)].map((id) => this.get(id));
+    const collect = () => runs.map((run) => {
+      if (run.settled) run.delivery = "delivered";
       return this.snapshot(run);
-    }
-    if (signal?.aborted) throw new Error("Wait cancelled; the background child is still owned by the session. Use stop to cancel it.");
-    run.activeWaits++;
+    });
+    if (runs.some((run) => run.settled)) return collect();
+    if (signal?.aborted) throw new Error("Wait cancelled; use stop to cancel children.");
+    for (const run of runs) run.activeWaits++;
     try {
       await new Promise<void>((resolve, reject) => {
         let settled = false;
@@ -192,21 +197,22 @@ export class SessionChildren {
           settled = true;
           clearTimeout(timer);
           signal?.removeEventListener("abort", abort);
-          run.waiters.delete(complete);
+          for (const run of runs) run.waiters.delete(complete);
           if (error) reject(error); else resolve();
         };
         const complete = () => finish();
-        const abort = () => finish(new Error("Wait cancelled; use stop to cancel the child."));
+        const abort = () => finish(new Error("Wait cancelled; use stop to cancel children."));
         const timer = setTimeout(complete, timeoutMs);
         signal?.addEventListener("abort", abort, { once: true });
-        run.waiters.add(complete);
+        for (const run of runs) run.waiters.add(complete);
       });
-      if (run.settled) run.delivery = "delivered";
-      return this.snapshot(run);
+      return collect();
     } finally {
-      run.activeWaits--;
-      // A cancelled join can race completion without having delivered it.
-      this.signalAvailable(run);
+      for (const run of runs) {
+        run.activeWaits--;
+        // A cancelled join can race completion without having delivered it.
+        this.signalAvailable(run);
+      }
     }
   }
 

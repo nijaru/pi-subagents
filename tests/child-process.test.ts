@@ -15,8 +15,8 @@ async function fixture(script: string, callback: (result: ChildResult, superviso
     import { spawn } from 'node:child_process';
     let input=''; for await (const chunk of process.stdin) input += chunk;
     const request=JSON.parse(input);
-    const send = value => writeSync(3, JSON.stringify({version:1,...value})+'\\n');
-    send({kind:'ready',model:request.model,tools:request.tools});
+    const send = value => writeSync(3, JSON.stringify({version:2,...value})+'\\n');
+    send({kind:'ready',model:request.model,thinking:'off',tools:request.tools});
     ${script}`);
   process.env.PI_SUBAGENT_RUNNER = file;
   process.env.PI_SUBAGENT_TIMEOUT_MS = "10000";
@@ -74,7 +74,7 @@ test("process cancellation outranks earlier protocol error", async () => {
   });
 });
 test("oversized protocol frame fails closed while stdout JSON stays diagnostic", async () => {
-  await fixture(`console.log(JSON.stringify({version:1,kind:'error',errorMessage:'stdout spoof'}));
+  await fixture(`console.log(JSON.stringify({version:2,kind:'error',errorMessage:'stdout spoof'}));
     writeSync(3,'X'.repeat(1100000)); setInterval(()=>{},1000);`, async (result, supervisor) => {
     const outcome = await supervisor.run({ result, signal: new AbortController().signal });
     expect(outcome.outcome).toBe("failed");

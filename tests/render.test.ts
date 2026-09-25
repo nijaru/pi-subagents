@@ -28,7 +28,7 @@ describe("compact child rendering", () => {
     initTheme("dark", false);
     let tool: ToolDefinition<any, any> | undefined;
     extension({ registerTool(value: ToolDefinition<any, any>) { tool = value; }, registerMessageRenderer() {}, on() {} } as any);
-    const row = new ToolExecutionComponent("subagent", "test-call", { command: "wait", id: child.id }, {}, tool, { requestRender() {} } as TUI, "/project");
+    const row = new ToolExecutionComponent("subagent", "test-call", { command: "wait", ids: [child.id] }, {}, tool, { requestRender() {} } as TUI, "/project");
     row.updateResult({ ...result("wait"), isError: false });
     const compact = row.render(80).map((line) => stripTerminalControls(line).trim()).filter(Boolean);
     expect(compact).toEqual(["subagent wait 900c096e", "✓ completed · 8s"]);
@@ -48,7 +48,7 @@ describe("compact child rendering", () => {
     expect(lines("status", { command: "status", id: child.id })).toEqual([
       "subagent status 900c096e", "✓ completed · 8s · Read the package version.",
     ]);
-    expect(lines("wait", { command: "wait", id: child.id })).toEqual([
+    expect(lines("wait", { command: "wait", ids: [child.id] })).toEqual([
       "subagent wait 900c096e", "✓ completed · 8s",
     ]);
   });
@@ -59,7 +59,7 @@ describe("compact child rendering", () => {
     ]);
   });
   test("expansion exposes full identity, context, output, and usage", () => {
-    const text = lines("wait", { command: "wait", id: child.id }, true).join("\n");
+    const text = lines("wait", { command: "wait", ids: [child.id] }, true).join("\n");
     expect(text.match(new RegExp(child.id, "g"))).toHaveLength(1);
     for (const value of [child.prompt, child.output!, "cwd: /project", "tools: read", "2 turns", "test/model"]) expect(text).toContain(value);
   });
@@ -68,9 +68,18 @@ describe("compact child rendering", () => {
     expect(lines("spawn", { command: "spawn", prompt: child.prompt }, false, [active])).toEqual([
       "subagent spawn", "○ 900c096e started · Read the package version.",
     ]);
-    expect(lines("wait", { command: "wait", id: child.id }, false, [active])).toEqual([
+    expect(lines("wait", { command: "wait", ids: [child.id] }, false, [active])).toEqual([
       "subagent wait 900c096e", "○ running · Read the package version.", "Wait expired; child continues.",
     ]);
+  });
+  test("multi-child joins distinguish remaining work from wait expiry", () => {
+    const active = { ...child, id: "abcd1234", state: { status: "running" } as const };
+    const value = result("wait", [child, active]);
+    value.details.waitExpired = false;
+    const text = renderChildResult(value, { expanded: false }, theme).render(120).join("\n");
+    expect(text).toContain("Child continues.");
+    expect(text).not.toContain("expired");
+    expect(renderChildCall({ command: "wait", ids: [child.id, active.id] }, theme).render(80).join("\n")).toContain("2 children");
   });
   test("old spawn and status snapshots do not acquire a live elapsed timer", () => {
     const active = { ...child, state: { status: "running" } as const, startedAt: 0 };
@@ -95,7 +104,7 @@ describe("compact child rendering", () => {
       errorMessage: "Model output limit reached", stdout: "diagnostic stdout", stderr: "diagnostic stderr",
       outputTruncation: { truncated: true, originalBytes: 1000, retainedBytes: Buffer.byteLength(child.output!) },
     };
-    const text = lines("wait", { command: "wait", id: child.id }, true, [incomplete]).join("\n");
+    const text = lines("wait", { command: "wait", ids: [child.id] }, true, [incomplete]).join("\n");
     for (const label of ["! incomplete", child.output!, "Model output limit reached", "Output shortened", "diagnostic stdout", "diagnostic stderr"]) expect(text).toContain(label);
   });
   test("detail budgets preserve truthful truncation metadata and bounded diagnostics", () => {

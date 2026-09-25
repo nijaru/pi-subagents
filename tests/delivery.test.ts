@@ -38,7 +38,7 @@ describe("parent completion delivery", () => {
     c.gates[0]!.resolve();
     await run.promise;
     expect(c.children.pendingCompletions()).toHaveLength(1);
-    expect((await c.children.wait(run.result.id, 1)).output).toBe("report");
+    expect((await c.children.wait([run.result.id], 1))[0]!.output).toBe("report");
     expect(c.boundary()).toBeUndefined();
     c.delivery.settled(c.ctx);
     expect(c.statuses.at(-1)).toBeUndefined();
@@ -48,7 +48,7 @@ describe("parent completion delivery", () => {
   test("a blocking join delivers instead of adding a boundary notice", async () => {
     const c = controlled();
     const run = c.start();
-    const waiting = c.children.wait(run.result.id, 1000);
+    const waiting = c.children.wait([run.result.id], 1000);
     c.gates[0]!.resolve();
     await waiting;
     expect(c.boundary()).toBeUndefined();
@@ -130,7 +130,7 @@ describe("parent completion delivery", () => {
     if (timing === "before") c.delivery.settled(c.ctx);
     expect(c.children.pendingCompletions()).toHaveLength(1);
     expect(c.statuses.at(-1)).toBe("1 unread child result");
-    expect((await c.children.wait(run.result.id, 1)).output).toBe("report");
+    expect((await c.children.wait([run.result.id], 1))[0]!.output).toBe("report");
     c.delivery.refreshStatus();
     expect(c.statuses.at(-1)).toBeUndefined();
     await c.close();

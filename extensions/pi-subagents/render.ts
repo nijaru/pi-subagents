@@ -3,14 +3,14 @@ import { getMarkdownTheme, keyText } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Markdown, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { truncateHeadTail, truncateOutput } from "./bounds.ts";
 import { MAX_OUTPUT_BYTES, MAX_RETAINED_RUNS } from "./limits.ts";
-import { failed, resultText } from "./supervisor.ts";
+import { resultText, runtimeLabel } from "./reports.ts";
 import type { SubagentDetails } from "./types.ts";
-import { isFiniteNumber, isOutputTruncation } from "./types.ts";
+import { failed, isFiniteNumber, isOutputTruncation, isThinkingLevel } from "./types.ts";
 import type { ChildResult, UsageSummary } from "./types.ts";
 
 interface ChildRenderContext {
   expanded: boolean;
-  args: { id?: unknown };
+  args: { id?: unknown; ids?: unknown };
 }
 
 export function isRenderableUsage(value: unknown): value is UsageSummary {
@@ -34,6 +34,7 @@ export function isRenderableChildResult(value: unknown): value is ChildResult {
     && (result.outputTruncation === undefined || isOutputTruncation(result.outputTruncation))
     && (result.errorMessage === undefined || typeof result.errorMessage === "string")
     && (result.model === undefined || typeof result.model === "string")
+    && (result.thinking === undefined || isThinkingLevel(result.thinking))
     && isFiniteNumber(result.startedAt ?? 0)
     && (result.state?.status === "running"
       || (result.state?.status === "terminal"
@@ -42,24 +43,6 @@ export function isRenderableChildResult(value: unknown): value is ChildResult {
         && isFiniteNumber(result.state.finishedAt)))
     && typeof result.stderr === "string"
     && isRenderableUsage(result.usage);
-}
-
-export function formatDuration(startedAt?: number, finishedAt?: number): string | undefined {
-  if (!isFiniteNumber(startedAt)) return undefined;
-  const end = isFiniteNumber(finishedAt) ? finishedAt : Date.now();
-  const totalSeconds = Math.max(0, Math.floor((end - startedAt) / 1000));
-  if (totalSeconds < 60) return `${totalSeconds}s`;
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  if (minutes < 60) return `${minutes}m ${seconds}s`;
-  const hours = Math.floor(minutes / 60);
-  return `${hours}h ${minutes % 60}m ${seconds}s`;
-}
-
-export function runtimeLabel(result: ChildResult): string {
-  const duration = formatDuration(result.startedAt, result.state.status === "terminal" ? result.state.finishedAt : undefined);
-  if (!duration) return "";
-  return `${duration}${result.state.status === "running" ? " elapsed" : ""}`;
 }
 
 export function formatTokens(value: number): string {
@@ -123,10 +106,16 @@ function singleLine(text: string): Component {
   return { render: (width) => [truncateToWidth(text, width)], invalidate() {} };
 }
 
+function targetId(args: ChildRenderContext["args"]): string | undefined {
+  if (typeof args.id === "string") return args.id;
+  return Array.isArray(args.ids) && args.ids.length === 1 && typeof args.ids[0] === "string" ? args.ids[0] : undefined;
+}
+
 export function renderChildCall(args: Record<string, unknown>, theme: Theme, context?: ChildRenderContext): Component {
   const expanded = context?.expanded ?? false;
   const command = typeof args.command === "string" ? clean(args.command, 64).replace(/\s+/g, " ") : "";
-  const id = typeof args.id === "string" ? ` ${displayId(args.id, expanded)}` : "";
+  const target = targetId(args);
+  const id = target ? ` ${displayId(target, expanded)}` : Array.isArray(args.ids) ? ` · ${args.ids.length} children` : "";
   const container = new Container();
   container.addChild(new Text(theme.fg("toolTitle", theme.bold(`subagent ${command}${id}`)), 0, 0));
   // The prompt is agent-facing instruction text; humans see it only on expansion.
@@ -181,7 +170,7 @@ function renderChildren(details: unknown, expanded: boolean, theme: Theme, targe
       container.addChild(singleLine(preview ? `${heading} · ${theme.fg("dim", preview)}` : heading));
     }
     if (active && data?.command === "wait") {
-      container.addChild(new Text(theme.fg("dim", "Wait expired; child continues."), 0, 0));
+      container.addChild(new Text(theme.fg("dim", data.waitExpired === false ? "Child continues." : "Wait expired; child continues."), 0, 0));
     }
     if (expanded) {
       // Status/wait/stop rows need task labels; run/spawn show the prompt in their call header.
@@ -203,14 +192,14 @@ function renderChildren(details: unknown, expanded: boolean, theme: Theme, targe
         container.addChild(new Text(theme.fg("dim", `${label}: ${stripTerminalControls(diagnostic)}`), 0, 0));
       }
       container.addChild(new Text(theme.fg("dim", `cwd: ${clean(child.cwd, 1024)}\ntools: ${clean(child.tools.join(", "), 1024) || "none"}`), 0, 0));
-      if (!active) container.addChild(new Text(theme.fg("dim", formatUsage(child.usage, child.model ? clean(child.model, 256) : undefined)), 0, 0));
+      if (!active) container.addChild(new Text(theme.fg("dim", formatUsage(child.usage, child.model ? clean(child.model, 256) : undefined) + (child.thinking ? ` · thinking: ${child.thinking}` : "")), 0, 0));
     }
   }
   return container;
 }
 
 export function renderChildResult(result: AgentToolResult<SubagentDetails>, { expanded }: { expanded: boolean }, theme: Theme, context?: ChildRenderContext): Component {
-  const rendered = renderChildren(result.details, expanded, theme, typeof context?.args?.id === "string" ? context.args.id : undefined);
+  const rendered = renderChildren(result.details, expanded, theme, context?.args ? targetId(context.args) : undefined);
   if (rendered) return rendered;
   const text = result.content[0];
   return renderOutput(text?.type === "text" && typeof text.text === "string" ? clean(text.text) : "(no output)", expanded, theme);

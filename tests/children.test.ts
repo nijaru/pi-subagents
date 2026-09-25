@@ -50,10 +50,10 @@ describe("session ownership", () => {
   test("expired and cancelled waits release their completion listeners", async () => {
     const c = controlled();
     const run = c.start();
-    for (let i = 0; i < 20; i++) await c.children.wait(run.result.id, 1);
+    for (let i = 0; i < 20; i++) await c.children.wait([run.result.id], 1);
     expect(run.waiters.size).toBe(0);
     const controller = new AbortController();
-    const wait = c.children.wait(run.result.id, 10000, controller.signal);
+    const wait = c.children.wait([run.result.id], 10000, controller.signal);
     expect(run.waiters.size).toBe(1);
     controller.abort();
     await expect(wait).rejects.toThrow("Wait cancelled");
@@ -63,19 +63,73 @@ describe("session ownership", () => {
   test("an active join claims delivery and suppresses the completion notice", async () => {
     const c = controlled();
     const run = c.start();
-    const joining = c.children.wait(run.result.id, 10000);
+    const joining = c.children.wait([run.result.id], 10000);
     c.gates[0]!.resolve();
-    expect((await joining).output).toBe("done");
+    expect((await joining)[0]!.output).toBe("done");
     await run.promise;
     expect(c.notices).toEqual([]);
   });
   test("a join that expires while the child is live re-arms the completion notice", async () => {
     const c = controlled();
     const run = c.start();
-    expect((await c.children.wait(run.result.id, 1)).state.status).toBe("running");
+    expect((await c.children.wait([run.result.id], 1))[0]!.state.status).toBe("running");
     c.gates[0]!.resolve();
     await run.promise;
     expect(c.notices).toEqual([run.result.id]);
+  });
+  test("wait-any collects ready reports and re-arms remaining children", async () => {
+    const c = controlled();
+    const runs = Array.from({ length: 3 }, () => c.start());
+    const joining = c.children.wait(runs.map((run) => run.result.id), 10000);
+    c.gates[1]!.resolve();
+    c.gates[2]!.resolve();
+    const results = await joining;
+    expect(results.map((result) => result.state.status)).toEqual(["running", "terminal", "terminal"]);
+    expect(runs.map((run) => run.delivery)).toEqual(["unread", "delivered", "delivered"]);
+    expect(runs.every((run) => run.waiters.size === 0 && run.activeWaits === 0)).toBe(true);
+    expect(c.notices).toEqual([]);
+    c.gates[0]!.resolve();
+    await runs[0]!.promise;
+    expect(c.notices).toEqual([runs[0]!.result.id]);
+    await c.children.close();
+  });
+  test("overlapping waits and stop release listeners without duplicate notices or usage", async () => {
+    const c = controlled();
+    const a = c.start(); const b = c.start();
+    c.requests[0]!.result.usage.input = 5;
+    const one = c.children.wait([a.result.id, b.result.id], 10000);
+    const two = c.children.wait([a.result.id], 10000);
+    const stop = c.children.stop(a.result.id);
+    expect((await one)[0]!.state).toMatchObject({ outcome: "cancelled" });
+    expect((await two)[0]!.state).toMatchObject({ outcome: "cancelled" });
+    await stop;
+    expect(c.notices).toEqual([]);
+    expect(c.children.takePendingUsage()?.input).toBe(5);
+    expect(c.children.takePendingUsage()).toBeUndefined();
+    expect(a.activeWaits).toBe(0);
+    expect(b.waiters.size).toBe(0);
+    await c.children.close();
+  });
+  test("invalid selections and cancelled multi-waits do not consume reports", async () => {
+    const c = controlled();
+    const a = c.start(); const b = c.start();
+    await expect(c.children.wait([a.result.id, "unknown"], 1)).rejects.toThrow("Unknown child");
+    expect(a.activeWaits).toBe(0);
+    const controller = new AbortController();
+    const joining = c.children.wait([a.result.id, b.result.id], 10000, controller.signal);
+    controller.abort();
+    c.gates[0]!.resolve();
+    c.gates[1]!.resolve();
+    await expect(joining).rejects.toThrow("Wait cancelled");
+    await Promise.all([a.promise, b.promise]);
+    expect(c.children.pendingCompletions()).toHaveLength(2);
+    expect([a, b].every((run) => run.activeWaits === 0 && run.waiters.size === 0 && !run.controller.signal.aborted)).toBe(true);
+    // Resolve all ids before consuming even an already-completed report.
+    await expect(c.children.wait([a.result.id, "unknown"], 1)).rejects.toThrow("Unknown child");
+    expect(a.delivery).toBe("unread");
+    expect((await c.children.wait([a.result.id, b.result.id], 1)).every((result) => result.state.status === "terminal")).toBe(true);
+    expect(c.children.pendingCompletions()).toHaveLength(0);
+    await c.children.close();
   });
   test("evicts only completed handles and bounds retained state", async () => {
     const c = controlled();
@@ -99,7 +153,7 @@ describe("session ownership", () => {
     expect(c.children.takePendingUsage()).toBeUndefined(); // cleanup still running
     c.gates[0]!.resolve();
     await run.promise;
-    await c.children.wait(run.result.id, 1);
+    await c.children.wait([run.result.id], 1);
     await c.children.stop(run.result.id);
     expect(c.children.takePendingUsage()?.input).toBe(5);
     expect(c.children.takePendingUsage()).toBeUndefined();
@@ -124,7 +178,7 @@ describe("session ownership", () => {
     }
     expect(() => c.start()).toThrow("unread");
     expect(c.children.pendingCompletions()).toHaveLength(MAX_RETAINED_RUNS);
-    await c.children.wait(c.children.list()[0]!.id, 1);
+    await c.children.wait([c.children.list()[0]!.id], 1);
     c.start();
     await c.children.close();
   });
@@ -161,7 +215,7 @@ describe("session ownership", () => {
     const children = new SessionChildren({ async run({ result }) { result.output = "answer"; return { outcome: "completed", exitCode: 0, stopReason: "stop" }; } }, () => { throw new Error("UI unavailable"); });
     const run = children.start({ prompt: "x", tools: [], cwd: process.cwd(), notify: true });
     await run.promise;
-    expect((await children.wait(run.result.id, 1)).output).toBe("answer");
+    expect((await children.wait([run.result.id], 1))[0]!.output).toBe("answer");
     await children.close();
   });
   test("lifecycle state never duplicates execution diagnostics", async () => {

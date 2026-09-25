@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import type { Readable } from "node:stream";
 import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { getChildInvocation } from "../extensions/pi-subagents/subprocess.ts";
-import { parseChildEvent, type ChildBootstrap, type ChildEvent } from "../extensions/pi-subagents/child-protocol.ts";
+import { CHILD_PROTOCOL_VERSION, parseChildEvent, type ChildBootstrap, type ChildEvent } from "../extensions/pi-subagents/child-protocol.ts";
 
 let dir: string;
 let packedRunner: string;
@@ -90,7 +90,7 @@ async function run(overrides: Partial<ChildBootstrap> = {}, packed = false, canc
   const stderr = read(child.stderr!);
   const protocol = read(child.stdio[3] as Readable);
   const deadline = setTimeout(() => child.kill("SIGKILL"), 10000);
-  child.stdin!.end(JSON.stringify({ version: 1, prompt: "/literal unchanged", tools: [], model: "fixture/model", ...overrides }));
+  child.stdin!.end(JSON.stringify({ version: CHILD_PROTOCOL_VERSION, prompt: "/literal unchanged", tools: [], model: "fixture/model", ...overrides }));
   const closed = new Promise((resolve, reject) => { child.on("close", resolve); child.on("error", reject); });
   if (cancel) {
     const started = Date.now() + 5000;
@@ -109,7 +109,7 @@ test.each([false, true])("real SDK and packed SDK runner keep prompts literal an
   const result = await run({}, packed);
   expect(result.stderr).not.toContain("Error");
   expect(result.code).toBe(0);
-  expect(result.events[0]).toEqual({ version: 1, kind: "ready", model: "fixture/model", tools: [] });
+  expect(result.events[0]).toMatchObject({ version: CHILD_PROTOCOL_VERSION, kind: "ready", model: "fixture/model", tools: [] });
   expect(result.events.at(-1)).toMatchObject({ kind: "result", report: { output: JSON.stringify({ text: "/literal unchanged", names: [] }) } });
   expect(result.stdout).toContain("STDOUT_DIAGNOSTIC");
   expect(result.stderr).toContain("STDERR_DIAGNOSTIC");
@@ -127,6 +127,28 @@ test.each([{ tools: ["runtime_only_missing"] }, { model: "fixture/missing" }])("
   expect(result.code).toBe(1);
   expect(result.events.at(-1)?.kind).toBe("error");
   expect(existsSync(join(dir, "provider-called"))).toBe(false);
+});
+
+test("SDK verifies explicit effort and reports effective inherited/default effort", async () => {
+  const explicit = await run({ thinking: "high", strictThinking: true });
+  expect(explicit.code).toBe(0);
+  expect(explicit.events[0]).toMatchObject({ kind: "ready", thinking: "high" });
+  const unsupported = await run({ thinking: "max", strictThinking: true });
+  expect(unsupported.code).toBe(1);
+  expect(unsupported.events.at(-1)).toMatchObject({ kind: "error" });
+  expect(unsupported.wire).toContain("Supported:");
+  expect(existsSync(join(dir, "provider-called"))).toBe(false);
+  const inherited = await run({ thinking: "max" });
+  expect(inherited.code).toBe(0);
+  expect(inherited.events[0]).toMatchObject({ kind: "ready", thinking: "high" });
+  const settingsPath = join(dir, "settings.json");
+  const previous = readFileSync(settingsPath, "utf8");
+  try {
+    writeFileSync(settingsPath, JSON.stringify({ ...JSON.parse(previous), modelThinkingLevels: { "fixture/model": "low" } }));
+    const defaults = await run();
+    expect(defaults.code).toBe(0);
+    expect(defaults.events[0]).toMatchObject({ kind: "ready", thinking: "low" });
+  } finally { writeFileSync(settingsPath, previous); }
 });
 
 test("successful SDK retry clears earlier assistant failure and counts both attempts", async () => {

@@ -27,12 +27,13 @@ Release through the manual `publish` workflow, never from a working tree. Verify
 - `child-bootstrap.mjs`, `child-runner.ts`, `child-protocol.ts`: selected-installation SDK loading, canonical noninteractive project trust, model/tool verification, literal prompting, and versioned compact records over fd 3.
 - `subprocess.ts`: Node invocation, stdin bootstrap transport, bounded private-pipe framing and stdout/stderr diagnostics, process-tree cancellation and normal-exit sweep, and the parent-death watchdog.
 - `params.ts`: command/tool policy and working-directory resolution.
-- `env.ts`, `bounds.ts`, `limits.ts`, `types.ts`, `render.ts`: environment policy, output/resource bounds, result contracts, rendering helpers.
+- `reports.ts`: bounded model-facing summaries and reports, shared by joins and completion notices; causes precede partial output and every selected child stays represented.
+- `env.ts`, `bounds.ts`, `limits.ts`, `types.ts`, `render.ts`: environment policy, output/resource bounds, result contracts, TUI rendering.
 - `tests/`: deterministic lifecycle tests plus real subprocess protocol regression tests.
 
 Children are leaves. Do not add a second scheduler, profile discovery layer, workflow framework, recursive delegation, or persistent registry without an explicit product decision. A future native Pi child API belongs behind the existing execution boundary, not beside a competing runner.
 
-Admission must happen before asynchronous setup or extension callbacks. Keep the active slot until process-tree cleanup finishes, not merely until terminal assistant output arrives. Session shutdown fences notifications before aborting and joining children; no completion may enter a replacement session.
+Tool calls may execute in parallel. Admission must happen before asynchronous setup or extension callbacks. Keep the active slot until process-tree cleanup finishes, not merely until terminal assistant output arrives. Multi-child waits use one deadline, wake on any selected completion, and acknowledge only returned terminal reports; detach every listener on completion, expiry, or cancellation. Session shutdown fences notifications before aborting and joining children; no completion may enter a replacement session.
 
 Default tools are known coding/research tools active in the parent; explicit tools can only select active parent tools. Tool lists, effect metadata, and subprocesses are not sandboxes: a child with shell access can produce effects outside the managed process group. Concurrent writers, including parent-versus-child writers, need separate worktrees; admission counts slots and does not arbitrate write ownership. Child Pi reloads its own integrations; runtime-only parent tools, credentials, providers, and permission hooks are not cloned.
 

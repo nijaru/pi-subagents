@@ -23,15 +23,19 @@ Ask Pi to delegate a specific task, or use these tool-call shapes:
 ```json
 {"command":"spawn","prompt":"Implement the parser regression test in tests/parser.test.ts. Own only that file, run its tests, and report changes and results.","cwd":"../parser-worktree"}
 {"command":"status"}
-{"command":"wait","id":"<child-id>","timeoutMs":30000}
+{"command":"wait","ids":["<child-id>"]}
 {"command":"stop","id":"<child-id>"}
 ```
 
 Unread background results arrive at the next successful active-turn boundary. Results ready together share one completion message and continuation. **Completions never wake an idle parent.** Results finishing after the last boundary, or during parent errors or cancellation, remain unread until another natural turn or an explicit `wait`. The TUI status indicator shows the unread count. This avoids undoing a late abort that Pi 0.87 cannot expose to extensions.
 
-Use `wait` before finishing a task that depends on a child's result. It returns the retained final result, or reports that the child is still running when its wait budget expires. Cancelling a wait does **not** cancel the child; `stop` cancels it and waits for cleanup. Cancelling `run` cancels its child.
+Spawn independent tasks before waiting. Calls can execute in parallel when Pi's tool scheduling permits it; one foreground child no longer forces sibling tool calls to run sequentially.
 
-`run`, `wait`, and `stop` mark the result they return as read, suppressing its pending automatic notice even if the child finished before the call. `status` only inspects state; it does not consume a report. Completion notices carry results inline and point at `wait` only when an excerpt was truncated. Once a report has entered the parent's transcript, explicitly reading it again still returns the retained copy but does not generate another notice.
+Use `wait` before finishing a task that depends on child results. Pass one or more `ids`: the call wakes when **any** selected child finishes, returns all ready reports, and identifies those still running. It waits up to five minutes by default, or up to ten minutes with `timeoutMs`. A longer budget does not delay early completion. Wait again only on remaining ids when their results block progress, rather than polling. `wait_expired: true` means the wait budget expired without a completed child; it is not a child execution timeout.
+
+Cancelling a wait does **not** cancel its children; `stop` cancels one child and waits for cleanup. Cancelling `run` cancels its child.
+
+`run`, `wait`, and `stop` mark completed reports they return as read, suppressing their pending automatic notices even if children finished before the call. A multi-child wait does not consume unfinished reports. `status` only inspects state; it does not consume a report. Completion notices carry results inline and point at `wait` only when an excerpt was truncated. Once a report has entered the parent's transcript, explicitly reading it again still returns the retained copy but does not generate another notice.
 
 Handles belong to the current parent session. All children stop on quit, reload, or session replacement. Background work requires a live parent process; a one-shot print invocation is not a persistent worker host.
 
@@ -48,7 +52,8 @@ Pi 0.87 cannot attach usage to a custom completion message. Background costs the
 - Defaults are the parent's active tools among `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `web_research`, `resolve-library-id`, and `query-docs`. Research tools require their extensions; they are not supplied by this package.
 - `tools` selects an explicit allowlist, restricted to tools active in the parent. `tools: []` is reasoning-only. An empty default selection is rejected rather than silently launching an unusable coding child.
 - Children are leaves. The `subagent` tool cannot be passed to them, and nested calls are rejected.
-- `model` optionally selects an exact `provider/model-id`; otherwise the parent's model is inherited. Fuzzy CLI model patterns are not accepted. Thinking effort inherits the parent's session level.
+- `model` optionally selects an exact `provider/model-id`; otherwise the parent's model is inherited. Fuzzy CLI model patterns are not accepted.
+- `thinking` selects a Pi reasoning effort supported by that model, such as `high` or `xhigh`. Omitted effort inherits the parent's level for the same model; a different model uses its own Pi defaults (per-model setting, then the global default). An unsupported explicit effort fails before prompting rather than silently changing it. Pi may clamp inherited/default effort to model capabilities; reports and expanded details show the effective startup level.
 - `cwd` defaults to the parent cwd; relative paths resolve against it.
 - Every child starts a new conversation. The prompt should include scope, relevant evidence, constraints, expected output, and verification. Parent conversation history is not copied.
 
@@ -70,7 +75,7 @@ Children are separate processes that share your working tree. The extension coun
 | Retained handles | 32; oldest completed, delivered handles are evicted first; unread results block admission rather than disappearing |
 | Foreground `run` | 60 seconds by default; `PI_SUBAGENT_FOREGROUND_MS` changes it, and expiry hands the child to background work |
 | Child execution | 30 minutes by default; `PI_SUBAGENT_TIMEOUT_MS` may set up to 2 hours |
-| One wait call | 30 seconds by default, at most 120 seconds; never extends the child deadline |
+| One wait call | 5 minutes by default, at most 10 minutes, shared across selected ids; wakes on any completion and never extends child deadlines |
 | Task prompt | 100 KiB |
 | Tool response and result details | 50 KiB each |
 | Child stdout and stderr | 50 KiB each, keeping both ends; diagnostics cannot be interpreted as result frames |
@@ -80,7 +85,7 @@ All children use one packaged SDK runner in a detached Node subprocess, with an 
 
 Normal completion and cancellation sweep the child's process group before releasing the concurrency slot. Graceful cancellation runs child extension shutdown hooks; hung cleanup is subject to the same forced process-tree termination. No profiles, workflow scheduler, recursive delegation, session persistence, or managed worktree creation is included.
 
-A successful child must produce terminal assistant output. Failures, cancellation, timeouts, and token-limit termination (`incomplete`) remain distinguishable in retained status. Process cancellation and deadlines take precedence over earlier assistant errors. `run` and completed `wait` throw tool errors for failed or incomplete children; `status` remains available to inspect them. `stop` reports the resulting state without treating requested cancellation as a tool failure.
+A successful child must produce terminal assistant output. Failures, cancellation, timeouts, and token-limit termination (`incomplete`) remain distinguishable in retained status. Process cancellation and deadlines take precedence over earlier assistant errors. `run` and `wait` throw tool errors for failed or incomplete children; a mixed wait still includes its successful reports and running children. Failure causes precede partial output so report truncation cannot hide the reason. `status` remains available to inspect retained state. `stop` reports the resulting state without treating requested cancellation as a tool failure.
 
 Reports remain bounded rather than spilling to disk. `outputTruncation` records whether text was shortened and its original/retained UTF-8 byte counts; expansion also shows this in the TUI. A completion excerpt can point to a longer retained report, but text beyond the retention limit is not recoverable.
 
@@ -92,10 +97,18 @@ Environment variables are allowlisted, with standard model credentials, `$VAR` r
 
 ## Release notes
 
-`0.0.x` is pre-release: the tool schema is stable, but behavior and the exported `ChildResult` shape are not promised across patch releases. Read this file, not the version number, for what changed.
+`0.0.x` is pre-release: the tool schema, behavior, and exported `ChildResult` shape are not promised across patch releases. Read this file, not the version number, for what changed.
 
 - **0.0.2**: `run` joins within a foreground budget and then continues as background work; `ChildResult` carries `state` instead of `exitCode`/`termination`; prompts travel on stdin instead of a temporary file; a blocking join claims the result it delivers; a crashed or killed parent now stops its children; stderr keeps both ends.
 - **0.0.1**: task-first child lifecycle.
+
+## Migration from single-child waits
+
+- `{"command":"wait","id":"…"}` → `{"command":"wait","ids":["…"]}`. `id` remains the argument for `status` and `stop`; `wait` requires `ids` even for one child.
+- A wait returns when any selected child finishes and includes all currently ready reports. Do not pass completed ids again unless you need to reread their retained reports.
+- Wait budgets now default to five minutes, at most ten. Expiry or cancellation still leaves children running.
+- `thinking` is an optional launch parameter. Changing `model` without setting `thinking` now uses that model's Pi defaults, not the parent's effort. Set both explicitly when you need a particular combination.
+- `ChildResult.thinking` records the effective startup effort; wait details add `waitExpired`. Custom developer runners must speak private protocol version 2 and report effective thinking in their readiness frame.
 
 ## Migration from CLI-backed children
 

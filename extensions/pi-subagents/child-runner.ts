@@ -3,7 +3,7 @@ import {
   createAgentSessionServices, createAgentSessionFromServices, getAgentDir, ProjectTrustStore, SessionManager, SettingsManager,
   type AgentSession, type DefaultProjectTrust, type LoadExtensionsResult, type ProjectTrustContext,
 } from "@earendil-works/pi-coding-agent";
-import { addUsage, emptyUsage } from "./types.ts";
+import { addUsage, emptyUsage, isThinkingLevel } from "./types.ts";
 import { boundedDiagnostic, truncateOutput } from "./bounds.ts";
 import { MAX_TASK_BYTES } from "./limits.ts";
 import { assistantReport, CHILD_PROTOCOL_VERSION, emptyReport, type ChildBootstrap, type ChildEvent } from "./child-protocol.ts";
@@ -43,7 +43,10 @@ export async function runChild(resolveProjectTrust: ResolveProjectTrust): Promis
     }
     const request: ChildBootstrap = JSON.parse(input);
     if (request.version !== CHILD_PROTOCOL_VERSION || typeof request.prompt !== "string" || !Array.isArray(request.tools)
-      || !request.tools.every((tool) => typeof tool === "string") || Buffer.byteLength(request.prompt) > MAX_TASK_BYTES) {
+      || !request.tools.every((tool) => typeof tool === "string") || Buffer.byteLength(request.prompt) > MAX_TASK_BYTES
+      || (request.thinking !== undefined && !isThinkingLevel(request.thinking))
+      || (request.strictThinking !== undefined && typeof request.strictThinking !== "boolean")
+      || (request.strictThinking && request.thinking === undefined)) {
       throw new Error("Invalid child bootstrap request.");
     }
     abort.signal.throwIfAborted();
@@ -77,7 +80,7 @@ export async function runChild(resolveProjectTrust: ResolveProjectTrust): Promis
     if (request.model && !model) throw new Error(`Requested child model is unavailable: ${request.model}`);
     const created = await createAgentSessionFromServices({
       services, model, tools: request.tools,
-      thinkingLevel: request.thinking as AgentSession["thinkingLevel"] | undefined,
+      thinkingLevel: request.thinking,
       sessionManager: SessionManager.inMemory(process.cwd()),
     });
     session = created.session;
@@ -90,7 +93,10 @@ export async function runChild(resolveProjectTrust: ResolveProjectTrust): Promis
     const active = session.getActiveToolNames();
     if (active.length !== request.tools.length || request.tools.some((tool) => !active.includes(tool))) throw new Error("Child tool selection did not match request.");
     if (!session.model || (request.model && `${session.model.provider}/${session.model.id}` !== request.model)) throw new Error("Child model selection did not match request.");
-    await send({ version: 1, kind: "ready", model: `${session.model.provider}/${session.model.id}`, tools: active });
+    if (request.strictThinking && session.thinkingLevel !== request.thinking) {
+      throw new Error(`Thinking level ${request.thinking} was not selected for ${request.model}; effective level is ${session.thinkingLevel}. Supported: ${session.getAvailableThinkingLevels().join(", ")}.`);
+    }
+    await send({ version: CHILD_PROTOCOL_VERSION, kind: "ready", model: `${session.model.provider}/${session.model.id}`, thinking: session.thinkingLevel, tools: active });
     let report = emptyReport();
     const usage = emptyUsage();
     session.subscribe((event) => {
@@ -102,17 +108,17 @@ export async function runChild(resolveProjectTrust: ResolveProjectTrust): Promis
         }
         if ((message.role === "assistant" || message.role === "toolResult") && message.usage) addUsage(usage, message.usage);
         // Coalesce under backpressure. The final report always includes full usage.
-        if (pipe.writableLength < 8192) pipe.write(JSON.stringify({ version: 1, kind: "usage", usage }) + "\n");
+        if (pipe.writableLength < 8192) pipe.write(JSON.stringify({ version: CHILD_PROTOCOL_VERSION, kind: "usage", usage }) + "\n");
       } else if (event.type === "tool_execution_start" && pipe.writableLength < 8192) {
-        pipe.write(JSON.stringify({ version: 1, kind: "progress", text: `Running ${truncateOutput(event.toolName, 256)}...` }) + "\n");
+        pipe.write(JSON.stringify({ version: CHILD_PROTOCOL_VERSION, kind: "progress", text: `Running ${truncateOutput(event.toolName, 256)}...` }) + "\n");
       }
     });
     abort.signal.throwIfAborted();
     await session.prompt(request.prompt, { expandPromptTemplates: false, source: "extension" });
     await session.waitForIdle();
-    await send({ version: 1, kind: "result", report, usage });
+    await send({ version: CHILD_PROTOCOL_VERSION, kind: "result", report, usage });
   } catch (error) {
-    await send({ version: 1, kind: "error", errorMessage: boundedDiagnostic(error instanceof Error ? error.message : String(error)) ?? "Child failed." });
+    await send({ version: CHILD_PROTOCOL_VERSION, kind: "error", errorMessage: boundedDiagnostic(error instanceof Error ? error.message : String(error)) ?? "Child failed." });
     process.exitCode = 1;
   } finally {
     try {

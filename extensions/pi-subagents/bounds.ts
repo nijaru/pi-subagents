@@ -157,6 +157,7 @@ export function boundChildResult(result: ChildResult, maxBytes: number): ChildRe
   // Optional metadata must pay for JSON escaping just like report text.
   addText("errorMessage", result.errorMessage, 512);
   addText("model", result.model, 256);
+  if (result.thinking !== undefined) addCandidate("thinking", result.thinking);
   addCandidate("tools", result.tools);
   addCandidate("cwd", result.cwd);
   addText("output", result.output, MAX_OUTPUT_BYTES);

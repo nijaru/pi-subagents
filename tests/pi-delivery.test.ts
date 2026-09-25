@@ -38,7 +38,7 @@ test.each(["wait", "unread", "batch"])("real Pi delivers completed children once
           }
           if (ids.length !== expectedChildren) throw new Error("Child completion barrier timed out");
           delta = { tool_calls: [mode === "wait"
-            ? call("wait_call", "subagent", { command: "wait", id: ids[0] })
+            ? call("wait_call", "subagent", { command: "wait", ids: [ids[0]] })
             : call("read_call", "read", { path: "fixture.txt" })] };
           finish = "tool_calls";
         } else delta = { content: parentRequests === 3 ? "PARENT_DONE" : "REDUNDANT_NOTICE" };
