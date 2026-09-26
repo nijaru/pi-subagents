@@ -136,6 +136,18 @@ describe("compact child rendering", () => {
     expect(rows.join("")).not.toContain("\x1b[31m");
     expect(() => renderChildCall({ command: {}, prompt: 123, id: [] }, theme).render(40)).not.toThrow();
   });
+  test("timeout notice shows the runtime without repeating the generic cause", () => {
+    const timedOut: ChildResult = { ...child, output: undefined,
+      state: { status: "terminal", outcome: "timed_out", exitCode: 1, finishedAt: 1_800_000 },
+      errorMessage: "Subagent timed out.",
+    };
+    const message = { role: "custom" as const, customType: "subagent-complete", content: "Full report", display: true,
+      timestamp: 0, details: result("wait", [timedOut]).details };
+    expect(renderChildCompletion(message, { expanded: false, outputPad: 1 }, theme)!.render(120).map((line) => line.trim()))
+      .toEqual(["✗ subagent 900c096e timed out · 30m 0s"]);
+    expect(renderChildCompletion(message, { expanded: true, outputPad: 1 }, theme)!.render(120).join("\n"))
+      .toContain("Subagent timed out.");
+  });
   test("completion is a one-line notice with details available on expansion", () => {
     const message = { role: "custom" as const, customType: "subagent-complete", content: "Full model-facing message", display: true, timestamp: 0, details: result("wait").details };
     const before = JSON.stringify(message);

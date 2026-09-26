@@ -93,6 +93,8 @@ function collapsedPreview(child: ChildResult, command: SubagentDetails["command"
   const statusList = !notification && command === "status";
   if (child.state.status === "running" || statusList) return oneLine(child.prompt);
   if (child.state.outcome === "completed") return "";
+  // The timeout heading already says what happened and how long it ran.
+  if (child.state.outcome === "timed_out" && child.errorMessage === "Subagent timed out.") return "";
   return oneLine(clean(child.errorMessage || child.stderr || "", 1024));
 }
 

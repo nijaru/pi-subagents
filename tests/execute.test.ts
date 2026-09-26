@@ -420,7 +420,11 @@ describe("subprocess regressions", () => {
   test("distinguishes deadline expiry from cancellation", async () => {
     const h = host(); fakePi("await delay(10000);");
     process.env.PI_SUBAGENT_TIMEOUT_MS = "100";
-    await expect(h.execute({ command: "run", prompt: "x" })).rejects.toThrow("timed out");
+    const error: Error = await h.execute({ command: "run", prompt: "x" }).then(
+      () => { throw new Error("deadline expiry must fail the join"); }, (cause: Error) => cause);
+    // The adjacent duration carries the runtime; the cause stays unit-free.
+    expect(error.message).toContain("Subagent timed out.");
+    expect(error.message).not.toMatch(/\d+ ?ms\b/);
     expect(first(await h.execute({ command: "status" })).state).toMatchObject({ outcome: "timed_out" });
   });
   test.each([

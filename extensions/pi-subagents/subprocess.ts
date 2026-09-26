@@ -15,6 +15,10 @@ import { processTimeoutMs } from "./limits.ts";
 import { setTimeout as delay } from "node:timers/promises";
 import { childEnvironment } from "./env.ts";
 
+// Result headings already carry elapsed runtime; don't repeat the deadline in
+// machine units in the cause.
+const TIMED_OUT_MESSAGE = "Subagent timed out.";
+
 export const activeChildren = new Set<ChildProcess>();
 
 export interface PiInvocation {
@@ -274,7 +278,7 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
         if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
         // Cancellation/deadline during the cleanup join is still authoritative.
         const termination = timedOut
-          ? { outcome: "timed_out" as const, exitCode: 1, stopReason: "error" as const, errorMessage: `Subagent timed out after ${timeoutMs} ms.` }
+          ? { outcome: "timed_out" as const, exitCode: 1, stopReason: "error" as const, errorMessage: TIMED_OUT_MESSAGE }
           : aborted || signal?.aborted
             ? { outcome: "cancelled" as const, exitCode: 1, stopReason: "aborted" as const, errorMessage: "Subagent aborted." } : {};
         resolve({ ...result, ...termination, stderr: truncateHeadTail(stderr, MAX_STDERR_BYTES), stdout: truncateHeadTail(stdout, MAX_STDERR_BYTES) });
@@ -399,7 +403,7 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
       activeChildren.delete(child);
       const message = error instanceof Error ? error.message : String(error);
       if (timedOut) {
-        finish({ exitCode: 1, stopReason: "error", outcome: "timed_out", errorMessage: `Subagent timed out after ${timeoutMs} ms.`, stderr });
+        finish({ exitCode: 1, stopReason: "error", outcome: "timed_out", errorMessage: TIMED_OUT_MESSAGE, stderr });
       } else if (aborted) {
         finish({ exitCode: 1, stopReason: "aborted", outcome: "cancelled", errorMessage: "Subagent aborted.", stderr });
       } else {
@@ -414,7 +418,7 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
         deliverLine(trailing);
       }
       if (timedOut) {
-        finish({ exitCode: 1, stopReason: "error", outcome: "timed_out", errorMessage: `Subagent timed out after ${timeoutMs} ms.`, stderr });
+        finish({ exitCode: 1, stopReason: "error", outcome: "timed_out", errorMessage: TIMED_OUT_MESSAGE, stderr });
         return;
       }
       if (aborted || signal?.aborted) {
