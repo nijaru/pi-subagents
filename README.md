@@ -99,6 +99,7 @@ Environment variables are allowlisted, with standard model credentials, `$VAR` r
 
 `0.0.x` is pre-release: the tool schema, behavior, and exported `ChildResult` shape are not promised across patch releases. Read this file, not the version number, for what changed.
 
+- **0.0.4**: wait for several children at once and set per-child thinking effort. Children now use Pi's SDK and project-trust policy instead of the CLI runner; completion notices arrive only at active parent-turn boundaries, and child usage is added to parent totals on the next tool result. See the migration sections below for changed arguments and runtime requirements.
 - **0.0.2**: `run` joins within a foreground budget and then continues as background work; `ChildResult` carries `state` instead of `exitCode`/`termination`; prompts travel on stdin instead of a temporary file; a blocking join claims the result it delivers; a crashed or killed parent now stops its children; stderr keeps both ends.
 - **0.0.1**: task-first child lifecycle.
 
