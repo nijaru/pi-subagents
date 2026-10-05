@@ -8,7 +8,7 @@ Delegate a self-contained task to a fresh [Pi](https://github.com/earendil-works
 pi install npm:@nijaru/pi-subagents
 ```
 
-Requires a Node/npm installation of Pi 0.87.x with its SDK files, and Node 22.19+ available to launch children. Standalone Pi binaries are not supported. Restart Pi or use `/reload`. The package registers one tool, `subagent`.
+Requires a Node/npm installation of Pi with its SDK files, and Node 22.19+ available to launch children. The tested API floor remains Pi 0.87.1; the current compatibility gate is Pi 1.0.2. Host-provided peer dependencies use `*` per Pi's package contract, not as a guarantee that every Pi version works. Standalone Pi binaries are not supported. Restart Pi or use `/reload`. The package registers one tool, `subagent`.
 
 ## Usage
 
@@ -136,9 +136,9 @@ bun install --frozen-lockfile
 bun run check
 ```
 
-Pi loads the TypeScript extension directly; there is no build step. The child bootstrap uses the same installation's SDK and TypeScript loader. Checks use pinned Pi 0.87.1 packages and exercise real CLI/RPC parents, SDK children, packed artifacts, project trust, cancellation, and abrupt parent death with local mock providers. No live model calls are needed. The process-tree and death-watchdog tests are POSIX-only and skip on Windows.
+Pi loads the TypeScript extension directly; there is no build step. The child bootstrap uses the same installation's SDK and TypeScript loader. Checks use pinned Pi 1.0.2 packages and exercise real CLI/RPC parents, SDK children, packed artifacts, project trust, cancellation, and abrupt parent death with local mock providers. No live model calls are needed. The process-tree and death-watchdog tests are POSIX-only and skip on Windows.
 
-Pi 0.87 does not publicly export its project-trust resolver. The bootstrap reuses that installation's internal resolver rather than duplicating policy or accepting the SDK's trusted-by-default setting. The pinned version and packed-artifact tests are the compatibility gate for this dependency.
+Pi 1.0.2 does not publicly export its project-trust resolver. The bootstrap reuses that installation's internal resolver rather than duplicating policy or accepting the SDK's trusted-by-default setting. The pinned version and packed-artifact tests are the compatibility gate for this dependency.
 
 The subprocess boundary is kept separate from session ownership so a future native Pi child API can replace it. Upstream's experimental Pico3/micro runtime is not a supported backend; this extension targets the normal coding-agent CLI.
 

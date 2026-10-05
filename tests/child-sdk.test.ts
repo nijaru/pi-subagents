@@ -10,6 +10,7 @@ import { CHILD_PROTOCOL_VERSION, parseChildEvent, type ChildBootstrap, type Chil
 
 let dir: string;
 let packedRunner: string;
+let packedManifest: { peerDependencies: Record<string, string>; dependencies?: Record<string, string> };
 const provider = `
 import { createAssistantMessageEventStream, getCurrentTools } from '@earendil-works/pi-ai';
 import { writeFileSync } from 'node:fs';
@@ -74,6 +75,7 @@ beforeAll(() => {
   const tar = spawnSync("tar", ["-xf", join(dir, archive), "-C", extracted, "--strip-components=1"]);
   if (tar.status !== 0) throw new Error("pack extraction failed");
   packedRunner = join(extracted, "extensions/pi-subagents/child-bootstrap.mjs");
+  packedManifest = JSON.parse(readFileSync(join(extracted, "package.json"), "utf8"));
 });
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
@@ -104,6 +106,14 @@ async function run(overrides: Partial<ChildBootstrap> = {}, packed = false, canc
   const events: ChildEvent[] = wire.trim() ? wire.trim().split("\n").map(parseChildEvent) : [];
   return { code, events, stdout: await stdout, stderr: await stderr, wire };
 }
+
+test("packed manifest declares host packages as wildcard peers, not runtime dependencies", () => {
+  for (const name of ["@earendil-works/pi-ai", "@earendil-works/pi-coding-agent", "@earendil-works/pi-tui", "typebox"]) {
+    expect(packedManifest.peerDependencies[name]).toBe("*");
+    expect(packedManifest.dependencies?.[name]).toBeUndefined();
+  }
+  expect(packedManifest.dependencies?.["@earendil-works/pi-agent-core"]).toBeUndefined();
+});
 
 test.each([false, true])("real SDK and packed SDK runner keep prompts literal and diagnostics separate (packed=%s)", async (packed) => {
   const result = await run({}, packed);
