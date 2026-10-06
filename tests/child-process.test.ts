@@ -1,10 +1,11 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, symlinkSync, chmodSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { SubprocessChildSupervisor } from "../extensions/pi-subagents/supervisor.ts";
 import { emptyUsage, type ChildResult } from "../extensions/pi-subagents/types.ts";
+import { getChildInvocation } from "../extensions/pi-subagents/subprocess.ts";
 
 async function fixture(script: string, callback: (result: ChildResult, supervisor: SubprocessChildSupervisor) => Promise<void>) {
   const dir = mkdtempSync(join(tmpdir(), "child-protocol-process-"));
@@ -29,14 +30,14 @@ async function fixture(script: string, callback: (result: ChildResult, superviso
   }
 }
 
-test("hard parent death kills a real protocol child through the detached watchdog", async () => {
-  if (process.platform === "win32") return;
+test.skipIf(process.platform === "win32")("hard parent death kills a real protocol child even without shell utilities on PATH", async () => {
   await fixture(`writeFileSync('pid',String(process.pid)); setInterval(()=>{},1000);`, async (result) => {
     const source = resolve(import.meta.dir, "../extensions/pi-subagents/supervisor.ts");
     const entry = join(result.cwd, "parent.ts");
     writeFileSync(entry, `import { SubprocessChildSupervisor } from ${JSON.stringify(source)};
       await new SubprocessChildSupervisor().run({result:${JSON.stringify(result)},signal:new AbortController().signal});`);
-    const parent = spawn(process.execPath, [entry], { cwd: result.cwd, env: process.env, stdio: "ignore" });
+    symlinkSync(getChildInvocation().command, join(result.cwd, "node"));
+    const parent = spawn(process.execPath, [entry], { cwd: result.cwd, env: { ...process.env, PATH: result.cwd }, stdio: "ignore" });
     let pid: number | undefined;
     try {
       const deadline = Date.now() + 5000;
@@ -56,6 +57,36 @@ test("hard parent death kills a real protocol child through the detached watchdo
     }
   });
 }, 15000);
+
+test.each(["empty error", "duplicate result"])("terminal protocol frames cannot be overwritten: %s", async (scenario) => {
+  const report = { output: "answer", stopReason: "stop", outputTruncation: { truncated: false, originalBytes: 6, retainedBytes: 6 } };
+  const resultFrame = `send(${JSON.stringify({ kind: "result", report, usage: emptyUsage() })});`;
+  await fixture((scenario === "empty error" ? `send({kind:"error",errorMessage:""});` : resultFrame) + resultFrame, async (result, supervisor) => {
+    expect((await supervisor.run({ result, signal: new AbortController().signal })).outcome).toBe("failed");
+  });
+});
+
+test.skipIf(process.platform === "win32")("watchdog startup failure stops the child before releasing the task", async () => {
+  await fixture(`writeFileSync('task-received','yes');`, async (result, supervisor) => {
+    const node = getChildInvocation().command;
+    const wrapper = join(result.cwd, "node");
+    writeFileSync(wrapper, `#!${node}
+import {spawn} from 'node:child_process';
+if(process.argv[2].endsWith('death-watchdog.mjs')) process.exit(1);
+const child=spawn(${JSON.stringify(node)},process.argv.slice(2),{stdio:'inherit'});
+child.on('exit',code=>process.exit(code??1));
+`);
+    chmodSync(wrapper, 0o755);
+    const path = process.env.PATH;
+    process.env.PATH = result.cwd;
+    try {
+      const outcome = await supervisor.run({ result, signal: new AbortController().signal });
+      expect(outcome.outcome).toBe("failed");
+      expect(outcome.errorMessage).toContain("watchdog failed");
+      expect(existsSync(join(result.cwd, "task-received"))).toBe(false);
+    } finally { process.env.PATH = path; }
+  });
+});
 
 const failure = `send({kind:'error',errorMessage:'earlier assistant failure'}); setInterval(()=>{},1000);`;
 test("process timeout outranks earlier protocol error", async () => {
@@ -82,8 +113,7 @@ test("oversized protocol frame fails closed while stdout JSON stays diagnostic",
     expect(result.stdout).toContain("stdout spoof");
   });
 });
-test("normal leader exit sweeps surviving descendants before returning", async () => {
-  if (process.platform === "win32") return;
+test.skipIf(process.platform === "win32")("normal leader exit sweeps surviving descendants before returning", async () => {
   await fixture(`const child=spawn('sh',['-c','sleep 30'],{stdio:'ignore'});
     writeFileSync('pid',String(child.pid)); child.unref();`, async (result, supervisor) => {
     await supervisor.run({ result, signal: new AbortController().signal });

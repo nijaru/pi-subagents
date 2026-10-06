@@ -19,8 +19,6 @@ import { childEnvironment } from "./env.ts";
 // machine units in the cause.
 const TIMED_OUT_MESSAGE = "Subagent timed out.";
 
-export const activeChildren = new Set<ChildProcess>();
-
 export interface PiInvocation {
   command: string;
   args: string[];
@@ -152,7 +150,7 @@ export function terminateProcessGroup(child: ChildProcess, signal: NodeJS.Signal
 }
 
 /**
- * Spawn a detached watchdog that holds the parent's end of a private pipe.
+ * Spawn a detached watchdog connected to a parent-owned private pipe.
  *
  * The pipe closes however the parent dies, including SIGKILL, and the watchdog
  * then terminates the child's process group. That is the only way a hard parent
@@ -160,28 +158,40 @@ export function terminateProcessGroup(child: ChildProcess, signal: NodeJS.Signal
  * SIGKILL. Windows needs a native job object for the same effect, so it keeps
  * the graceful-shutdown-only guarantee.
  */
-export function spawnDeathWatchdog(child: ChildProcess): ChildProcess | undefined {
+export async function spawnDeathWatchdog(child: ChildProcess, command: string): Promise<ChildProcess | undefined> {
   if (process.platform === "win32" || !child.pid) return undefined;
-  const script = [
-    "cat >/dev/null",
-    'kill -s TERM -- "-$1" 2>/dev/null',
-    "i=0",
-    'while kill -s 0 -- "-$1" 2>/dev/null && [ "$i" -lt 25 ]; do sleep 0.2; i=$((i+1)); done',
-    'kill -s KILL -- "-$1" 2>/dev/null',
-  ].join("; ");
+  const watchdog = spawn(command, [fileURLToPath(new URL("./death-watchdog.mjs", import.meta.url)), String(child.pid)], {
+    stdio: ["pipe", "pipe", "ignore"], detached: true, env: {},
+  });
+  watchdog.stdin?.on("error", () => {});
   try {
-    const watchdog = spawn("sh", ["-c", script, "sh", String(child.pid)], {
-      stdio: ["pipe", "ignore", "ignore"],
-      // Survive a parent that is killed together with its process group.
-      detached: true,
+    await new Promise<void>((resolve, reject) => {
+      let ready = "";
+      const timer = setTimeout(() => reject(new Error("Watchdog readiness timed out.")), 5000);
+      const fail = () => reject(new Error("Watchdog exited before readiness."));
+      watchdog.once("error", reject);
+      watchdog.once("exit", fail);
+      watchdog.stdout!.on("data", (chunk) => {
+        ready += chunk.toString();
+        if (ready.length > 16) reject(new Error("Invalid watchdog readiness."));
+      });
+      watchdog.stdout!.once("end", () => ready === "ready\n" ? resolve() : fail());
+      watchdog.stdout!.once("error", reject);
+      // Detach the startup listeners and timer on either outcome.
+      const cleanup = () => { clearTimeout(timer); watchdog.off("error", reject); watchdog.off("exit", fail); };
+      watchdog.stdout!.once("end", cleanup);
+      watchdog.once("error", cleanup);
+      watchdog.once("exit", cleanup);
     });
     watchdog.on("error", () => {});
-    watchdog.stdin?.on("error", () => {});
+    watchdog.stdout?.destroy();
     // Cleanup alone must never keep the parent's event loop alive.
     watchdog.unref();
     return watchdog;
-  } catch {
-    return undefined;
+  } catch (error) {
+    watchdog.stdin?.end();
+    watchdog.kill("SIGKILL");
+    throw error;
   }
 }
 
@@ -253,8 +263,9 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
     let killTimer: ReturnType<typeof setTimeout> | undefined;
     let processTimer: ReturnType<typeof setTimeout> | undefined;
     let timedOut = false;
-    let eventError: string | undefined;
+    let processFailure: string | undefined;
     let watchdog: ChildProcess | undefined;
+    let watchdogSetup: Promise<void> | undefined;
     const decoder = new StringDecoder("utf8");
     let abortHandler: (() => void) | undefined;
 
@@ -267,11 +278,13 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
       void (async () => {
         // A background run must not release mutation ownership while a
         // descendant from its detached root group can still be alive.
+        await watchdogSetup;
+        watchdog?.stdin?.end();
         if (rootSweepPromise) await rootSweepPromise;
         // A leader can close before the escalation timer fires while a
         // descendant ignores SIGTERM and does not hold an inherited pipe open.
         // Force the retained tree snapshot before dropping the timer.
-        if (aborted || timedOut || eventError) terminateProcessTree(child, "SIGKILL");
+        if (aborted || timedOut || processFailure) terminateProcessTree(child, "SIGKILL");
         settled = true;
         if (killTimer) clearTimeout(killTimer);
         if (processTimer) clearTimeout(processTimer);
@@ -280,7 +293,8 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
         const termination = timedOut
           ? { outcome: "timed_out" as const, exitCode: 1, stopReason: "error" as const, errorMessage: TIMED_OUT_MESSAGE }
           : aborted || signal?.aborted
-            ? { outcome: "cancelled" as const, exitCode: 1, stopReason: "aborted" as const, errorMessage: "Subagent aborted." } : {};
+            ? { outcome: "cancelled" as const, exitCode: 1, stopReason: "aborted" as const, errorMessage: "Subagent aborted." }
+            : processFailure ? { outcome: "failed" as const, exitCode: 1, stopReason: "error" as const, errorMessage: processFailure } : {};
         resolve({ ...result, ...termination, stderr: truncateHeadTail(stderr, MAX_STDERR_BYTES), stdout: truncateHeadTail(stdout, MAX_STDERR_BYTES) });
       })();
     };
@@ -296,7 +310,6 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
         // The task travels on stdin, so no temporary prompt file can leak.
         stdio: ["pipe", "pipe", "pipe", "pipe"],
       });
-      activeChildren.add(child);
       let rootGroupSwept = false;
       const sweepRoot = () => {
         if (rootGroupSwept) return;
@@ -308,41 +321,30 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
       // cannot defer cleanup until the hard timeout.
       child.once("exit", sweepRoot);
       child.once("close", sweepRoot);
-      watchdog = spawnDeathWatchdog(child);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       finish({ exitCode: 1, stopReason: "error", outcome: "failed", errorMessage: message, stderr });
       return;
     }
 
-    const stopForAbort = () => {
-      if (settled) return;
-      aborted = true;
+    const stopTree = () => {
+      if (settled || killTimer) return;
       terminateProcessTree(child, "SIGTERM");
       killTimer = setTimeout(() => {
         if (!settled) terminateProcessTree(child, "SIGKILL");
       }, 5000);
     };
-    const stopForTimeout = () => {
-      if (settled) return;
-      timedOut = true;
-      terminateProcessTree(child, "SIGTERM");
-      killTimer = setTimeout(() => {
-        if (!settled) terminateProcessTree(child, "SIGKILL");
-      }, 5000);
-    };
+    const stopForAbort = () => { if (!settled) { aborted = true; stopTree(); } };
+    const stopForTimeout = () => { if (!settled) { timedOut = true; stopTree(); } };
     processTimer = setTimeout(stopForTimeout, timeoutMs);
     const deliverLine = (line: string, oversized = false) => {
-      if (settled || eventError) return;
+      if (settled || processFailure) return;
       try {
         if (oversized) throw new Error("Oversized child protocol frame.");
         onEvent(parseChildEvent(line));
       } catch (error) {
-        eventError = error instanceof Error ? error.message : String(error);
-        terminateProcessTree(child, "SIGTERM");
-        killTimer = setTimeout(() => {
-          if (!settled) terminateProcessTree(child, "SIGKILL");
-        }, 5000);
+        processFailure = `Subagent event handling failed: ${error instanceof Error ? error.message : String(error)}`;
+        stopTree();
       }
     };
     abortHandler = stopForAbort;
@@ -351,7 +353,20 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
     // The child may exit before it drains the prompt; an EPIPE here is already
     // reflected by the close/exit handling below.
     child.stdin?.on("error", () => {});
-    child.stdin?.end(JSON.stringify(bootstrap));
+    watchdogSetup = spawnDeathWatchdog(child, invocation.command).then((process) => {
+      watchdog = process;
+      watchdog?.once("exit", () => {
+        if (!finishing && child.exitCode === null && child.signalCode === null) {
+          processFailure = "Subagent watchdog exited unexpectedly.";
+          stopTree();
+        }
+      });
+      if (finishing || aborted || timedOut || processFailure) watchdog?.stdin?.end();
+      else child.stdin?.end(JSON.stringify(bootstrap));
+    }).catch((error) => {
+      processFailure = `Subagent watchdog failed: ${error instanceof Error ? error.message : String(error)}`;
+      stopTree();
+    });
 
     const consumeProtocolText = (text: string) => {
       let cursor = 0;
@@ -400,33 +415,16 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
       stderr = capStderr(stderr, typeof chunk === "string" ? chunk : chunk.toString("utf8"));
     });
     child.on("error", (error) => {
-      activeChildren.delete(child);
-      const message = error instanceof Error ? error.message : String(error);
-      if (timedOut) {
-        finish({ exitCode: 1, stopReason: "error", outcome: "timed_out", errorMessage: TIMED_OUT_MESSAGE, stderr });
-      } else if (aborted) {
-        finish({ exitCode: 1, stopReason: "aborted", outcome: "cancelled", errorMessage: "Subagent aborted.", stderr });
-      } else {
-        finish({ exitCode: 1, stopReason: "error", outcome: "failed", errorMessage: eventError ? `Subagent event handling failed: ${eventError}` : message, stderr });
-      }
+      finish({ exitCode: 1, stopReason: "error", outcome: "failed", errorMessage: processFailure ?? error.message, stderr });
     });
     child.on("close", (code) => {
-      activeChildren.delete(child);
       const finalText = decoder.end();
       if (finalText && !discardingLine) consumeProtocolText(finalText);
       if (trailing.trim() && !discardingLine && Buffer.byteLength(trailing, "utf8") <= MAX_PROTOCOL_LINE_BYTES) {
         deliverLine(trailing);
       }
-      if (timedOut) {
-        finish({ exitCode: 1, stopReason: "error", outcome: "timed_out", errorMessage: TIMED_OUT_MESSAGE, stderr });
-        return;
-      }
-      if (aborted || signal?.aborted) {
-        finish({ exitCode: code ?? 1, stopReason: "aborted", outcome: "cancelled", errorMessage: "Subagent aborted.", stderr });
-        return;
-      }
-      if (eventError) {
-        finish({ exitCode: 1, stopReason: "error", outcome: "failed", errorMessage: `Subagent event handling failed: ${eventError}`, stderr });
+      if (processFailure) {
+        finish({ exitCode: 1, stopReason: "error", outcome: "failed", errorMessage: processFailure, stderr });
         return;
       }
       const exitCode = code ?? 1;

@@ -21,7 +21,7 @@ function controlled() {
   const ctx: any = { sessionManager: { getBranch: () => entries }, ui: { setStatus: (_key: string, value: string | undefined) => statuses.push(value) } };
   delivery = new CompletionDelivery(children);
   delivery.bind(ctx);
-  const start = () => children.start({ prompt: "inspect", tools: [], cwd: process.cwd(), notify: true });
+  const start = () => children.start({ prompt: "inspect", tools: [], cwd: process.cwd() });
   const boundary = (outcome = "completed", drafts: any[] = []) => delivery.boundary({ type: "turn_end", entries: drafts, outcome } as any, ctx);
   const commit = (result: ReturnType<typeof boundary>) => {
     entries.push(...(result?.entries ?? []));

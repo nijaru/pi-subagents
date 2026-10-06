@@ -10,12 +10,13 @@ const jiti = createJiti(import.meta.url, {
 });
 try {
   const { runChild } = await jiti.import(new URL("./child-runner.ts", import.meta.url).href);
-  // Pi 0.87 does not export its trust resolver from the public SDK. Use the
-  // selected installation's canonical policy rather than duplicating it or
-  // accepting the SDK's default projectTrusted=true. Package tests gate this
-  // pinned internal dependency until upstream exposes the resolver publicly.
+  // These are not public SDK exports. Reuse the selected installation's CLI
+  // built-ins and canonical trust policy instead of maintaining copies or
+  // accepting the SDK's default projectTrusted=true. Package tests gate both
+  // internal dependencies until upstream exposes them publicly.
   const { resolveProjectTrusted } = await import(new URL("./core/project-trust.js", pathToFileURL(sdkPath)));
-  await runChild(resolveProjectTrusted);
+  const { builtInExtensions } = await import(new URL("./extensions/index.js", pathToFileURL(sdkPath)));
+  await runChild(resolveProjectTrusted, builtInExtensions);
 } catch (error) {
   console.error(error);
   process.exitCode = 1;

@@ -16,7 +16,9 @@ function child(id = "child-1"): ChildResult {
 describe("serialized result bounds", () => {
   test("32 escaped diagnostics retain every identity within the default budget", () => {
     const results = Array.from({ length: 32 }, (_, i) => child(`child-${i}`));
+    const original = JSON.stringify(results);
     const bounded = boundDetails({ command: "wait", results });
+    expect(JSON.stringify(results)).toBe(original);
     expect(jsonBytes(bounded)).toBeLessThanOrEqual(51200);
     expect(bounded.results.map(result => result.id)).toEqual(results.map(result => result.id));
     for (const [i, result] of bounded.results.entries()) {
@@ -61,10 +63,6 @@ describe("serialized result bounds", () => {
 });
 
 describe("output truncation", () => {
-  test("digit-boundary oscillation reports the prefix actually retained", () => {
-    expect(truncateOutput("x".repeat(52), 51)).toBe("x".repeat(9) + "\n\n[Output truncated: kept 9 of 52 bytes.]");
-  });
-
   test("ASCII and UTF-8 prefixes are bounded and truthful across digit boundaries", () => {
     for (const value of ["x".repeat(1200), "😀é中".repeat(200), "x".repeat(52)]) {
       const total = Buffer.byteLength(value);

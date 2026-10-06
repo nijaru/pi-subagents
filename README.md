@@ -8,7 +8,7 @@ Delegate a self-contained task to a fresh [Pi](https://github.com/earendil-works
 pi install npm:@nijaru/pi-subagents
 ```
 
-Requires a Node/npm installation of Pi with its SDK files, and Node 22.19+ available to launch children. The tested API floor remains Pi 0.87.1; the current compatibility gate is Pi 1.0.2. Host-provided peer dependencies use `*` per Pi's package contract, not as a guarantee that every Pi version works. Standalone Pi binaries are not supported. Restart Pi or use `/reload`. The package registers one tool, `subagent`.
+Requires a Node/npm installation of Pi 1.0.4 or newer with its SDK files, and Node 22.19+ available to launch children. The current compatibility gate is Pi 1.0.4. Host-provided peer dependencies use `*` per Pi's package contract, not as a guarantee that every Pi version works. Standalone Pi binaries are not supported. Restart Pi or use `/reload`. The package registers one tool, `subagent`.
 
 ## Usage
 
@@ -27,7 +27,7 @@ Ask Pi to delegate a specific task, or use these tool-call shapes:
 {"command":"stop","id":"<child-id>"}
 ```
 
-Unread background results arrive at the next successful active-turn boundary. Results ready together share one completion message and continuation. **Completions never wake an idle parent.** Results finishing after the last boundary, or during parent errors or cancellation, remain unread until another natural turn or an explicit `wait`. The TUI status indicator shows the unread count. This avoids undoing a late abort that Pi 0.87 cannot expose to extensions.
+Unread background results arrive at the next successful active-turn boundary. Results ready together share one completion message and continuation. **Completions never wake an idle parent.** Results finishing after the last boundary, or during parent errors or cancellation, remain unread until another natural turn or an explicit `wait`. The TUI status indicator shows the unread count. This avoids undoing a late idle abort that Pi does not expose to extensions.
 
 Spawn independent tasks before waiting. Calls can execute in parallel when Pi's tool scheduling permits it; one foreground child no longer forces sibling tool calls to run sequentially.
 
@@ -45,7 +45,7 @@ The TUI hides agent-facing text — delegated prompts and child reports — behi
 
 Child usage includes assistant calls and usage reported by child tools. After cleanup finishes, each child's usage is added once to the next parent tool result, including failed results. Repeated `status`, `wait`, or `stop` calls do not charge it again. Pi includes this usage in its footer, `/session`, and RPC totals.
 
-Pi 0.87 cannot attach usage to a custom completion message. Background costs therefore enter native totals only when another parent tool finishes; until then, they remain visible in the child details. Quit, reload, or session replacement discards any unreported usage, including usage from children stopped during shutdown. No extra tool call or model turn is created just to report costs.
+Pi cannot attach usage to a custom completion message. Background costs therefore enter native totals only when another parent tool finishes; until then, they remain visible in the child details. Quit, reload, or session replacement discards any unreported usage, including usage from children stopped during shutdown. No extra tool call or model turn is created just to report costs.
 
 ### Tools and context
 
@@ -57,7 +57,7 @@ Pi 0.87 cannot attach usage to a custom completion message. Background costs the
 - `cwd` defaults to the parent cwd; relative paths resolve against it.
 - Every child starts a new conversation. The prompt should include scope, relevant evidence, constraints, expected output, and verification. Parent conversation history is not copied.
 
-The subprocess loads its own Pi configuration, extensions, skills, and applicable `AGENTS.md` files. **Fresh context does not mean an empty system prompt.** Runtime-only tools, providers, credentials, and permission-hook state are not cloned from the parent; required integrations must also be configured in child Pi. Before submitting the task, the child verifies the requested model and tools against its own loaded integrations. An unavailable tool or model fails startup instead of silently reducing the child's capabilities. Project resources follow Pi's noninteractive trust policy, including saved decisions and global `project_trust` hooks; parent-only trust decisions are not copied.
+The subprocess loads its own Pi configuration, CLI built-in extensions (including codemode, tool search, and MCP), configured extensions, skills, and applicable `AGENTS.md` files. **Fresh context does not mean an empty system prompt.** Runtime-only tools, providers, credentials, and permission-hook state are not cloned from the parent; required integrations must also be configured in child Pi. Before submitting the task, the child verifies the requested model and tools against its own loaded integrations. An unavailable tool or model fails startup instead of silently reducing the child's capabilities. Explicit MCP tool names get up to ten seconds to register before startup fails. The tool allowlist also restricts nested calls: selecting `codemode` alone does not grant access to omitted MCP tools. Project resources follow Pi's noninteractive trust policy, including saved decisions and global `project_trust` hooks; parent-only trust decisions are not copied.
 
 `tools` filters tool names, not extension code: child Pi still loads its configured extensions, so unrelated extension behavior (commands, hooks, providers) keeps running even when its tools are excluded. Use `tools: []` to give the model no tools; that is not a sandbox.
 
@@ -85,7 +85,7 @@ All children use one packaged SDK runner in a detached Node subprocess, with an 
 
 Normal completion and cancellation sweep the child's process group before releasing the concurrency slot. Graceful cancellation runs child extension shutdown hooks; hung cleanup is subject to the same forced process-tree termination. No profiles, workflow scheduler, recursive delegation, session persistence, or managed worktree creation is included.
 
-A successful child must produce terminal assistant output. Failures, cancellation, timeouts, and token-limit termination (`incomplete`) remain distinguishable in retained status. Process cancellation and deadlines take precedence over earlier assistant errors. `run` and `wait` throw tool errors for failed or incomplete children; a mixed wait still includes its successful reports and running children. Failure causes precede partial output so report truncation cannot hide the reason. `status` remains available to inspect retained state. `stop` reports the resulting state without treating requested cancellation as a tool failure.
+A successful child must produce terminal assistant output. Failures, cancellation, timeouts, and token-limit termination (`incomplete`) remain distinguishable in retained status. Process cancellation and deadlines take precedence over earlier assistant errors. `run` and `wait` return native tool errors with retained details for failed or incomplete children; a mixed wait still includes its successful reports and running children. Failure causes precede partial output so report truncation cannot hide the reason. `status` remains available to inspect retained state. `stop` reports the resulting state without treating requested cancellation as a tool failure.
 
 Reports remain bounded rather than spilling to disk. `outputTruncation` records whether text was shortened and its original/retained UTF-8 byte counts; expansion also shows this in the TUI. A completion excerpt can point to a longer retained report, but text beyond the retention limit is not recoverable.
 
@@ -102,6 +102,13 @@ Environment variables are allowlisted, with standard model credentials, `$VAR` r
 - **0.0.4**: wait for several children at once and set per-child thinking effort. Children now use Pi's SDK and project-trust policy instead of the CLI runner; completion notices arrive only at active parent-turn boundaries, and child usage is added to parent totals on the next tool result. See the migration sections below for changed arguments and runtime requirements.
 - **0.0.2**: `run` joins within a foreground budget and then continues as background work; `ChildResult` carries `state` instead of `exitCode`/`termination`; prompts travel on stdin instead of a temporary file; a blocking join claims the result it delivers; a crashed or killed parent now stops its children; stderr keeps both ends.
 - **0.0.1**: task-first child lifecycle.
+
+## Migration to Pi 1.0.4
+
+- Pi 1.0.4 is now the minimum supported host. Earlier SDK versions are no longer supported.
+- Children load the selected installation's CLI built-ins, respecting disabled or replacement extensions. You no longer need a separate extension to supply codemode or MCP to SDK children.
+- `tools` remains an exact list, not Pi CLI wildcard patterns. Include every tool the child may call, including through codemode; omitted MCP tools are no longer implicitly callable.
+- Direct callers of the extension's `execute()` receive `{ isError: true, content, details }` for failed child reports rather than a rejected promise. Invalid requests and cancelled waits still throw. Pi presents both as native tool errors.
 
 ## Migration from single-child waits
 
@@ -136,9 +143,9 @@ bun install --frozen-lockfile
 bun run check
 ```
 
-Pi loads the TypeScript extension directly; there is no build step. The child bootstrap uses the same installation's SDK and TypeScript loader. Checks use pinned Pi 1.0.2 packages and exercise real CLI/RPC parents, SDK children, packed artifacts, project trust, cancellation, and abrupt parent death with local mock providers. No live model calls are needed. The process-tree and death-watchdog tests are POSIX-only and skip on Windows.
+Pi loads the TypeScript extension directly; there is no build step. The child bootstrap uses the same installation's SDK and TypeScript loader. Checks use pinned Pi 1.0.4 packages and exercise real CLI/RPC parents, SDK children, packed artifacts, project trust, cancellation, and abrupt parent death with local mock providers. No live model calls are needed. The process-tree and death-watchdog tests are POSIX-only and skip on Windows.
 
-Pi 1.0.2 does not publicly export its project-trust resolver. The bootstrap reuses that installation's internal resolver rather than duplicating policy or accepting the SDK's trusted-by-default setting. The pinned version and packed-artifact tests are the compatibility gate for this dependency.
+Pi 1.0.4 does not publicly export its project-trust resolver or CLI built-in extension registry. The bootstrap reuses the selected installation's internal implementations rather than duplicating discovery or trust policy. The pinned version and packed-artifact tests gate both dependencies.
 
 The subprocess boundary is kept separate from session ownership so a future native Pi child API can replace it. Upstream's experimental Pico3/micro runtime is not a supported backend; this extension targets the normal coding-agent CLI.
 

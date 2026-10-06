@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { emptyUsage } from "../extensions/pi-subagents/types.ts";
-import { truncateHeadTail, truncateOutput } from "../extensions/pi-subagents/bounds.ts";
+import { truncateHeadTail } from "../extensions/pi-subagents/bounds.ts";
 import { stripTerminalControls } from "../extensions/pi-subagents/render.ts";
 import { executable, getChildInvocation, spawnDeathWatchdog } from "../extensions/pi-subagents/subprocess.ts";
 import { assistantReport, parseChildEvent } from "../extensions/pi-subagents/child-protocol.ts";
@@ -29,6 +29,12 @@ describe("compact child protocol", () => {
   test("rejects legacy, malformed, wrong-version and oversized frames", () => {
     for (const line of ["warning", "{}", '{"version":1}', '{"version":2,"kind":"result"}', '{"version":2,"kind":"ready","model":"a/b","tools":[]}', "x".repeat(2_000_000)]) {
       expect(() => parseChildEvent(line)).toThrow();
+    }
+  });
+  test("usage frames reject negative tokens and costs", () => {
+    for (const usage of [{ ...emptyUsage(), input: -17 }, { ...emptyUsage(), cost: { ...emptyUsage().cost, total: -5 } }, { ...emptyUsage(), cacheWrite1h: -1 }]) {
+      expect(() => parseChildEvent(JSON.stringify({ version: 2, kind: "usage", usage }))).toThrow("Malformed");
+      expect(() => parseChildEvent(JSON.stringify({ version: 2, kind: "result", report: assistantReport(assistant), usage }))).toThrow("Malformed");
     }
   });
   test("bounded UTF-8 output has explicit truncation metadata", () => {
@@ -81,16 +87,12 @@ describe("deterministic truncation", () => {
     expect(bounded).toContain("truncated");
     expect(truncateHeadTail("short", 8192)).toBe("short");
   });
-  test("is deterministic and byte-safe", () => {
-    expect(truncateOutput("small", 20)).toBe("small");
+  test("head+tail truncation does not split Unicode at either end", () => {
+    const value = "😀漢字".repeat(100);
     for (const limit of [5, 8, 18, 19, 20, 30, 40, 42, 43, 80]) {
-      for (const truncate of [truncateOutput, truncateHeadTail]) {
-        const value = "😀漢字".repeat(100);
-        const output = truncate(value, limit);
-        expect(output).toBe(truncate(value, limit));
-        expect(Buffer.byteLength(output)).toBeLessThanOrEqual(limit);
-        expect(output).not.toContain("�");
-      }
+      const output = truncateHeadTail(value, limit);
+      expect(Buffer.byteLength(output)).toBeLessThanOrEqual(limit);
+      expect(output).not.toContain("�");
     }
   });
 });
@@ -116,11 +118,10 @@ function groupAlive(pid: number): boolean {
 }
 
 describe("parent-death supervision", () => {
-  test("watchdog leaves a live parent's child group alone until pipe closes", async () => {
-    if (process.platform === "win32") return;
+  test.skipIf(process.platform === "win32")("watchdog leaves a live parent's child group alone until pipe closes", async () => {
     const victim = spawn("sh", ["-c", "sleep 30"], { detached: true, stdio: "ignore" });
     const pid = victim.pid!;
-    const watchdog = spawnDeathWatchdog(victim);
+    const watchdog = await spawnDeathWatchdog(victim, getChildInvocation().command);
     expect(watchdog).toBeDefined();
     try {
       await Bun.sleep(300);

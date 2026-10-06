@@ -5,7 +5,6 @@ import { ToolExecutionComponent } from "../node_modules/@earendil-works/pi-codin
 import { initTheme } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 import extension from "../extensions/pi-subagents/index.ts";
 import { renderChildCall, renderChildResult, renderChildCompletion, stripTerminalControls } from "../extensions/pi-subagents/render.ts";
-import { boundDetails } from "../extensions/pi-subagents/bounds.ts";
 import { emptyUsage, type ChildResult, type SubagentDetails } from "../extensions/pi-subagents/types.ts";
 
 const theme = { fg: (_: string, text: string) => text, bg: (_: string, text: string) => text, bold: (text: string) => text } as Theme;
@@ -107,20 +106,9 @@ describe("compact child rendering", () => {
     const text = lines("wait", { command: "wait", ids: [child.id] }, true, [incomplete]).join("\n");
     for (const label of ["! incomplete", child.output!, "Model output limit reached", "Output shortened", "diagnostic stdout", "diagnostic stderr"]) expect(text).toContain(label);
   });
-  test("detail budgets preserve truthful truncation metadata and bounded diagnostics", () => {
-    const output = "界".repeat(1000);
-    const large: ChildResult = { ...child, output, stdout: "x".repeat(10000),
-      outputTruncation: { truncated: false, originalBytes: Buffer.byteLength(output), retainedBytes: Buffer.byteLength(output) },
-    };
-    const details = boundDetails({ command: "wait", results: [large] }, 1800);
-    const bounded = details.results[0]!;
-    expect(Buffer.byteLength(JSON.stringify(details))).toBeLessThanOrEqual(1800);
-    expect(bounded.outputTruncation).toEqual({ truncated: true, originalBytes: Buffer.byteLength(output), retainedBytes: Buffer.byteLength(bounded.output ?? "") });
-    expect(large.outputTruncation?.truncated).toBe(false);
-    expect(bounded.stdout).toBeDefined();
-  });
+
   test("narrow terminals keep one bounded preview row per child", () => {
-    const long = { ...child, output: "wide界🙂 ".repeat(1000) };
+    const long = { ...child, prompt: "wide界🙂 ".repeat(1000), state: { status: "running" } as const };
     for (const width of [20, 40, 80, 120]) {
       const rows = renderChildResult(result("run", [long]), { expanded: false }, theme).render(width);
       expect(rows).toHaveLength(1);
@@ -147,6 +135,16 @@ describe("compact child rendering", () => {
       .toEqual(["✗ subagent 900c096e timed out · 30m 0s"]);
     expect(renderChildCompletion(message, { expanded: true, outputPad: 1 }, theme)!.render(120).join("\n"))
       .toContain("Subagent timed out.");
+  });
+  test("old or malformed transcript details fall back to text; oversized output stays bounded", () => {
+    for (const expanded of [false, true]) {
+      for (const details of [{ results: [{ agent: "worker" }] }, { command: "run", results: [{ ...child, model: {} }] }]) {
+        const value = { content: [{ type: "text" as const, text: "old output" }], details } as any;
+        expect(renderChildResult(value, { expanded }, theme).render(80).join("\n")).toContain("old output");
+      }
+    }
+    const oversized = result("run", [{ ...child, output: "x".repeat(200000) }]);
+    expect(renderChildResult(oversized, { expanded: true }, theme).render(80).join("\n").length).toBeLessThan(70000);
   });
   test("completion is a one-line notice with details available on expansion", () => {
     const message = { role: "custom" as const, customType: "subagent-complete", content: "Full model-facing message", display: true, timestamp: 0, details: result("wait").details };

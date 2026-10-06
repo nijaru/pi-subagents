@@ -5,7 +5,7 @@ description: Use when delegating a self-contained task to a fresh Pi child, choo
 
 # Pi Subagents
 
-Use one child for one concrete task. Keep routine or tightly coupled work local. A child is useful when independent execution or context separation outweighs the handoff cost.
+Requires a Node/npm Pi 1.0.4+ installation with its SDK and Node 22.19+. Use one child for one concrete task. Keep routine or tightly coupled work local. A child is useful when independent execution or context separation outweighs the handoff cost.
 
 ## Choose the lifecycle
 
@@ -26,7 +26,7 @@ The prompt must carry the relevant evidence, decisions, scope, constraints, expe
 
 Omitted `tools` selects active parent coding and known research tools. Use an explicit list to narrow access, or `tools: []` for reasoning-only work. Research extensions must be installed in child Pi too; parent runtime-only tools and providers are not copied. `model` must be an exact `provider/model-id` and overrides the inherited parent model. Optional `thinking` selects a supported Pi effort. Omitted effort inherits the parent level for the same model; a different model uses its Pi defaults. Set both for a deliberate model/effort combination. Unsupported explicit effort fails before prompting; reports show the effective startup level. Child startup fails if that model or any requested tool is unavailable in the child's own configuration. Do not retry the same unavailable capability unchanged.
 
-Tools must be active in the parent. `subagent` itself is forbidden: children are leaves. These are access controls, not a sandbox or a transfer of parent permission-hook state. The child loads its own Pi extensions regardless of the tool allowlist, so extension code beyond provider tools still runs in it.
+Tools must be active in the parent and listed by exact name, not wildcard patterns. Children load the selected Pi installation's CLI built-ins, including codemode and MCP, unless disabled or replaced in their own settings. Selecting codemode does not grant omitted tools; include every tool it may call. Explicit MCP tools get up to ten seconds to register before startup fails. `subagent` itself is forbidden: children are leaves. These are access controls, not a sandbox or a transfer of parent permission-hook state. The child loads its own Pi extensions regardless of the tool allowlist, so extension code beyond provider tools still runs in it.
 
 Give concurrent writers distinct worktrees through `cwd`. Children are separate processes sharing one working tree; the extension does not arbitrate write ownership and cannot prevent overlap with parent edits. Do not duplicate the delegated assignment. Inspect returned evidence or patches and own integration and final verification in the parent.
 

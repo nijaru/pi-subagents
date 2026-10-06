@@ -116,12 +116,13 @@ export function isOutputTruncation(value: unknown): value is OutputTruncation {
 export function isUsage(value: unknown): value is Usage {
   if (!value || typeof value !== "object") return false;
   const usage = value as Record<string, unknown>;
+  const nonnegative = (value: unknown) => isFiniteNumber(value) && value >= 0;
   const numericKeys = ["input", "output", "cacheRead", "cacheWrite", "totalTokens"];
-  if (!numericKeys.every((key) => isFiniteNumber(usage[key]))) return false;
+  if (!numericKeys.every((key) => nonnegative(usage[key]))) return false;
   const cost = usage.cost;
   if (!cost || typeof cost !== "object") return false;
-  return ["input", "output", "cacheRead", "cacheWrite", "total"].every((key) => isFiniteNumber((cost as Record<string, unknown>)[key]))
-    && (usage.cacheWrite1h === undefined || isFiniteNumber(usage.cacheWrite1h));
+  return ["input", "output", "cacheRead", "cacheWrite", "total"].every((key) => nonnegative((cost as Record<string, unknown>)[key]))
+    && (usage.cacheWrite1h === undefined || nonnegative(usage.cacheWrite1h));
 }
 
 export function isContentPart(value: unknown): value is { type: string; text?: unknown } {

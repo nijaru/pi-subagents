@@ -28,8 +28,6 @@ export interface StartChild {
   model?: string;
   thinking?: ModelThinkingLevel;
   strictThinking?: boolean;
-  /** Make the completed result available for automatic delivery unless a join reads it. */
-  notify: boolean;
   emit?: (result: ChildResult, progress: string) => void;
 }
 
@@ -56,7 +54,7 @@ export class SessionChildren {
     };
     const completion = Promise.withResolvers<ChildResult>();
     const run: ChildRun = {
-      result, delivery: options.notify ? "unread" : "delivered", controller: new AbortController(), settled: false,
+      result, delivery: "unread", controller: new AbortController(), settled: false,
       promise: completion.promise, waiters: new Set(), activeWaits: 0,
     };
     // Register before execution can emit, await, or invoke extension callbacks.
@@ -137,14 +135,6 @@ export class SessionChildren {
     return dropped;
   }
 
-  /** Called only when results are supplied to the parent, not merely queued locally. */
-  acknowledgeCompletions(ids: string[]): void {
-    for (const id of ids) {
-      const run = this.runs.get(id);
-      if (run?.settled) run.delivery = "delivered";
-    }
-  }
-
   /** Pi custom completion messages cannot carry usage; the next tool result does. */
   takePendingUsage(): Usage | undefined {
     const usage = this.pendingUsage;
@@ -186,8 +176,8 @@ export class SessionChildren {
       if (run.settled) run.delivery = "delivered";
       return this.snapshot(run);
     });
-    if (runs.some((run) => run.settled)) return collect();
     if (signal?.aborted) throw new Error("Wait cancelled; use stop to cancel children.");
+    if (runs.some((run) => run.settled)) return collect();
     for (const run of runs) run.activeWaits++;
     try {
       await new Promise<void>((resolve, reject) => {

@@ -109,7 +109,7 @@ export function collectModelEnvRefs(): Set<string> {
     const agentDir = getAgentDir();
     const modelsPath = path.join(agentDir, "models.json");
     const raw = fs.readFileSync(modelsPath, "utf8");
-    const parsed = JSON.parse(stripJsonComments(raw)) as unknown;
+    const parsed = JSON.parse(stripJsonComments(raw.replace(/^\uFEFF/, ""))) as unknown;
     collectConfigEnvRefs(parsed, refs);
   } catch {
     // Best-effort; absence of models.json is not fatal

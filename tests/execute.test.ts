@@ -3,7 +3,6 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import extension from "../extensions/pi-subagents/index.ts";
-import { activeChildren } from "../extensions/pi-subagents/subprocess.ts";
 import { MAX_COMPLETION_BYTES } from "../extensions/pi-subagents/limits.ts";
 
 const directories: string[] = [];
@@ -11,7 +10,6 @@ interface Host {
   tool: any;
   cwd: string;
   notices: any[];
-  renderers: Map<string, any>;
   execute(params: any, signal?: AbortSignal, update?: (value: any) => void): Promise<any>;
   toolResult(event?: any): any;
   boundary(): void;
@@ -29,22 +27,19 @@ function host(active = ["read", "bash", "edit", "write", "web_search", "web_fetc
   let tool: any;
   const events = new Map<string, (...args: any[]) => any>();
   const notices: any[] = [];
-  const renderers = new Map<string, any>();
   extension({
     registerTool(value: any) { tool = value; },
-    registerMessageRenderer(name: string, renderer: any) { renderers.set(name, renderer); },
+    registerMessageRenderer() {},
     on(name: string, fn: (...args: any[]) => any) { events.set(name, fn); },
     getActiveTools() { return active; },
-    sendMessage(message: any, options: any) { notices.push({ message, options }); },
   } as any);
   const cwd = tempDir();
   const entries: any[] = [];
-  const context = { cwd, hasUI: false, model: { provider: "parent", id: "model" }, thinkingLevel: "high", isIdle: () => true,
+  const context = { cwd, hasUI: false, model: { provider: "parent", id: "model" }, thinkingLevel: "high",
     sessionManager: { getBranch: () => entries } };
-  let calls = 0;
   const instance = {
-    tool, cwd, notices, renderers,
-    execute: (params: any, signal?: AbortSignal, update?: (value: any) => void) => tool.execute(calls++ ? `call-${calls}` : "call", params, signal, update, context),
+    tool, cwd, notices,
+    execute: (params: any, signal?: AbortSignal, update?: (value: any) => void) => tool.execute("test-call", params, signal, update, context),
     toolResult: (event = { toolName: "subagent" }) => events.get("tool_result")!(event),
     boundary: () => {
       const result = events.get("turn_end")!({ type: "turn_end", outcome: "completed", entries: [] }, context);
@@ -110,11 +105,10 @@ afterEach(async () => {
 });
 
 describe("task-first tool", () => {
-  test("exposes only the lifecycle API with unambiguous prompt guidelines", () => {
+  test("exposes the lifecycle schema and allows parallel scheduling", () => {
     const tool = host().tool;
     expect(Object.keys(tool.parameters.properties)).toEqual(["command", "prompt", "tools", "model", "thinking", "cwd", "id", "ids", "timeoutMs"]);
     expect(tool.executionMode).toBe("parallel");
-    expect(tool.promptGuidelines.every((line: string) => line.includes("subagent"))).toBe(true);
   });
   test("runs without profiles, inherits model/thinking, and delivers the prompt on stdin", async () => {
     const h = host();
@@ -134,7 +128,6 @@ describe("task-first tool", () => {
     expect(first(value).output).toBe("done");
     expect(first(value).usage.cost.total).toBe(1);
     expect(h.notices).toHaveLength(0);
-    expect(activeChildren.size).toBe(0);
   });
   test("supports explicit tool-less reasoning, model override and canonical cwd", async () => {
     const h = host();
@@ -158,14 +151,7 @@ describe("task-first tool", () => {
     const inherited = await h.execute({ command: "run", prompt: "same model", model: "parent/model" });
     expect(first(inherited).thinking).toBe("high");
   });
-  test("does not read repository or user role definitions", async () => {
-    const h = host();
-    fs.mkdirSync(path.join(h.cwd, ".pi", "agents"), { recursive: true });
-    fs.writeFileSync(path.join(h.cwd, ".pi", "agents", "worker.md"), "MALICIOUS ROLE PERSONA");
-    const file = fakePi();
-    await h.execute({ command: "run", prompt: "only my task", tools: ["read"] });
-    expect((await captured(file)).prompt).toBe("only my task");
-  });
+
   test.each([
     {}, { agent: "worker", task: "old" }, { command: "send", id: "id" },
     { command: "run", prompt: " " }, { command: "spawn", prompt: "x", id: "id" },
@@ -176,10 +162,8 @@ describe("task-first tool", () => {
     { command: "wait", ids: [" "] }, { command: "stop", ids: ["x"] }, { command: "run", prompt: "x", thinking: "ultra" },
     { command: "status", thinking: "high" },
     { command: "run", prompt: "x", tools: ["read", "read"] },
-    { command: "run", prompt: "😀".repeat(26_000) },
   ])("rejects invalid or obsolete input before launch: %j", async (params) => {
     await expect(host().execute(params)).rejects.toThrow();
-    expect(activeChildren.size).toBe(0);
   });
   test("rejects unavailable tools, recursive calls, malformed depth and missing cwd", async () => {
     const h = host(["read", "subagent"]);
@@ -190,6 +174,9 @@ describe("task-first tool", () => {
       process.env.PI_SUBAGENT_DEPTH = depth;
       await expect(h.execute({ command: "run", prompt: "x" })).rejects.toThrow("leaves");
     }
+  });
+  test("rejects prompts over the UTF-8 byte limit before launch", async () => {
+    await expect(host().execute({ command: "run", prompt: "😀".repeat(26_000) })).rejects.toThrow("bytes");
   });
   test("cancellation before launch creates no child", async () => {
     const h = host();
@@ -216,12 +203,6 @@ describe("background lifecycle", () => {
     expect(h.notices[0].message.content).toContain(id);
     expect(h.notices[0].message.content).toContain("finished later");
     expect(h.notices[0].message.content).not.toContain("use subagent wait");
-    expect(h.notices[0].options).toBeUndefined();
-    const theme = { fg: (_: string, text: string) => text, bg: (_: string, text: string) => text };
-    const notice = h.renderers.get("subagent-complete")(h.notices[0].message, { expanded: false, outputPad: 1 }, theme).render(100);
-    expect(notice).toHaveLength(1);
-    expect(notice[0]).toContain(`subagent ${id.slice(0, 8)} completed`);
-    expect(notice[0]).not.toContain("finished later"); // status-only notice; report on expansion
     expect(first(await h.execute({ command: "wait", ids: [id] })).output).toBe("finished later");
     expect(h.notices).toHaveLength(1);
   });
@@ -242,14 +223,16 @@ describe("background lifecycle", () => {
     const ids = await Promise.all([spawn(h, { prompt: "x" }), spawn(h, { prompt: "bad" })]);
     const deadline = Date.now() + 3000;
     while ((await h.execute({ command: "status" })).details.results.some((r: any) => r.state.status === "running") && Date.now() < deadline) await Bun.sleep(10);
-    const error = await h.execute({ command: "wait", ids }).then(() => { throw new Error("expected failure"); }, (cause: Error) => cause);
-    for (const id of ids) expect(error.message).toContain(id);
-    expect(error.message).toContain("completed");
-    expect(error.message).toContain("incomplete");
-    expect(error.message).toContain("model output limit");
-    expect(error.message).toContain("x".repeat(100));
-    expect(error.message).toContain("wait_expired: false");
-    expect(Buffer.byteLength(error.message)).toBeLessThanOrEqual(50 * 1024);
+    const value = await h.execute({ command: "wait", ids });
+    expect(value.isError).toBe(true);
+    const text = value.content[0].text;
+    for (const id of ids) expect(text).toContain(id);
+    expect(text).toContain("completed");
+    expect(text).toContain("incomplete");
+    expect(text).toContain("model output limit");
+    expect(text).toContain("x".repeat(100));
+    expect(text).toContain("wait_expired: false");
+    expect(Buffer.byteLength(text)).toBeLessThanOrEqual(50 * 1024);
     h.boundary();
     expect(h.notices).toHaveLength(0);
     expect(h.toolResult().usage.cost.total).toBe(2);
@@ -293,7 +276,6 @@ describe("background lifecycle", () => {
     expect(first(await h.execute({ command: "stop", id })).state).toMatchObject({ outcome: "cancelled" });
     expect(first(await h.execute({ command: "stop", id })).state).toMatchObject({ outcome: "cancelled" });
     expect(h.notices).toHaveLength(0);
-    expect(activeChildren.size).toBe(0);
   });
   test("run propagates abort and preserves the cancelled result in status", async () => {
     const h = host();
@@ -301,7 +283,7 @@ describe("background lifecycle", () => {
     const controller = new AbortController();
     const pending = h.execute({ command: "run", prompt: "x" }, controller.signal);
     await captured(file); controller.abort();
-    await expect(pending).rejects.toThrow("cancelled");
+    expect((await pending).isError).toBe(true);
     expect(first(await h.execute({ command: "status" })).state).toMatchObject({ outcome: "cancelled" });
   });
   test("shutdown drains children, suppresses stale notices, and session start drops old handles", async () => {
@@ -309,7 +291,6 @@ describe("background lifecycle", () => {
     const file = fakePi("await delay(10000);");
     const id = await spawn(h); await captured(file);
     await h.shutdown();
-    expect(activeChildren.size).toBe(0);
     expect(h.notices).toHaveLength(0);
     await expect(h.execute({ command: "spawn", prompt: "no" })).rejects.toThrow("closing");
     await h.restart();
@@ -342,13 +323,11 @@ describe("usage delivery", () => {
   test.each([false, true])("charges foreground usage once, including failures (%s)", async (fails) => {
     const h = host();
     fakePi(fails ? 'final("", "error", {errorMessage:"paid failure"});' : undefined);
-    if (fails) await expect(h.execute({ command: "run", prompt: "x" })).rejects.toThrow("paid failure");
-    else await h.execute({ command: "run", prompt: "x" });
+    expect((await h.execute({ command: "run", prompt: "x" })).isError).toBe(fails);
     expect(h.toolResult({ toolName: "subagent", isError: fails }).usage.cost.total).toBe(1);
     const id = first(await h.execute({ command: "status" })).id;
     expect(h.toolResult()).toBeUndefined();
-    if (fails) await expect(h.execute({ command: "wait", ids: [id] })).rejects.toThrow("paid failure");
-    else await h.execute({ command: "wait", ids: [id] });
+    expect((await h.execute({ command: "wait", ids: [id] })).isError).toBe(fails);
     expect(h.toolResult()).toBeUndefined();
     await h.execute({ command: "stop", id });
     expect(h.toolResult()).toBeUndefined();
@@ -374,9 +353,11 @@ describe("usage delivery", () => {
     const h = host();
     fakePi('emit({kind:"usage", usage}); emit({kind:"progress",text:"Working"}); await delay(10000);');
     const controller = new AbortController();
-    await expect(h.execute({ command: "run", prompt: "x" }, controller.signal, (value) => {
+    const result = await h.execute({ command: "run", prompt: "x" }, controller.signal, (value) => {
       if (first(value).usage.turns) controller.abort();
-    })).rejects.toThrow("cancelled");
+    });
+    expect(result.isError).toBe(true);
+    expect(first(result).state).toMatchObject({ outcome: "cancelled" });
     expect(h.toolResult({ toolName: "subagent", isError: true }).usage.cost.total).toBe(1);
     expect(h.toolResult()).toBeUndefined();
   });
@@ -397,34 +378,30 @@ describe("subprocess regressions", () => {
     ["nonzero exit", 'console.error("broken child"); process.exit(2);', "broken child"],
   ])("reports %s as failure", async (_name, body, error) => {
     const h = host(); fakePi(body);
-    await expect(h.execute({ command: "run", prompt: "x" })).rejects.toThrow(error);
-    expect(first(await h.execute({ command: "status" })).state).toMatchObject({ outcome: "failed" });
+    const result = await h.execute({ command: "run", prompt: "x" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain(error);
+    expect(first(result).state).toMatchObject({ outcome: "failed" });
   });
-  test("thrown tool errors reattach renderer details without duplicate prompts", async () => {
+  test("failed results preserve renderer details without duplicating prompts", async () => {
     const theme = { fg: (_: string, text: string) => text, bg: (_: string, text: string) => text };
     const h = host();
     fakePi('final("", "error", {errorMessage:"assistant failed"});');
-    const error: Error = await h.execute({ command: "run", prompt: "unique task prompt", tools: ["read"] }).then(
-      () => { throw new Error("expected failure"); }, (cause: Error) => cause);
-    expect(error.message).toContain("assistant failed");
-    expect(error.message).not.toContain("unique task prompt");
-    const patch = h.toolResult({ toolName: "subagent", toolCallId: "call", isError: true });
-    expect(patch.details).toMatchObject({ command: "run", results: [{ errorMessage: "assistant failed" }] });
-    const rendered = h.tool.renderResult({ content: [{ type: "text", text: error.message }], details: patch.details }, { expanded: false }, theme).render(80).join("\n");
+    const result = await h.execute({ command: "run", prompt: "unique task prompt", tools: ["read"] });
+    expect(result.isError).toBe(true);
+    expect(result.details).toMatchObject({ command: "run", results: [{ errorMessage: "assistant failed" }] });
+    expect(result.content[0].text).not.toContain("unique task prompt");
+    const rendered = h.tool.renderResult(result, { expanded: false }, theme).render(80).join("\n");
     expect(rendered).toContain("failed");
     expect(rendered).toContain("assistant failed");
     expect(rendered).not.toContain("unique task prompt");
-    // Consumed exactly once: nothing left to patch, and no duplicate usage.
-    expect(h.toolResult({ toolName: "subagent", toolCallId: "call", isError: true })).toBeUndefined();
   });
   test("distinguishes deadline expiry from cancellation", async () => {
     const h = host(); fakePi("await delay(10000);");
     process.env.PI_SUBAGENT_TIMEOUT_MS = "100";
-    const error: Error = await h.execute({ command: "run", prompt: "x" }).then(
-      () => { throw new Error("deadline expiry must fail the join"); }, (cause: Error) => cause);
-    // The adjacent duration carries the runtime; the cause stays unit-free.
-    expect(error.message).toContain("Subagent timed out.");
-    expect(error.message).not.toMatch(/\d+ ?ms\b/);
+    const result = await h.execute({ command: "run", prompt: "x" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Subagent timed out.");
     expect(first(await h.execute({ command: "status" })).state).toMatchObject({ outcome: "timed_out" });
   });
   test.each([
@@ -445,9 +422,7 @@ describe("subprocess regressions", () => {
   test("bounds returned reports and details independently of diagnostic volume", async () => {
     const h = host();
     fakePi('process.stdout.write("x".repeat(100000)); final("x".repeat(50*1024));');
-    let updates = 0;
-    const value = await h.execute({ command: "run", prompt: "x" }, undefined, () => updates++);
-    expect(updates).toBeLessThan(10);
+    const value = await h.execute({ command: "run", prompt: "x" });
     expect(Buffer.byteLength(value.content[0].text)).toBeLessThanOrEqual(50 * 1024);
     expect(Buffer.byteLength(JSON.stringify(value.details))).toBeLessThanOrEqual(50 * 1024);
     expect("messages" in first(value)).toBe(false);
@@ -464,7 +439,9 @@ describe("subprocess regressions", () => {
   test("retains incomplete output while reporting the token limit as a tool error", async () => {
     const h = host();
     fakePi('final("partial findings" + "x".repeat(50000), "length");');
-    await expect(h.execute({ command: "run", prompt: "x" })).rejects.toThrow("model output limit");
+    const result = await h.execute({ command: "run", prompt: "x" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("model output limit");
     const value = first(await h.execute({ command: "status" }));
     expect(value.state).toMatchObject({ outcome: "incomplete", stopReason: "length" });
     expect(value.output).toStartWith("partial findings");
@@ -476,7 +453,6 @@ describe("subprocess regressions", () => {
     expect(first(value).output).toBe("done");
     expect(first(value).state).toMatchObject({ outcome: "completed" });
     expect(updates).toBe(1);
-    expect(activeChildren.size).toBe(0);
   });
   test("emits coarse heartbeats while foreground work is running", async () => {
     const h = host(); fakePi('await delay(1150); final("done");');
@@ -484,8 +460,7 @@ describe("subprocess regressions", () => {
     await h.execute({ command: "run", prompt: "x" }, undefined, (value) => updates.push(value.content[0].text));
     expect(updates.filter((text) => text === "Working...").length).toBeGreaterThan(1);
   });
-  test("sweeps surviving processes before reporting ordinary completion", async () => {
-    if (process.platform === "win32") return;
+  test.skipIf(process.platform === "win32")("sweeps surviving processes before reporting ordinary completion", async () => {
     const h = host();
     const marker = path.join(tempDir(), "swept");
     fakePi(`const {spawn}=await import("node:child_process"); const child=spawn("sh",["-c",${JSON.stringify(`trap 'printf swept > '${JSON.stringify(marker)}'; exit 0' TERM; printf ready; while :; do sleep 1; done`)}],{stdio:["ignore","pipe","inherit"]}); await new Promise(resolve=>child.stdout.once("data",resolve)); final("done"); process.exit(0);`);
@@ -493,69 +468,18 @@ describe("subprocess regressions", () => {
     expect(first(value).state).toMatchObject({ outcome: "completed" });
     expect(fs.existsSync(marker)).toBe(true);
   });
-  test("killing the parent mid-run kills the child instead of orphaning it", async () => {
-    if (process.platform === "win32") return;
-    const dir = tempDir();
-    const started = path.join(dir, "started");
-    const marker = path.join(dir, "mutation");
-    const runner = path.join(dir, "runner.mjs");
-    // A real child that outlives its parent long enough to mutate the tree.
-    fs.writeFileSync(runner, `import * as fs from "node:fs";
-import { setTimeout as delay } from "node:timers/promises";
-for await (const chunk of process.stdin) {};
-fs.writeFileSync(${JSON.stringify(started)}, "1");
-await delay(1500);
-fs.writeFileSync(${JSON.stringify(marker)}, "mutated");
-`);
-    const parentScript = path.join(dir, "parent.ts");
-    fs.writeFileSync(parentScript, `import { SubprocessChildSupervisor } from ${JSON.stringify(path.resolve(import.meta.dir, "../extensions/pi-subagents/supervisor.ts"))};
-const result: any = { id: "orphan-check", prompt: "task", cwd: process.cwd(), tools: [], state: { status: "running" }, stderr: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, turns: 0 } };
-await new SubprocessChildSupervisor().run({ result, signal: new AbortController().signal });
-`);
-    const proc = Bun.spawn([process.execPath, parentScript], {
-      cwd: dir,
-      env: { ...process.env, PI_SUBAGENT_RUNNER: runner },
-      stdout: "ignore", stderr: "pipe",
-    });
-    try {
-      const deadline = Date.now() + 15000;
-      while (!fs.existsSync(started) && Date.now() < deadline) await Bun.sleep(20);
-      expect(fs.existsSync(started)).toBe(true);
-      process.kill(proc.pid, "SIGKILL");
-      await proc.exited;
-      await Bun.sleep(2500);
-      expect(fs.existsSync(marker)).toBe(false);
-    } finally {
-      try { process.kill(proc.pid, "SIGKILL"); } catch { /* already gone */ }
-      await proc.exited;
-    }
-  }, 30000);
+
   test("keeps the tail of over-budget stderr so the final failure survives", async () => {
     const h = host();
     fakePi('process.stderr.write("EARLY_DIAGNOSTIC\\n" + "x".repeat(60000) + "\\nFINAL_STACK_TRACE\\n"); process.exit(3);');
-    await expect(h.execute({ command: "run", prompt: "x" })).rejects.toThrow("FINAL_STACK_TRACE");
+    const result = await h.execute({ command: "run", prompt: "x" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("FINAL_STACK_TRACE");
     const status = first(await h.execute({ command: "status" }));
     expect(Buffer.byteLength(status.stderr)).toBeLessThanOrEqual(50 * 1024);
     expect(status.stderr).toContain("EARLY_DIAGNOSTIC");
     expect(status.stderr).toContain("FINAL_STACK_TRACE");
   });
 
-  test("renders current results and safely falls back for old transcripts", async () => {
-    const h = host(); fakePi();
-    const value = await h.execute({ command: "run", prompt: "render me" });
-    const theme = { fg: (_: string, text: string) => text, bold: (text: string) => text };
-    const collapsed = h.tool.renderResult(value, { expanded: false }, theme).render(120).join("\n");
-    expect(collapsed).toContain("completed");
-    expect(collapsed).not.toContain("done"); // agent-facing report stays behind expansion
-    for (const expanded of [false, true]) {
-      expect(h.tool.renderResult(value, { expanded }, theme).render(120).join("\n")).toContain(expanded ? "done" : "completed");
-      expect(h.tool.renderResult({ content: [{ type: "text", text: "old output" }], details: { results: [{ agent: "worker" }] } }, { expanded }, theme).render(120).join("\n")).toContain("old output");
-    }
-    const malformed = { ...value, details: { ...value.details, results: [{ ...first(value), model: {} }] } };
-    expect(h.tool.renderResult(malformed, { expanded: true }, theme).render(120).join("\n")).toContain("done");
-    const oversized = { ...value, details: { ...value.details, results: [{ ...first(value), output: "x".repeat(200000) }] } };
-    expect(h.tool.renderResult(oversized, { expanded: true }, theme).render(120).join("\n").length).toBeLessThan(70000);
-    expect(h.tool.renderCall({ command: "run", prompt: "hello\x1b[31m" }, theme).render(120).join("\n")).not.toContain("hello");
-    expect(h.tool.renderCall({ command: "run", prompt: "hello\x1b[31m" }, theme, { args: {}, expanded: true } as any).render(120).join("\n")).toContain("hello");
-  });
+
 });

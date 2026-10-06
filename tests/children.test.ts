@@ -20,7 +20,7 @@ function controlled() {
   };
   const notices: string[] = [];
   const children = new SessionChildren(supervisor, (result) => notices.push(result.id));
-  const start = (background = true) => children.start({ prompt: "bounded task", tools: ["read"], cwd: process.cwd(), notify: background });
+  const start = () => children.start({ prompt: "bounded task", tools: ["read"], cwd: process.cwd() });
   return { children, start, requests, gates, notices };
 }
 
@@ -127,6 +127,8 @@ describe("session ownership", () => {
     // Resolve all ids before consuming even an already-completed report.
     await expect(c.children.wait([a.result.id, "unknown"], 1)).rejects.toThrow("Unknown child");
     expect(a.delivery).toBe("unread");
+    await expect(c.children.wait([a.result.id, b.result.id], 1, controller.signal)).rejects.toThrow("Wait cancelled");
+    expect(c.children.pendingCompletions()).toHaveLength(2);
     expect((await c.children.wait([a.result.id, b.result.id], 1)).every((result) => result.state.status === "terminal")).toBe(true);
     expect(c.children.pendingCompletions()).toHaveLength(0);
     await c.children.close();
@@ -136,10 +138,11 @@ describe("session ownership", () => {
     const active = c.start();
     let firstCompleted = "";
     for (let i = 1; i <= MAX_RETAINED_RUNS; i++) {
-      const run = c.start(false);
+      const run = c.start();
       if (i === 1) firstCompleted = run.result.id;
       c.gates[i]!.resolve();
       await run.promise;
+      await c.children.wait([run.result.id], 1);
     }
     expect(c.children.list()).toHaveLength(MAX_RETAINED_RUNS);
     expect(c.children.get(active.result.id)).toBe(active);
@@ -162,7 +165,7 @@ describe("session ownership", () => {
       c.requests[i]!.result.usage.input = 2;
       c.gates[i]!.resolve();
       await next.promise;
-      c.children.acknowledgeCompletions([next.result.id]);
+      await c.children.wait([next.result.id], 1);
     }
     expect(() => c.children.get(run.result.id)).toThrow("Unknown child");
     expect(c.children.takePendingUsage()?.input).toBe((MAX_RETAINED_RUNS + 1) * 2);
@@ -205,7 +208,7 @@ describe("session ownership", () => {
   test("shutdown fences foreground updates as well as completion notices", async () => {
     const c = controlled();
     let updates = 0;
-    c.children.start({ prompt: "x", tools: [], cwd: process.cwd(), notify: false, emit: () => { updates++; } });
+    c.children.start({ prompt: "x", tools: [], cwd: process.cwd(), emit: () => { updates++; } });
     const closing = c.children.close();
     c.requests[0]!.emit?.(c.requests[0]!.result, "stale update");
     await closing;
@@ -213,7 +216,7 @@ describe("session ownership", () => {
   });
   test("notification failure does not lose the completed result", async () => {
     const children = new SessionChildren({ async run({ result }) { result.output = "answer"; return { outcome: "completed", exitCode: 0, stopReason: "stop" }; } }, () => { throw new Error("UI unavailable"); });
-    const run = children.start({ prompt: "x", tools: [], cwd: process.cwd(), notify: true });
+    const run = children.start({ prompt: "x", tools: [], cwd: process.cwd() });
     await run.promise;
     expect((await children.wait([run.result.id], 1))[0]!.output).toBe("answer");
     await children.close();
@@ -222,7 +225,7 @@ describe("session ownership", () => {
     const children = new SessionChildren({ async run() {
       return { outcome: "failed", exitCode: 1, stopReason: "error", errorMessage: "diagnostic".repeat(1000), stdout: "not lifecycle state" };
     } }, () => {});
-    const run = children.start({ prompt: "x", tools: [], cwd: process.cwd(), notify: false });
+    const run = children.start({ prompt: "x", tools: [], cwd: process.cwd() });
     const result = await run.promise;
     expect(Object.keys(result.state).sort()).toEqual(["exitCode", "finishedAt", "outcome", "status", "stopReason"]);
     expect(result.errorMessage).toContain("diagnostic");
@@ -231,7 +234,7 @@ describe("session ownership", () => {
   test("supervisor setup failures settle rather than leaking admission", async () => {
     const children = new SessionChildren({ async run() { throw new Error("setup failed"); } }, () => {});
     for (let i = 0; i < 8; i++) {
-      const run = children.start({ prompt: "x", tools: [], cwd: process.cwd(), notify: true });
+      const run = children.start({ prompt: "x", tools: [], cwd: process.cwd() });
       expect((await run.promise).errorMessage).toBe("setup failed");
       expect(children.snapshot(run).state).toMatchObject({ status: "terminal", outcome: "failed" });
     }

@@ -45,9 +45,9 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
         bootstrap: { version: CHILD_PROTOCOL_VERSION, prompt: result.prompt, tools: result.tools, model: result.model, thinking, strictThinking },
         cwd: result.cwd, childRunId: result.id, signal,
         onEvent: (event) => {
-          if (terminal || protocolFailure) throw new Error("Child sent a frame after its terminal result.");
+          if (terminal || protocolFailure !== undefined) throw new Error("Child sent a frame after its terminal result.");
           if (event.kind === "error") {
-            protocolFailure = boundedDiagnostic(event.errorMessage);
+            protocolFailure = boundedDiagnostic(event.errorMessage) || "Child reported an error.";
           } else if (event.kind === "ready") {
             if (ready || (result.model && event.model !== result.model) || (strictThinking && event.thinking !== thinking)
               || event.tools.length !== result.tools.length || result.tools.some((tool) => !event.tools.includes(tool))) {
@@ -91,9 +91,9 @@ export function classifyExecution(process: ProcessResult, report?: ChildReport, 
     outcome: process.outcome, exitCode: process.exitCode, stopReason: process.stopReason,
     errorMessage: boundedDiagnostic(process.errorMessage),
   };
-  if (protocolFailure || process.outcome !== "completed") return {
+  if (protocolFailure !== undefined || process.outcome !== "completed") return {
     outcome: "failed", exitCode: process.exitCode || 1, stopReason: "error",
-    errorMessage: boundedDiagnostic(protocolFailure ?? process.errorMessage) ?? "Child failed.",
+    errorMessage: boundedDiagnostic(protocolFailure ?? process.errorMessage) || "Child failed.",
   };
   if (report?.stopReason === "length") return {
     outcome: "incomplete", exitCode: 0, stopReason: "length", errorMessage: "Child reached the model output limit; response is incomplete.",

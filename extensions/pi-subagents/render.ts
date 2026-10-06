@@ -5,7 +5,7 @@ import { truncateHeadTail, truncateOutput } from "./bounds.ts";
 import { MAX_OUTPUT_BYTES, MAX_RETAINED_RUNS } from "./limits.ts";
 import { resultText, runtimeLabel } from "./reports.ts";
 import type { SubagentDetails } from "./types.ts";
-import { failed, isFiniteNumber, isOutputTruncation, isThinkingLevel } from "./types.ts";
+import { failed, isFiniteNumber, isOutputTruncation, isThinkingLevel, isUsage } from "./types.ts";
 import type { ChildResult, UsageSummary } from "./types.ts";
 
 interface ChildRenderContext {
@@ -14,12 +14,7 @@ interface ChildRenderContext {
 }
 
 export function isRenderableUsage(value: unknown): value is UsageSummary {
-  if (!value || typeof value !== "object") return false;
-  const usage = value as Record<string, unknown>;
-  const cost = usage.cost;
-  return ["input", "output", "cacheRead", "cacheWrite", "totalTokens", "turns"].every((key) => isFiniteNumber(usage[key]))
-    && !!cost && typeof cost === "object"
-    && ["input", "output", "cacheRead", "cacheWrite", "total"].every((key) => isFiniteNumber((cost as Record<string, unknown>)[key]));
+  return isUsage(value) && isFiniteNumber((value as Partial<UsageSummary>).turns);
 }
 
 export function isRenderableChildResult(value: unknown): value is ChildResult {
@@ -179,8 +174,9 @@ function renderChildren(details: unknown, expanded: boolean, theme: Theme, targe
       if (data?.command !== "run" && data?.command !== "spawn") {
         container.addChild(new Text(theme.fg("dim", clean(child.prompt, 8192)), 0, 0));
       }
+      const report = resultText(child);
       if (!active) {
-        const output = truncateOutput(resultText(child), remaining);
+        const output = truncateOutput(report, remaining);
         remaining = Math.max(0, remaining - Buffer.byteLength(output, "utf8"));
         container.addChild(renderOutput(stripTerminalControls(output).trimEnd(), true, theme));
       }
@@ -188,7 +184,7 @@ function renderChildren(details: unknown, expanded: boolean, theme: Theme, targe
         container.addChild(new Text(theme.fg("warning", `Output shortened: ${child.outputTruncation.retainedBytes}/${child.outputTruncation.originalBytes} UTF-8 bytes retained.`), 0, 0));
       }
       for (const [label, value] of [["stderr", child.stderr], ["stdout", child.stdout]] as const) {
-        if (!value || value === resultText(child) || remaining <= 0) continue;
+        if (!value || value === report || remaining <= 0) continue;
         const diagnostic = truncateHeadTail(value, Math.min(remaining, 2048));
         remaining -= Buffer.byteLength(diagnostic);
         container.addChild(new Text(theme.fg("dim", `${label}: ${stripTerminalControls(diagnostic)}`), 0, 0));

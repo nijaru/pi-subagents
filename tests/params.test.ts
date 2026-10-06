@@ -56,7 +56,7 @@ describe("child environment", () => {
     process.env.CHILD_TEST_TOKEN = "token";
     process.env.CHILD_TEST_APP_VALUE = "private-app-state";
     delete process.env.PI_SUBAGENT_PASSTHROUGH_ENV;
-    fs.writeFileSync(path.join(dir, "models.json"), '{ // JSONC\n "providers": {"custom": {"apiKey": "$CHILD_TEST_MODEL_SECRET", "headers":{"x-key":"$child_test_header"}, "models": [], }, }, }');
+    fs.writeFileSync(path.join(dir, "models.json"), '\uFEFF{ // JSONC\n "providers": {"custom": {"apiKey": "$CHILD_TEST_MODEL_SECRET", "headers":{"x-key":"$child_test_header"}, "models": [], }, }, }');
     const child = childEnvironment("child-1", dir);
     expect(child.CHILD_TEST_MODEL_SECRET).toBe("model-secret");
     expect(child.child_test_header).toBe("header-secret");

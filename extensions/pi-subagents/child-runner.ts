@@ -1,12 +1,17 @@
 import { createWriteStream } from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   createAgentSessionServices, createAgentSessionFromServices, getAgentDir, ProjectTrustStore, SessionManager, SettingsManager,
-  type AgentSession, type DefaultProjectTrust, type LoadExtensionsResult, type ProjectTrustContext,
+  type AgentSession, type DefaultProjectTrust, type InlineExtension, type LoadExtensionsResult, type ProjectTrustContext,
 } from "@earendil-works/pi-coding-agent";
 import { addUsage, emptyUsage, isThinkingLevel } from "./types.ts";
 import { boundedDiagnostic, truncateOutput } from "./bounds.ts";
 import { MAX_TASK_BYTES } from "./limits.ts";
 import { assistantReport, CHILD_PROTOCOL_VERSION, emptyReport, type ChildBootstrap, type ChildEvent } from "./child-protocol.ts";
+
+// Pi's MCP allowlist exception includes these unnamespaced resource tools.
+const MCP_RESOURCE_TOOLS = ["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"];
+const isMcpTool = (name: string) => name.startsWith("mcp__") || MCP_RESOURCE_TOOLS.includes(name);
 
 type ResolveProjectTrust = (options: {
   cwd: string;
@@ -18,7 +23,7 @@ type ResolveProjectTrust = (options: {
 }) => Promise<boolean>;
 
 /** SDK host for one leaf task. stdout/stderr remain extension diagnostics, never protocol. */
-export async function runChild(resolveProjectTrust: ResolveProjectTrust): Promise<void> {
+export async function runChild(resolveProjectTrust: ResolveProjectTrust, builtInExtensions: InlineExtension[]): Promise<void> {
   const pipe = createWriteStream("", { fd: 3, autoClose: false });
   let pipeError: Error | undefined;
   pipe.on("error", (error) => { pipeError = error; });
@@ -57,6 +62,7 @@ export async function runChild(resolveProjectTrust: ResolveProjectTrust): Promis
     const trustStore = new ProjectTrustStore(agentDir);
     const services = await createAgentSessionServices({
       cwd, agentDir, settingsManager, modelRuntimeSignal: abort.signal,
+      resourceLoaderOptions: { extensionFactories: builtInExtensions },
       resourceLoaderReloadOptions: {
         resolveProjectTrust: ({ extensionsResult }) => resolveProjectTrust({
           cwd, trustStore, extensionsResult, defaultProjectTrust: settingsManager.getDefaultProjectTrust(),
@@ -80,14 +86,30 @@ export async function runChild(resolveProjectTrust: ResolveProjectTrust): Promis
     if (request.model && !model) throw new Error(`Requested child model is unavailable: ${request.model}`);
     const created = await createAgentSessionFromServices({
       services, model, tools: request.tools,
+      // Pi 1.0.4 retains omitted MCP tools for nested calls unless an MCP name
+      // occurs in the allowlist. An active-name check alone cannot restrict them.
+      excludeTools: [
+        ...(request.tools.some((name) => name.startsWith("mcp__")) ? [] : ["mcp__*"]),
+        ...MCP_RESOURCE_TOOLS.filter((name) => !request.tools.includes(name)),
+      ],
       thinkingLevel: request.thinking,
       sessionManager: SessionManager.inMemory(process.cwd()),
     });
     session = created.session;
     await session.bindExtensions({ mode: "json", onError: (error) => console.error(error.error) });
     abort.signal.throwIfAborted();
-    const available = new Set(session.getAllTools().map((tool) => tool.name));
-    const missing = request.tools.filter((tool) => !available.has(tool));
+    const missingTools = () => {
+      const available = new Set(session!.getAllTools().map((tool) => tool.name));
+      return request.tools.filter((tool) => !available.has(tool));
+    };
+    // MCP connects in the background, including tools explicitly requested by
+    // name. Gate prompting on their registration, under Pi's 10s startup budget
+    // and our cancellation/deadline; never call the model with a partial loadout.
+    const until = Date.now() + 10_000;
+    while (missingTools().some(isMcpTool) && Date.now() < until) {
+      await delay(25, undefined, { signal: abort.signal });
+    }
+    const missing = missingTools();
     if (missing.length) throw new Error(`Requested child tools are unavailable: ${missing.join(", ")}`);
     session.setActiveToolsByName(request.tools);
     const active = session.getActiveToolNames();

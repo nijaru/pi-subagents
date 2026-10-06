@@ -178,13 +178,6 @@ export function boundDetails(details: SubagentDetails, maxBytes = MAX_OUTPUT_BYT
   }
   if (baseBytes === maxBytes || minimalResults.length === 0) return bounded;
   const perResult = Math.floor((maxBytes - baseBytes) / minimalResults.length);
-  bounded.results = details.results.map((result) => boundChildResult(result, jsonBytes(minimalChildResult(result)) + perResult));
-  // The allocation above is deterministic. A final minimal fallback keeps
-  // the aggregate bounded even if JSON overhead differs across runtimes.
-  while (jsonBytes(bounded) > maxBytes && bounded.results.some((result, index) => jsonBytes(result) > jsonBytes(minimalResults[index]!))) {
-    const index = bounded.results.findIndex((result, itemIndex) => jsonBytes(result) > jsonBytes(minimalResults[itemIndex]!));
-    if (index < 0) break;
-    bounded.results[index] = minimalResults[index]!;
-  }
+  bounded.results = details.results.map((result, index) => boundChildResult(result, jsonBytes(minimalResults[index]!) + perResult));
   return bounded;
 }
