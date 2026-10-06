@@ -7,7 +7,8 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { emptyUsage } from "../extensions/pi-subagents/types.ts";
 import { truncateHeadTail } from "../extensions/pi-subagents/bounds.ts";
 import { stripTerminalControls } from "../extensions/pi-subagents/render.ts";
-import { executable, getChildInvocation, spawnDeathWatchdog } from "../extensions/pi-subagents/subprocess.ts";
+import { executable, getChildInvocation } from "../extensions/pi-subagents/subprocess.ts";
+import { spawnDeathWatchdog } from "../extensions/pi-subagents/process-tree.ts";
 import { assistantReport, parseChildEvent } from "../extensions/pi-subagents/child-protocol.ts";
 import { classifyExecution } from "../extensions/pi-subagents/supervisor.ts";
 
@@ -32,7 +33,7 @@ describe("compact child protocol", () => {
     }
   });
   test("usage frames reject negative tokens and costs", () => {
-    for (const usage of [{ ...emptyUsage(), input: -17 }, { ...emptyUsage(), cost: { ...emptyUsage().cost, total: -5 } }, { ...emptyUsage(), cacheWrite1h: -1 }]) {
+    for (const usage of [{ ...emptyUsage(), input: -17 }, { ...emptyUsage(), cost: { ...emptyUsage().cost, total: -5 } }, { ...emptyUsage(), cacheWrite1h: -1 }, { ...emptyUsage(), reasoning: -1 }]) {
       expect(() => parseChildEvent(JSON.stringify({ version: 2, kind: "usage", usage }))).toThrow("Malformed");
       expect(() => parseChildEvent(JSON.stringify({ version: 2, kind: "result", report: assistantReport(assistant), usage }))).toThrow("Malformed");
     }

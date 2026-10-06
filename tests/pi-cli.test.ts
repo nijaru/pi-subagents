@@ -2,30 +2,40 @@ import { expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Check } from "typebox/value";
+import { SubagentDetailsSchema } from "../extensions/pi-subagents/result-schema.ts";
 
 // A real Pi parent invokes this extension, which launches a real Pi child.
 // Only the model HTTP endpoint is fake: no provider credentials or network services are needed.
-test.each([false, true])("real Pi CLI delegates and accounts child usage, including failure: %s", async (fails) => {
+test.each([
+  { codemode: false, fails: false }, { codemode: false, fails: true },
+  { codemode: true, fails: false }, { codemode: true, fails: true },
+])("real Pi delegates with structured results and exact usage: %j", async ({ codemode, fails }) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-children-cli-"));
   const requests: any[] = [];
+  const selectedTool = codemode ? "fixture_lookup" : "read";
+  const task = { command: "run", prompt: "CHILD_TASK_ONLY: Read fixture.txt and report its content.", tools: [selectedTool] };
+  const code = `const completed = await tools.subagent(${JSON.stringify(task)});
+const status = await tools.subagent({command:'status',id:completed.results[0].id});
+let denied;
+try { await tools.subagent({command:'run',prompt:'must not start',tools:['fixture_hidden']}); }
+catch (error) { denied = error.message; }
+text({completed,status,denied});`;
   const server = Bun.serve({
     hostname: "127.0.0.1", port: 0,
     async fetch(request) {
       const body = await request.json() as any;
       requests.push(body);
-      const names = (body.tools ?? []).map((tool: any) => tool.function.name);
-      const parent = names.includes("subagent");
+      const parent = JSON.stringify(body.messages).includes("PARENT_HISTORY_SECRET");
       const returned = body.messages.some((message: any) => message.role === "tool");
       const delta = returned
         ? { content: parent ? "PARENT_SMOKE_OK" : fails ? "" : "CHILD_SMOKE_OK" }
         : { tool_calls: [{ index: 0, id: parent ? "parent_call" : "child_call", type: "function", function: {
-          name: parent ? "subagent" : "read",
-          arguments: JSON.stringify(parent
-            ? { command: "run", prompt: "CHILD_TASK_ONLY: Read fixture.txt and report its content.", tools: ["read"] }
-            : { path: "fixture.txt" }),
+          name: parent ? codemode ? "codemode" : "subagent" : selectedTool,
+          arguments: JSON.stringify(parent ? codemode ? { code } : task : { path: "fixture.txt" }),
         } }] };
       const chunk = (part: any, finish_reason: string | null) => `data: ${JSON.stringify({ id: "completion", object: "chat.completion.chunk", created: 0, model: "model", choices: [{ index: 0, delta: part, finish_reason }],
-        usage: finish_reason ? { prompt_tokens: parent ? 10 : 20, completion_tokens: parent ? 2 : 3, total_tokens: parent ? 12 : 23 } : undefined,
+        usage: finish_reason ? { prompt_tokens: parent ? 10 : 20, completion_tokens: parent ? 2 : 3, completion_tokens_details: { reasoning_tokens: parent ? 0 : 1 }, total_tokens: parent ? 12 : 23 } : undefined,
       })}\n\n`;
       return new Response(chunk({ role: "assistant", ...delta }, null) + chunk({}, returned ? "stop" : "tool_calls") + "data: [DONE]\n\n", { headers: { "Content-Type": "text/event-stream" } });
     },
@@ -36,13 +46,18 @@ test.each([false, true])("real Pi CLI delegates and accounts child usage, includ
     // A child research tool may itself make paid model calls. Its usage must
     // flow through the child protocol and into the parent's native usage field.
     const usageExtension = path.join(dir, "usage.ts");
-    fs.writeFileSync(usageExtension, `export default function (pi) {
-      pi.on("tool_result", (event) => event.toolName === "read" ? { usage: {
-        input: 7, output: 11, cacheRead: 0, cacheWrite: 0, totalTokens: 18,
+    fs.writeFileSync(usageExtension, `import {readFileSync} from 'node:fs';
+export default function (pi) {
+      pi.registerTool({name:'fixture_lookup',label:'lookup',description:'Read a fixture',exposure:'codemode',parameters:{type:'object',properties:{path:{type:'string'}},required:['path']},
+        execute:async (_id,args) => ({content:[{type:'text',text:readFileSync(args.path,'utf8')}],details:undefined})});
+      pi.registerTool({name:'fixture_hidden',label:'hidden',description:'Not eligible',exposure:'hidden',parameters:{type:'object',properties:{}},
+        execute:async () => {throw new Error('hidden tool executed');}});
+      pi.on("tool_result", (event) => ['read','fixture_lookup'].includes(event.toolName) ? { usage: {
+        input: 7, output: 11, reasoning: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 18,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.5 }
       } } : undefined);
     }`);
-    fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ extensions: [usageExtension] }));
+    fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ extensions: [usageExtension], defaultTools: ["read", "codemode", "subagent"] }));
     fs.writeFileSync(path.join(dir, "models.json"), JSON.stringify({ providers: { fixture: {
       baseUrl: `http://127.0.0.1:${server.port}/v1`, api: "openai-completions", apiKey: "test-only",
       models: [{ id: "model", contextWindow: 128000, maxTokens: 1024 }],
@@ -50,7 +65,7 @@ test.each([false, true])("real Pi CLI delegates and accounts child usage, includ
     const cli = path.resolve(import.meta.dir, "../node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
     const invocation = process.env.PI_CHILD_TEST_CLI ? [process.env.PI_CHILD_TEST_CLI] : ["node", cli];
     const extension = process.env.PI_CHILD_TEST_EXTENSION ?? path.resolve(import.meta.dir, "../extensions/pi-subagents/index.ts");
-    const child = Bun.spawn([...invocation, "--mode", "json", "-p", "--no-session", "--extension", extension, "--tools", "read,subagent", "--model", "fixture/model", "PARENT_HISTORY_SECRET: delegate the bounded task."], {
+    const child = Bun.spawn([...invocation, "--mode", "json", "-p", "--no-session", "--extension", extension, ...(codemode ? [] : ["--tools", "read,subagent"]), "--model", "fixture/model", "PARENT_HISTORY_SECRET: delegate the bounded task."], {
       cwd: dir,
       env: { HOME: dir, PATH: process.env.PATH, PI_CODING_AGENT_DIR: dir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_SUBAGENT_TIMEOUT_MS: "15000" },
       stdout: "pipe", stderr: "pipe",
@@ -66,17 +81,34 @@ test.each([false, true])("real Pi CLI delegates and accounts child usage, includ
     expect({ exit, stderr: err }).toEqual({ exit: 0, stderr: "" });
     expect(out).toContain("PARENT_SMOKE_OK");
     expect(requests).toHaveLength(4);
-    const childRequests = requests.filter((request) => !request.tools.some((tool: any) => tool.function.name === "subagent"));
+    const childRequests = requests.filter((request) => !JSON.stringify(request.messages).includes("PARENT_HISTORY_SECRET"));
     expect(childRequests).toHaveLength(2);
-    expect(childRequests[0].tools.map((tool: any) => tool.function.name)).toEqual(["read"]);
+    expect(childRequests[0].tools.map((tool: any) => tool.function.name)).toEqual([selectedTool]);
+    expect(requests[0].tools.some((tool: any) => tool.function.name === "fixture_lookup")).toBe(false);
     expect(JSON.stringify(childRequests[0].messages)).toContain("CHILD_TASK_ONLY");
     expect(JSON.stringify(childRequests[0].messages)).not.toContain("PARENT_HISTORY_SECRET");
     expect(JSON.stringify(childRequests[1].messages)).toContain("FILE_SENTINEL");
     expect(JSON.stringify(requests.at(-1).messages)).toContain(fails ? "terminal assistant output" : "CHILD_SMOKE_OK");
     const events = out.trim().split("\n").map((line) => JSON.parse(line));
-    const delegated = events.find((event) => event.type === "message_end" && event.message.role === "toolResult" && event.message.toolName === "subagent");
-    expect(delegated.message.isError).toBe(fails);
-    expect(delegated.message.usage).toMatchObject({ input: 47, output: 17, totalTokens: 64, cost: { total: 0.5 } });
+    const delegated = events.find((event) => event.type === "message_end" && event.message.role === "toolResult" && event.message.toolName === (codemode ? "codemode" : "subagent"));
+    expect(delegated.message.isError).toBe(codemode ? false : fails);
+    expect(delegated.message.usage).toMatchObject({ input: 47, output: 17, reasoning: 5, totalTokens: 64, cost: { total: 0.5 } });
+    let completed;
+    if (codemode) {
+      const data = JSON.parse(delegated.message.content.find((part: any) => part.type === "text" && part.text.startsWith("{")).text);
+      completed = data.completed;
+      expect(Check(SubagentDetailsSchema, data.status)).toBe(true);
+      expect(data.status.command).toBe("status");
+      expect(data.status.results[0].id).toBe(completed.results[0].id);
+      expect(data.denied).toContain("active or callable in the parent");
+    } else {
+      const execution = events.find((event) => event.type === "tool_execution_end" && event.toolName === "subagent");
+      completed = execution.result.structuredContent;
+      expect(completed).toEqual(delegated.message.details);
+    }
+    expect(Check(SubagentDetailsSchema, completed)).toBe(true);
+    expect(completed.command).toBe("run");
+    expect(completed.results[0].state).toMatchObject({ status: "terminal", outcome: fails ? "failed" : "completed" });
   } finally {
     proc?.kill();
     server.stop(true);
@@ -131,8 +163,9 @@ execute:async()=>{writeFileSync('probe-ran','yes'); return {content:[{type:'text
       baseUrl: `http://127.0.0.1:${server.port}/v1`, api: "openai-completions", apiKey: "test-only", models: [{ id: "model" }],
     } } }));
     const cli = path.resolve(import.meta.dir, "../node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
-    const extension = path.resolve(import.meta.dir, "../extensions/pi-subagents/index.ts");
-    const child = Bun.spawn(["node", cli, "--mode", "json", "-p", "--no-session", "--extension", extension, "--tools", "subagent,probe", "--model", "fixture/model", "delegate"], {
+    const invocation = process.env.PI_CHILD_TEST_CLI ? [process.env.PI_CHILD_TEST_CLI] : ["node", cli];
+    const extension = process.env.PI_CHILD_TEST_EXTENSION ?? path.resolve(import.meta.dir, "../extensions/pi-subagents/index.ts");
+    const child = Bun.spawn([...invocation, "--mode", "json", "-p", "--no-session", "--extension", extension, "--tools", "subagent,probe", "--model", "fixture/model", "delegate"], {
       cwd: dir, env: { HOME: dir, PATH: process.env.PATH, PI_CODING_AGENT_DIR: dir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_SUBAGENT_RUNNER: runner, PI_SUBAGENT_TIMEOUT_MS: "10000" },
       stdout: "pipe", stderr: "pipe",
     });

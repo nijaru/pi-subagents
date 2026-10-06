@@ -6,6 +6,7 @@ import { SubagentParamsSchema, resolveCwd, selectTools, validateCommand } from "
 import { DEFAULT_WAIT_MS, MAX_OUTPUT_BYTES, foregroundBudgetMs, isChildProcess } from "./limits.ts";
 import { boundDetails, truncateOutput } from "./bounds.ts";
 import { addUsage, failed, isRunning } from "./types.ts";
+import { SubagentDetailsSchema } from "./result-schema.ts";
 import type { ChildResult, SubagentDetails } from "./types.ts";
 import { renderChildCall, renderChildResult, renderChildCompletion } from "./render.ts";
 import { CompletionDelivery } from "./delivery.ts";
@@ -17,7 +18,8 @@ export type { ChildResult, SubagentDetails, AgentOutcome, ChildState, UsageSumma
 export { MAX_CONCURRENCY } from "./limits.ts";
 
 function answer(command: SubagentDetails["command"], results: ChildResult[], text: string, waitExpired?: boolean): AgentToolResult<SubagentDetails> {
-  return { content: [{ type: "text", text: truncateOutput(text, MAX_OUTPUT_BYTES) }], details: boundDetails({ command, results, ...(waitExpired === undefined ? {} : { waitExpired }) }) };
+  const details = boundDetails({ command, results, ...(waitExpired === undefined ? {} : { waitExpired }) });
+  return { content: [{ type: "text", text: truncateOutput(text, MAX_OUTPUT_BYTES) }], details, structuredContent: details };
 }
 
 function outcome(command: "run" | "wait", results: ChildResult[]): AgentToolResult<SubagentDetails> {
@@ -70,6 +72,7 @@ export default function (pi: ExtensionAPI) {
     label: "Subagent",
     description: "Delegate one self-contained task to a fresh child. run joins within a foreground budget, then lets the child finish as background work; spawn returns an id immediately and reports completion later. status, wait and stop control session-scoped children. Defaults to available coding/research tools; tools can narrow access. No profiles, nested delegation, shared history, or persistent child sessions.",
     parameters: SubagentParamsSchema,
+    outputSchema: SubagentDetailsSchema,
     executionMode: "parallel",
     promptSnippet: "Use run for a fresh-context result, or spawn for independent work alongside useful local work.",
     promptGuidelines: [
@@ -102,7 +105,7 @@ export default function (pi: ExtensionAPI) {
         return outcome("wait", results);
       }
       if (signal?.aborted) throw new Error("Child launch cancelled.");
-      const tools = selectTools(params.tools, pi.getActiveTools());
+      const tools = selectTools(params.tools, pi.getActiveTools(), ctx.tools.map((tool) => tool.name));
       const cwd = resolveCwd(ctx.cwd || process.cwd(), params.cwd);
       const foreground = params.command === "run";
       const parentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;

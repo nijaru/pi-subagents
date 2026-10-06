@@ -1,9 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { ModelThinkingLevel, Usage } from "@earendil-works/pi-ai";
 import type { ChildResult } from "./types.ts";
-import { addUsage, emptyUsage } from "./types.ts";
+import { addUsage, copyResult, emptyUsage } from "./types.ts";
 import type { ChildSupervisor } from "./supervisor.ts";
-import { copyResult } from "./supervisor.ts";
 import { MAX_CONCURRENCY, MAX_DIAGNOSTIC_BYTES, MAX_RETAINED_RUNS } from "./limits.ts";
 import { truncateOutput } from "./bounds.ts";
 

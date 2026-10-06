@@ -16,7 +16,7 @@ try {
   // internal dependencies until upstream exposes them publicly.
   const { resolveProjectTrusted } = await import(new URL("./core/project-trust.js", pathToFileURL(sdkPath)));
   const { builtInExtensions } = await import(new URL("./extensions/index.js", pathToFileURL(sdkPath)));
-  await runChild(resolveProjectTrusted, builtInExtensions);
+  await runChild({ resolveProjectTrust: resolveProjectTrusted, builtInExtensions });
 } catch (error) {
   console.error(error);
   process.exitCode = 1;

@@ -41,16 +41,31 @@ Handles belong to the current parent session. All children stop on quit, reload,
 
 The TUI hides agent-facing text — delegated prompts and child reports — behind expansion. Each child is one status line: live work and status listings carry a one-line task label, finished children show only outcome and duration, with the error message added for failures. Expand for the full prompt and report, full IDs, diagnostics, working directory, tools, and usage. Short IDs are display-only; tool calls still require the full ID. Completion notices occupy one line, with results available on expansion.
 
+### Programmatic results
+
+Codemode calls receive `{ command, results, waitExpired? }`, not report text. Each child carries its id, lifecycle `state`, bounded report and diagnostics, truncation metadata, and usage. The same bounded envelope is returned as tool `details`; the model still receives a text summary. Child reports do not have to be JSON.
+
+```javascript
+const result = await tools.subagent({
+  command: "run", prompt: "Review src/parser.ts. Return concrete findings; do not edit.", tools: ["read"],
+});
+for (const child of result.results) {
+  text({ id: child.id, state: child.state, report: child.output, error: child.errorMessage });
+}
+```
+
+Failed children remain structured results, even when Pi marks the call as a tool error. Inspect `state.outcome` rather than assuming that a resolved script call means success. Invalid requests and cancelled waits still reject. `waitExpired` distinguishes a wait budget expiring from a child execution timeout.
+
 ### Usage accounting
 
-Child usage includes assistant calls and usage reported by child tools. After cleanup finishes, each child's usage is added once to the next parent tool result, including failed results. Repeated `status`, `wait`, or `stop` calls do not charge it again. Pi includes this usage in its footer, `/session`, and RPC totals.
+Child usage includes assistant calls and usage reported by child tools, including reported reasoning tokens. Reasoning tokens are a breakdown of output tokens, not extra tokens added to the total. After cleanup finishes, each child's usage is added once to the next parent tool result, including failed results. Repeated `status`, `wait`, or `stop` calls do not charge it again. Pi includes this usage in its footer, `/session`, and RPC totals.
 
 Pi cannot attach usage to a custom completion message. Background costs therefore enter native totals only when another parent tool finishes; until then, they remain visible in the child details. Quit, reload, or session replacement discards any unreported usage, including usage from children stopped during shutdown. No extra tool call or model turn is created just to report costs.
 
 ### Tools and context
 
 - Defaults are the parent's active tools among `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `web_research`, `resolve-library-id`, and `query-docs`. Research tools require their extensions; they are not supplied by this package.
-- `tools` selects an explicit allowlist, restricted to tools active in the parent. `tools: []` is reasoning-only. An empty default selection is rejected rather than silently launching an unusable coding child.
+- `tools` selects an explicit allowlist from tools active **or callable** in the parent, including codemode/deferred tools that are not declared to the model. Merely registered or hidden tools are not eligible. Selecting a tool does not activate it in the parent. `tools: []` is reasoning-only. An empty default selection is rejected rather than silently launching an unusable coding child.
 - Children are leaves. The `subagent` tool cannot be passed to them, and nested calls are rejected.
 - `model` optionally selects an exact `provider/model-id`; otherwise the parent's model is inherited. Fuzzy CLI model patterns are not accepted.
 - `thinking` selects a Pi reasoning effort supported by that model, such as `high` or `xhigh`. Omitted effort inherits the parent's level for the same model; a different model uses its own Pi defaults (per-model setting, then the global default). An unsupported explicit effort fails before prompting rather than silently changing it. Pi may clamp inherited/default effort to model capabilities; reports and expanded details show the effective startup level.
@@ -107,7 +122,8 @@ Environment variables are allowlisted, with standard model credentials, `$VAR` r
 
 - Pi 1.0.4 is now the minimum supported host. Earlier SDK versions are no longer supported.
 - Children load the selected installation's CLI built-ins, respecting disabled or replacement extensions. You no longer need a separate extension to supply codemode or MCP to SDK children.
-- `tools` remains an exact list, not Pi CLI wildcard patterns. Include every tool the child may call, including through codemode; omitted MCP tools are no longer implicitly callable.
+- `tools` remains an exact list, not Pi CLI wildcard patterns. Include every tool the child may call, including through codemode; omitted MCP tools are no longer implicitly callable. Explicit selections may now name parent-callable tools that are not active; defaults still use active coding/research tools only.
+- Codemode callers now receive the structured `{ command, results, waitExpired? }` envelope instead of text. Inspect child states and output fields directly; do not parse the prose summary. Native `isError` results retain this data, so a failed child does not reject the script call.
 - Direct callers of the extension's `execute()` receive `{ isError: true, content, details }` for failed child reports rather than a rejected promise. Invalid requests and cancelled waits still throw. Pi presents both as native tool errors.
 
 ## Migration from single-child waits

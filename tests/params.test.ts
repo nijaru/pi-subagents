@@ -17,14 +17,16 @@ afterEach(() => {
 
 describe("tool selection", () => {
   test("has usable defaults without enabling control tools", () => {
-    expect(selectTools(undefined, ["read", "bash", "edit", "write", "subagent", "intercom", "web_search"])).toEqual(["read", "bash", "edit", "write", "web_search"]);
-    expect(selectTools(undefined, ["read"])).toEqual(["read"]);
-    expect(() => selectTools(undefined, [])).toThrow("tools: []");
-    expect(selectTools([], [])).toEqual([]);
+    expect(selectTools(undefined, ["read", "bash", "edit", "write", "subagent", "intercom", "web_search"], ["mcp__server__lookup"])).toEqual(["read", "bash", "edit", "write", "web_search"]);
+    expect(selectTools(undefined, ["read"], ["web_search"])).toEqual(["read"]);
+    expect(() => selectTools(undefined, [], ["mcp__server__lookup"])).toThrow("tools: []");
+    expect(selectTools([], [], [])).toEqual([]);
   });
-  test("explicit extension tools must be active, not merely installed", () => {
-    expect(selectTools(["query-docs"], ["read", "query-docs"])).toEqual(["query-docs"]);
-    expect(() => selectTools(["query-docs"], ["read"])).toThrow("active in the parent");
+  test("explicit tools may be active or callable, but not merely registered", () => {
+    expect(selectTools(["query-docs"], ["read", "query-docs"], [])).toEqual(["query-docs"]);
+    expect(selectTools(["mcp__server__lookup"], ["read"], ["mcp__server__lookup"])).toEqual(["mcp__server__lookup"]);
+    expect(() => selectTools(["query-docs"], ["read"], [])).toThrow("active or callable in the parent");
+    expect(() => selectTools(["subagent"], ["subagent"], ["subagent"])).toThrow("leaves");
   });
   test("malformed and nested depth markers fail closed", () => {
     delete process.env.PI_SUBAGENT_DEPTH;

@@ -137,6 +137,7 @@ test.each([{ tools: ["runtime_only_missing"] }, { model: "fixture/missing" }])("
   expect(result.code).toBe(1);
   expect(result.events.at(-1)?.kind).toBe("error");
   expect(existsSync(join(dir, "provider-called"))).toBe(false);
+  if (request.tools) expect(existsSync(join(dir, "child-shutdown"))).toBe(true);
 });
 
 test("SDK verifies explicit effort and reports effective inherited/default effort", async () => {

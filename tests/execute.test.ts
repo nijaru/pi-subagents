@@ -4,6 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import extension from "../extensions/pi-subagents/index.ts";
 import { MAX_COMPLETION_BYTES } from "../extensions/pi-subagents/limits.ts";
+import { Check } from "typebox/value";
+import { SubagentDetailsSchema } from "../extensions/pi-subagents/result-schema.ts";
 
 const directories: string[] = [];
 interface Host {
@@ -35,7 +37,7 @@ function host(active = ["read", "bash", "edit", "write", "web_search", "web_fetc
   } as any);
   const cwd = tempDir();
   const entries: any[] = [];
-  const context = { cwd, hasUI: false, model: { provider: "parent", id: "model" }, thinkingLevel: "high",
+  const context = { cwd, hasUI: false, tools: active.map((name) => ({ name })), model: { provider: "parent", id: "model" }, thinkingLevel: "high",
     sessionManager: { getBranch: () => entries } };
   const instance = {
     tool, cwd, notices,
@@ -167,7 +169,7 @@ describe("task-first tool", () => {
   });
   test("rejects unavailable tools, recursive calls, malformed depth and missing cwd", async () => {
     const h = host(["read", "subagent"]);
-    await expect(h.execute({ command: "run", prompt: "x", tools: ["bash"] })).rejects.toThrow("active in the parent");
+    await expect(h.execute({ command: "run", prompt: "x", tools: ["bash"] })).rejects.toThrow("active or callable in the parent");
     await expect(h.execute({ command: "run", prompt: "x", tools: ["subagent"] })).rejects.toThrow("leaves");
     await expect(h.execute({ command: "run", prompt: "x", cwd: "missing" })).rejects.toThrow("does not exist");
     for (const depth of ["1", "3", "garbage", "-1", ""]) {
@@ -225,6 +227,8 @@ describe("background lifecycle", () => {
     while ((await h.execute({ command: "status" })).details.results.some((r: any) => r.state.status === "running") && Date.now() < deadline) await Bun.sleep(10);
     const value = await h.execute({ command: "wait", ids });
     expect(value.isError).toBe(true);
+    expect(Check(SubagentDetailsSchema, value.structuredContent)).toBe(true);
+    expect(value.structuredContent).toEqual(value.details);
     const text = value.content[0].text;
     for (const id of ids) expect(text).toContain(id);
     expect(text).toContain("completed");

@@ -1,58 +1,17 @@
 import type { Message, ModelThinkingLevel, StopReason, Usage } from "@earendil-works/pi-ai";
+import type { Static } from "typebox";
+import type { OutcomeSchema, ChildStateSchema, UsageSchema, OutputTruncationSchema, ChildResultSchema, SubagentDetailsSchema } from "./result-schema.ts";
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const satisfies readonly ModelThinkingLevel[];
 export function isThinkingLevel(value: unknown): value is ModelThinkingLevel {
   return typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value);
 }
 
-export type AgentOutcome = "completed" | "incomplete" | "failed" | "cancelled" | "timed_out";
-
-/**
- * One discriminated lifecycle state. Everything that differs between a live
- * child and a finished one lives here, so no call site has to infer liveness
- * from a sentinel exit code or repair mismatched fields.
- */
-export type ChildState =
-  | { status: "running" }
-  | {
-      status: "terminal";
-      outcome: AgentOutcome;
-      exitCode: number;
-      stopReason?: StopReason;
-      finishedAt: number;
-    };
-
-export interface UsageSummary extends Usage {
-  turns: number;
-}
-
-export interface OutputTruncation {
-  truncated: boolean;
-  originalBytes: number;
-  /** UTF-8 bytes retained, including the truncation marker when present. */
-  retainedBytes: number;
-}
-
-export interface ChildResult {
-  id: string;
-  prompt: string;
-  cwd: string;
-  tools: string[];
-  /** Final assistant text, kept separately from bounded diagnostics. */
-  output?: string;
-  outputTruncation?: OutputTruncation;
-  /** Child stdout is diagnostic only; protocol travels on a private pipe. */
-  stdout?: string;
-  /** Wall-clock launch time for user-visible runtime reporting. */
-  startedAt?: number;
-  state: ChildState;
-  errorMessage?: string;
-  stderr: string;
-  usage: UsageSummary;
-  model?: string;
-  /** Effective Pi thinking level, reported only after child startup verification. */
-  thinking?: ModelThinkingLevel;
-}
+export type AgentOutcome = Static<typeof OutcomeSchema>;
+export type ChildState = Static<typeof ChildStateSchema>;
+export type UsageSummary = Static<typeof UsageSchema>;
+export type OutputTruncation = Static<typeof OutputTruncationSchema>;
+export type ChildResult = Static<typeof ChildResultSchema>;
 
 export function isRunning(result: ChildResult): boolean {
   return result.state.status === "running";
@@ -66,11 +25,13 @@ export function outcomeOf(result: ChildResult): AgentOutcome | undefined {
   return result.state.status === "terminal" ? result.state.outcome : undefined;
 }
 
-export interface SubagentDetails {
-  command: "run" | "spawn" | "status" | "wait" | "stop";
-  results: ChildResult[];
-  /** A wait budget expired with no selected child complete; not a child timeout. */
-  waitExpired?: boolean;
+export type SubagentDetails = Static<typeof SubagentDetailsSchema>;
+
+/** Snapshots never lend mutable session-owned fields to callers. */
+export function copyResult(result: ChildResult): ChildResult {
+  return { ...result, tools: [...result.tools], state: { ...result.state },
+    outputTruncation: result.outputTruncation ? { ...result.outputTruncation } : undefined,
+    usage: { ...result.usage, cost: { ...result.usage.cost } } };
 }
 
 export function emptyUsage(): UsageSummary {
@@ -97,6 +58,7 @@ export function addUsage(target: Usage, usage: Usage): void {
   target.cost.cacheWrite += usage.cost?.cacheWrite || 0;
   target.cost.total += usage.cost?.total || 0;
   if (usage.cacheWrite1h !== undefined) target.cacheWrite1h = (target.cacheWrite1h || 0) + usage.cacheWrite1h;
+  if (usage.reasoning !== undefined) target.reasoning = (target.reasoning || 0) + usage.reasoning;
 }
 
 export function isFiniteNumber(value: unknown): value is number {
@@ -122,7 +84,7 @@ export function isUsage(value: unknown): value is Usage {
   const cost = usage.cost;
   if (!cost || typeof cost !== "object") return false;
   return ["input", "output", "cacheRead", "cacheWrite", "total"].every((key) => nonnegative((cost as Record<string, unknown>)[key]))
-    && (usage.cacheWrite1h === undefined || nonnegative(usage.cacheWrite1h));
+    && ["cacheWrite1h", "reasoning"].every((key) => usage[key] === undefined || nonnegative(usage[key]));
 }
 
 export function isContentPart(value: unknown): value is { type: string; text?: unknown } {

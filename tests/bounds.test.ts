@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { boundChildResult, boundDetails, jsonBytes, minimalChildResult, truncateOutput } from "../extensions/pi-subagents/bounds.ts";
 import { emptyUsage, type ChildResult } from "../extensions/pi-subagents/types.ts";
+import { Check } from "typebox/value";
+import { SubagentDetailsSchema } from "../extensions/pi-subagents/result-schema.ts";
 
 function child(id = "child-1"): ChildResult {
   return {
@@ -20,6 +22,7 @@ describe("serialized result bounds", () => {
     const bounded = boundDetails({ command: "wait", results });
     expect(JSON.stringify(results)).toBe(original);
     expect(jsonBytes(bounded)).toBeLessThanOrEqual(51200);
+    expect(Check(SubagentDetailsSchema, bounded)).toBe(true);
     expect(bounded.results.map(result => result.id)).toEqual(results.map(result => result.id));
     for (const [i, result] of bounded.results.entries()) {
       expect(result.state).toEqual(results[i]!.state);

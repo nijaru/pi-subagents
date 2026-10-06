@@ -11,7 +11,7 @@ export const SubagentParamsSchema = Type.Object({
   }),
   prompt: Type.Optional(Type.String({ description: "Self-contained task: scope, relevant evidence, constraints, expected output and checks", minLength: 1, maxLength: MAX_TASK_BYTES })),
   tools: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 256, pattern: "^[A-Za-z][A-Za-z0-9_.:-]*$" }), {
-    description: "Tool allowlist, restricted to the parent's active tools. Defaults to available coding and known research tools; [] means reasoning only. No nested subagent tool.", maxItems: 64, uniqueItems: true,
+    description: "Exact tool allowlist: tools must be active or callable in the parent. Defaults to active coding and known research tools; [] means reasoning only. No nested subagent tool.", maxItems: 64, uniqueItems: true,
   })),
   model: Type.Optional(Type.String({ description: "run/spawn only: exact provider/model-id; omitted inherits the parent model", minLength: 1, maxLength: 512 })),
   thinking: Type.Optional(StringEnum(THINKING_LEVELS, {
@@ -28,20 +28,18 @@ export const SubagentParamsSchema = Type.Object({
 
 export type SubagentParams = Static<typeof SubagentParamsSchema>;
 
-// Always offered by default, and the source of the research tools in the default
-// allowlist below; `read` is filtered out there because it is listed explicitly.
-export const READ_ONLY_TOOLS = new Set([
-  "read", "grep", "find", "ls", "web_search", "web_fetch", "web_research", "resolve-library-id", "query-docs",
-]);
-const CODING_TOOLS = ["read", "bash", "edit", "write"];
-const DEFAULT_TOOLS = [...CODING_TOOLS, ...[...READ_ONLY_TOOLS].filter((name) => name !== "read")];
+const DEFAULT_TOOLS = [
+  "read", "bash", "edit", "write", "grep", "find", "ls",
+  "web_search", "web_fetch", "web_research", "resolve-library-id", "query-docs",
+];
 
-export function selectTools(requested: string[] | undefined, active: string[]): string[] {
+export function selectTools(requested: string[] | undefined, active: string[], callable: readonly string[]): string[] {
   const tools = requested ?? DEFAULT_TOOLS.filter((name) => active.includes(name));
   if (requested === undefined && tools.length === 0) throw new Error("No default child tools are active. Specify tools: [] for a reasoning-only task.");
   if (tools.some((name) => name === "subagent")) throw new Error("Children are leaves: the subagent tool cannot be delegated.");
-  const unavailable = tools.filter((name) => !active.includes(name));
-  if (unavailable.length) throw new Error(`Child tools must be active in the parent: ${unavailable.join(", ")}.`);
+  const eligible = new Set([...active, ...callable]);
+  const unavailable = tools.filter((name) => !eligible.has(name));
+  if (unavailable.length) throw new Error(`Child tools must be active or callable in the parent: ${unavailable.join(", ")}.`);
   return [...tools];
 }
 

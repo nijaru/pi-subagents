@@ -7,7 +7,8 @@ import { getChildInvocation } from "../extensions/pi-subagents/subprocess.ts";
 import { CHILD_PROTOCOL_VERSION, parseChildEvent } from "../extensions/pi-subagents/child-protocol.ts";
 
 // Real SDK, built-in integrations, and stdio MCP. Only the model is local/fake.
-async function run(tools: string[], tool: string, args: unknown, exposure?: string) {
+async function run(tools: string[], tool: string, args: unknown, options: { exposure?: string; cancelStartup?: boolean } = {}) {
+  const { exposure, cancelStartup } = options;
   const dir = mkdtempSync(join(tmpdir(), "pi-child-tools-"));
   let child: ReturnType<typeof spawn> | undefined;
   let deadline: ReturnType<typeof setTimeout> | undefined;
@@ -17,8 +18,14 @@ async function run(tools: string[], tool: string, args: unknown, exposure?: stri
 import {createAssistantMessageEventStream, getCurrentTools} from '@earendil-works/pi-ai';
 import {writeFileSync} from 'node:fs';
 export default pi => {
+  pi.on('session_shutdown', () => writeFileSync(process.cwd()+'/child-shutdown','yes'));
+  pi.on('tool_result', event => event.toolName === 'read' ? {usage:{input:7,output:11,reasoning:3,cacheRead:0,cacheWrite:0,totalTokens:18,
+    cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0.5}}} : undefined);
   pi.registerTool({name:'delegate_probe', label:'probe', description:'Calls a nested tool', parameters:{type:'object',properties:{target:{type:'string'}},required:['target']},
-    execute:async (_id,args,signal,_update,ctx) => ctx.executeTool(args.target, {}, {signal})});
+    execute:async (_id,args,signal,_update,ctx) => {
+      const outcome = await ctx.executeTool(args.target, {}, {signal});
+      return {content:outcome.result.content,details:undefined,isError:outcome.isError};
+    }});
   if (${JSON.stringify(!exposure)}) for(const name of ['mcp__omitted__action','list_mcp_resources','list_mcp_resource_templates','read_mcp_resource']) {
     pi.registerTool({name, label:'omitted', description:'Must not execute', exposure:'codemode', parameters:{type:'object',properties:{}},
       execute:async () => {writeFileSync(process.cwd()+'/omitted-called','yes'); return {content:[{type:'text',text:'OMITTED_EXECUTED'}]};}});
@@ -42,12 +49,13 @@ export default pi => {
     if (exposure) {
       writeFileSync(join(dir, "server.mjs"), `
 import {createInterface} from 'node:readline';
+import {writeFileSync} from 'node:fs';
 const input=createInterface({input:process.stdin});
 for await (const line of input) {
   const request=JSON.parse(line); if(request.id===undefined) continue;
   let result;
   if(request.method==='initialize') result={protocolVersion:'2024-11-05',capabilities:{tools:{},resources:{}},serverInfo:{name:'fixture',version:'1'}};
-  else if(request.method==='tools/list') {await new Promise(resolve=>setTimeout(resolve,100));result={tools:[{name:'echo',description:'Echo',inputSchema:{type:'object',properties:{}}}]};}
+  else if(request.method==='tools/list') {writeFileSync('mcp-listing','yes');await new Promise(resolve=>setTimeout(resolve,${cancelStartup ? 10000 : 100}));result={tools:[{name:'echo',description:'Echo',inputSchema:{type:'object',properties:{}}}]};}
   else if(request.method==='tools/call') result={content:[{type:'text',text:'MCP_OK'}]};
   else if(request.method==='resources/read') result={contents:[{uri:request.params.uri,mimeType:'text/plain',text:'RESOURCE_OK'}]};
   else if(request.method==='resources/list') result={resources:[]};
@@ -71,10 +79,19 @@ for await (const line of input) {
     const closed = new Promise((resolve, reject) => { child!.once("close", resolve); child!.once("error", reject); });
     deadline = setTimeout(() => child?.kill("SIGKILL"), 15000);
     child.stdin!.end(JSON.stringify({ version: CHILD_PROTOCOL_VERSION, prompt: "Exercise the selected tool.", model: "fixture/model", tools }));
+    if (cancelStartup) {
+      const until = Date.now() + 5000;
+      while (!existsSync(join(dir, "mcp-listing")) && Date.now() < until) await Bun.sleep(10);
+      expect(existsSync(join(dir, "mcp-listing"))).toBe(true);
+      child.kill("SIGTERM");
+      clearTimeout(deadline);
+      deadline = setTimeout(() => child?.kill("SIGKILL"), 5000);
+    }
     const code = await closed;
     const events = (await wire).trim().split("\n").map(parseChildEvent);
     return { code, events, stdout: await stdout, stderr: await stderr,
-      omittedCalled: existsSync(join(dir, "omitted-called")), providerCalled: existsSync(join(dir, "provider-called")) };
+      omittedCalled: existsSync(join(dir, "omitted-called")), providerCalled: existsSync(join(dir, "provider-called")),
+      shutdown: existsSync(join(dir, "child-shutdown")) };
   } finally {
     clearTimeout(deadline);
     child?.kill();
@@ -90,16 +107,26 @@ test.each(["mcp__omitted__action", "list_mcp_resources", "list_mcp_resource_temp
   expect(JSON.parse(report.report.output)).toMatchObject({ names: ["delegate_probe"], isError: true });
 });
 
-test("SDK child loads built-in codemode and can call an explicitly allowed built-in", async () => {
+test("SDK child codemode accounts paid nested work exactly once", async () => {
   const result = await run(["read", "codemode"], "codemode", { code: "text(await tools.read({path:'fixture.txt'}));" });
   expect(result.code).toBe(0);
   expect(result.events.at(-1)).toMatchObject({ kind: "result" });
   expect((result.events.at(-1) as any).report.output).toContain("READ_OK");
   expect(result.omittedCalled).toBe(false);
+  expect((result.events.at(-1) as any).usage).toMatchObject({ input: 9, output: 13, reasoning: 3, totalTokens: 22, turns: 2, cost: { total: 0.5 } });
 });
 
+test("cancelling MCP readiness closes the startup-owned session without prompting", async () => {
+  const result = await run(["mcp__fixture__echo"], "mcp__fixture__echo", {}, { exposure: "codemode", cancelStartup: true });
+  expect(result.code).toBe(1);
+  expect(result.events.some((event) => event.kind === "ready")).toBe(false);
+  expect(result.events.at(-1)).toMatchObject({ kind: "error" });
+  expect(result.providerCalled).toBe(false);
+  expect(result.shutdown).toBe(true);
+}, 15000);
+
 test("child waits for an explicitly selected asynchronous MCP resource tool", async () => {
-  const result = await run(["read_mcp_resource"], "read_mcp_resource", { server: "fixture", uri: "fixture:///data" }, "codemode");
+  const result = await run(["read_mcp_resource"], "read_mcp_resource", { server: "fixture", uri: "fixture:///data" }, { exposure: "codemode" });
   expect(result.code).toBe(0);
   const report = result.events.at(-1) as any;
   expect(JSON.parse(report.report.output)).toMatchObject({ names: ["read_mcp_resource"], isError: false });
@@ -107,7 +134,7 @@ test("child waits for an explicitly selected asynchronous MCP resource tool", as
 });
 
 test.each(["direct", "codemode"])("child waits for an explicitly selected asynchronous MCP tool (%s)", async (exposure) => {
-  const result = await run(["mcp__fixture__echo"], "mcp__fixture__echo", {}, exposure);
+  const result = await run(["mcp__fixture__echo"], "mcp__fixture__echo", {}, { exposure });
   expect(result.code).toBe(0);
   const report = result.events.at(-1) as any;
   expect(JSON.parse(report.report.output)).toMatchObject({ names: ["mcp__fixture__echo"], isError: false });

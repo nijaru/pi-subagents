@@ -103,9 +103,3 @@ export function classifyExecution(process: ProcessResult, report?: ChildReport, 
   return { outcome: "failed", exitCode: 1, stopReason: "error", errorMessage: boundedDiagnostic(report?.errorMessage)
     ?? "Child produced no terminal assistant output; a final response is required." };
 }
-
-export function copyResult(result: ChildResult): ChildResult {
-  return { ...result, tools: [...result.tools], state: { ...result.state },
-    outputTruncation: result.outputTruncation ? { ...result.outputTruncation } : undefined,
-    usage: { ...result.usage, cost: { ...result.usage.cost } } };
-}
