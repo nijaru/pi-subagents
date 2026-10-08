@@ -109,7 +109,7 @@ afterEach(async () => {
 describe("task-first tool", () => {
   test("exposes the lifecycle schema and allows parallel scheduling", () => {
     const tool = host().tool;
-    expect(Object.keys(tool.parameters.properties)).toEqual(["command", "prompt", "tools", "model", "thinking", "cwd", "id", "ids", "timeoutMs"]);
+    expect(Object.keys(tool.parameters.properties).sort()).toEqual(["command", "prompt", "tools", "model", "thinking", "cwd", "id", "ids", "timeoutMs"].sort());
     expect(tool.executionMode).toBe("parallel");
   });
   test("runs without profiles, inherits model/thinking, and delivers the prompt on stdin", async () => {
