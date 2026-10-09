@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { CompletionDelivery } from "../extensions/pi-subagents/delivery.ts";
 import { SessionChildren } from "../extensions/pi-subagents/children.ts";
 import { MAX_OUTPUT_BYTES, MAX_RETAINED_RUNS } from "../extensions/pi-subagents/limits.ts";
+import { emptyUsage } from "../extensions/pi-subagents/types.ts";
 
 function controlled() {
   const gates: ReturnType<typeof Promise.withResolvers<void>>[] = [];
@@ -9,13 +10,12 @@ function controlled() {
   const statuses: (string | undefined)[] = [];
   let delivery: CompletionDelivery;
   const children = new SessionChildren({
-    async run({ result, signal }) {
+    async run({ signal }) {
       const gate = Promise.withResolvers<void>();
       gates.push(gate);
       signal.addEventListener("abort", () => gate.resolve(), { once: true });
       await gate.promise;
-      result.output = "report";
-      return { outcome: signal.aborted ? "cancelled" : "completed", exitCode: 0, stopReason: "stop" };
+      return { output: "report", stderr: "", usage: emptyUsage(), outcome: signal.aborted ? "cancelled" : "completed", exitCode: 0, stopReason: "stop" };
     },
   }, () => delivery.refreshStatus());
   const ctx: any = { sessionManager: { getBranch: () => entries }, ui: { setStatus: (_key: string, value: string | undefined) => statuses.push(value) } };

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { ModelThinkingLevel, Usage } from "@earendil-works/pi-ai";
 import type { ChildResult } from "./types.ts";
 import { addUsage, copyResult, emptyUsage } from "./types.ts";
-import type { ChildSupervisor } from "./supervisor.ts";
+import type { ChildSupervisor, ChildTask } from "./supervisor.ts";
 import { MAX_CONCURRENCY, MAX_DIAGNOSTIC_BYTES, MAX_RETAINED_RUNS } from "./limits.ts";
 import { truncateOutput } from "./bounds.ts";
 
@@ -56,23 +56,31 @@ export class SessionChildren {
       result, delivery: "unread", controller: new AbortController(), settled: false,
       promise: completion.promise, waiters: new Set(), activeWaits: 0,
     };
+    const task: ChildTask = Object.freeze({
+      id: result.id, prompt: options.prompt, cwd: options.cwd, tools: Object.freeze([...options.tools]),
+      model: options.model, thinking: options.thinking, strictThinking: options.strictThinking,
+    });
     // Register before execution can emit, await, or invoke extension callbacks.
     this.runs.set(result.id, run);
-    void this.execute(run, options).then(completion.resolve, completion.reject);
+    void this.execute(run, task, options.emit).then(completion.resolve, completion.reject);
     return run;
   }
 
-  private async execute(run: ChildRun, options: StartChild): Promise<ChildResult> {
+  private async execute(run: ChildRun, task: ChildTask, emit: StartChild["emit"]): Promise<ChildResult> {
+    let presentationFailed = false;
     try {
-      const outcome = await this.supervisor.run({
-        result: run.result, thinking: options.thinking, strictThinking: options.strictThinking, signal: run.controller.signal,
-        emit: options.emit ? (result, progress) => { if (!this.closed) options.emit?.(result, progress); } : undefined,
+      const { outcome, exitCode, stopReason, ...data } = await this.supervisor.run({
+        task, signal: run.controller.signal,
+        onUpdate: (data, progress) => {
+          run.result = copyResult({ ...run.result, ...data });
+          if (this.closed || presentationFailed || !emit || progress === undefined) return;
+          try { emit(this.snapshot(run), progress); } catch { presentationFailed = true; }
+        },
       });
-      if (outcome.errorMessage) run.result.errorMessage = outcome.errorMessage;
-      run.result.state = {
-        status: "terminal", outcome: outcome.outcome, exitCode: outcome.exitCode,
-        stopReason: outcome.stopReason, finishedAt: Date.now(),
-      };
+      run.result = copyResult({
+        ...run.result, ...data,
+        state: { status: "terminal", outcome, exitCode, stopReason, finishedAt: Date.now() },
+      });
     } catch (error) {
       const cancelled = run.controller.signal.aborted;
       run.result.errorMessage = truncateOutput(error instanceof Error ? error.message : String(error), MAX_DIAGNOSTIC_BYTES);

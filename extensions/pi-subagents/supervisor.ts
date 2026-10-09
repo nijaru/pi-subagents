@@ -2,15 +2,30 @@ import type { AgentOutcome, ChildResult } from "./types.ts";
 import type { ModelThinkingLevel, StopReason } from "@earendil-works/pi-ai";
 import { RUNNING_PROGRESS_TEXT, RUNTIME_UPDATE_INTERVAL_MS } from "./limits.ts";
 import { boundedDiagnostic } from "./bounds.ts";
+import { copyUsage, emptyUsage } from "./types.ts";
 import { runPiProcess, type ProcessResult } from "./subprocess.ts";
 import { CHILD_PROTOCOL_VERSION, type ChildReport } from "./child-protocol.ts";
 
+export interface ChildTask {
+  readonly id: string;
+  readonly prompt: string;
+  readonly cwd: string;
+  readonly tools: readonly string[];
+  readonly model?: string;
+  readonly thinking?: ModelThinkingLevel;
+  readonly strictThinking?: boolean;
+}
+
+/** Execution data never includes session identity, lifecycle, or delivery state. */
+export type ChildExecutionData = Pick<ChildResult,
+  "startedAt" | "model" | "thinking" | "usage" | "output" | "outputTruncation" | "stdout" | "stderr" | "errorMessage"
+>;
+
 export interface ChildRunRequest {
-  result: ChildResult;
-  thinking?: ModelThinkingLevel;
-  strictThinking?: boolean;
-  signal: AbortSignal;
-  emit?: (result: ChildResult, progress: string) => void;
+  readonly task: ChildTask;
+  readonly signal: AbortSignal;
+  /** Detached snapshots; progress text is optional for metadata-only updates. */
+  readonly onUpdate?: (data: ChildExecutionData, progress?: string) => void;
 }
 
 /** Execution facts only. The session registry owns lifecycle and notification. */
@@ -20,64 +35,74 @@ export interface ChildExecutionOutcome {
   stopReason?: StopReason;
   errorMessage?: string;
 }
+export interface ChildExecutionResult extends ChildExecutionData, ChildExecutionOutcome {}
+
 export interface ChildSupervisor {
-  /** Fills derived output/usage/diagnostics; resolves only after process-tree cleanup. */
-  run(request: ChildRunRequest): Promise<ChildExecutionOutcome>;
+  /** Owns execution data and resolves only after process-tree cleanup. */
+  run(request: ChildRunRequest): Promise<ChildExecutionResult>;
 }
 
 export class SubprocessChildSupervisor implements ChildSupervisor {
-  async run({ result, thinking, strictThinking, signal, emit }: ChildRunRequest): Promise<ChildExecutionOutcome> {
+  async run({ task, signal, onUpdate }: ChildRunRequest): Promise<ChildExecutionResult> {
+    const data: ChildExecutionData = { model: task.model, stderr: "", usage: emptyUsage() };
+    const snapshot = (): ChildExecutionData => ({
+      ...data, usage: copyUsage(data.usage),
+      outputTruncation: data.outputTruncation ? { ...data.outputTruncation } : undefined,
+    });
+    const publish = (progress?: string) => onUpdate?.(snapshot(), progress);
     let ready = false;
     let terminal: ChildReport | undefined;
     let protocolFailure: string | undefined;
-    let presentationFailed = false;
     let runtimeTimer: ReturnType<typeof setInterval> | undefined;
-    const report = (progress: string) => {
-      if (presentationFailed || !emit) return;
-      try { emit(result, progress); } catch { presentationFailed = true; }
-    };
     try {
       if (signal.aborted) throw new Error("Child aborted before launch.");
-      result.startedAt = Date.now();
-      report(RUNNING_PROGRESS_TEXT);
-      runtimeTimer = setInterval(() => report(RUNNING_PROGRESS_TEXT), RUNTIME_UPDATE_INTERVAL_MS);
+      data.startedAt = Date.now();
+      publish(RUNNING_PROGRESS_TEXT);
+      if (onUpdate) runtimeTimer = setInterval(() => publish(RUNNING_PROGRESS_TEXT), RUNTIME_UPDATE_INTERVAL_MS);
       const processResult = await runPiProcess({
-        bootstrap: { version: CHILD_PROTOCOL_VERSION, prompt: result.prompt, tools: result.tools, model: result.model, thinking, strictThinking },
-        cwd: result.cwd, childRunId: result.id, signal,
+        bootstrap: { version: CHILD_PROTOCOL_VERSION, prompt: task.prompt, tools: [...task.tools], model: task.model,
+          thinking: task.thinking, strictThinking: task.strictThinking },
+        cwd: task.cwd, childRunId: task.id, signal,
         onEvent: (event) => {
           if (terminal || protocolFailure !== undefined) throw new Error("Child sent a frame after its terminal result.");
           if (event.kind === "error") {
             protocolFailure = boundedDiagnostic(event.errorMessage) || "Child reported an error.";
           } else if (event.kind === "ready") {
-            if (ready || (result.model && event.model !== result.model) || (strictThinking && event.thinking !== thinking)
-              || event.tools.length !== result.tools.length || result.tools.some((tool) => !event.tools.includes(tool))) {
+            if (ready || (task.model && event.model !== task.model) || (task.strictThinking && event.thinking !== task.thinking)
+              || event.tools.length !== task.tools.length || task.tools.some((tool) => !event.tools.includes(tool))) {
               throw new Error("Child bootstrap did not match requested model/thinking/tools.");
             }
             ready = true;
-            result.model = event.model;
-            result.thinking = event.thinking;
+            data.model = event.model;
+            data.thinking = event.thinking;
+            publish();
           } else {
             if (!ready) throw new Error("Child sent task events before bootstrap verification.");
-            if (event.kind === "usage") result.usage = event.usage;
-            if (event.kind === "progress") report(event.text);
+            if (event.kind === "usage") {
+              data.usage = event.usage;
+              publish();
+            }
+            if (event.kind === "progress") publish(event.text);
             if (event.kind === "result") {
               terminal = event.report;
-              result.usage = event.usage;
-              result.output = terminal.output;
-              result.outputTruncation = terminal.outputTruncation;
-              result.errorMessage = terminal.errorMessage;
+              data.usage = event.usage;
+              data.output = terminal.output;
+              data.outputTruncation = terminal.outputTruncation;
+              data.errorMessage = terminal.errorMessage;
+              publish();
             }
           }
         },
       });
-      result.stderr = processResult.stderr;
-      result.stdout = processResult.stdout;
+      data.stderr = processResult.stderr;
+      data.stdout = processResult.stdout;
       const outcome = classifyExecution(processResult, terminal, protocolFailure);
-      report(result.output || outcome.errorMessage || "(no output)");
-      return outcome;
+      data.errorMessage = outcome.errorMessage;
+      publish(data.output || outcome.errorMessage || "(no output)");
+      return { ...snapshot(), ...outcome };
     } catch (error) {
       const cancelled = signal.aborted;
-      return { outcome: cancelled ? "cancelled" : "failed", exitCode: 1, stopReason: cancelled ? "aborted" : "error",
+      return { ...snapshot(), outcome: cancelled ? "cancelled" : "failed", exitCode: 1, stopReason: cancelled ? "aborted" : "error",
         errorMessage: boundedDiagnostic(error instanceof Error ? error.message : String(error)) ?? "Child failed." };
     } finally {
       if (runtimeTimer) clearInterval(runtimeTimer);

@@ -27,11 +27,15 @@ export function outcomeOf(result: ChildResult): AgentOutcome | undefined {
 
 export type SubagentDetails = Static<typeof SubagentDetailsSchema>;
 
+export function copyUsage(usage: UsageSummary): UsageSummary {
+  return { ...usage, cost: { ...usage.cost } };
+}
+
 /** Snapshots never lend mutable session-owned fields to callers. */
 export function copyResult(result: ChildResult): ChildResult {
   return { ...result, tools: [...result.tools], state: { ...result.state },
     outputTruncation: result.outputTruncation ? { ...result.outputTruncation } : undefined,
-    usage: { ...result.usage, cost: { ...result.usage.cost } } };
+    usage: copyUsage(result.usage) };
 }
 
 export function emptyUsage(): UsageSummary {

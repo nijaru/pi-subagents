@@ -1,27 +1,29 @@
 import { describe, expect, test } from "bun:test";
 import { SessionChildren } from "../extensions/pi-subagents/children.ts";
-import type { ChildRunRequest, ChildSupervisor } from "../extensions/pi-subagents/supervisor.ts";
+import type { ChildExecutionData, ChildRunRequest, ChildSupervisor } from "../extensions/pi-subagents/supervisor.ts";
+import { emptyUsage } from "../extensions/pi-subagents/types.ts";
 import { MAX_RETAINED_RUNS } from "../extensions/pi-subagents/limits.ts";
 
 function controlled() {
   const requests: ChildRunRequest[] = [];
+  const executions: ChildExecutionData[] = [];
   const gates: ReturnType<typeof Promise.withResolvers<void>>[] = [];
   const supervisor: ChildSupervisor = {
     async run(request) {
       const gate = Promise.withResolvers<void>();
-      requests.push(request); gates.push(gate);
+      const data: ChildExecutionData = { stderr: "", usage: emptyUsage() };
+      requests.push(request); executions.push(data); gates.push(gate);
       request.signal.addEventListener("abort", () => gate.resolve(), { once: true });
       await gate.promise;
-      request.result.output = "done";
-      return request.signal.aborted
-        ? { outcome: "cancelled", exitCode: 1, stopReason: "aborted" }
-        : { outcome: "completed", exitCode: 0, stopReason: "stop" };
+      return { ...data, output: "done", ...(request.signal.aborted
+        ? { outcome: "cancelled" as const, exitCode: 1, stopReason: "aborted" as const }
+        : { outcome: "completed" as const, exitCode: 0, stopReason: "stop" as const }) };
     },
   };
   const notices: string[] = [];
   const children = new SessionChildren(supervisor, (result) => notices.push(result.id));
   const start = () => children.start({ prompt: "bounded task", tools: ["read"], cwd: process.cwd() });
-  return { children, start, requests, gates, notices };
+  return { children, start, requests, executions, gates, notices };
 }
 
 describe("session ownership", () => {
@@ -38,13 +40,48 @@ describe("session ownership", () => {
     const c = controlled();
     const runs = Array.from({ length: 4 }, () => c.start());
     // Terminal output has arrived, but the supervisor has not returned yet.
-    c.requests[0]!.result.output = "done";
+    c.executions[0]!.output = "done";
+    c.requests[0]!.onUpdate?.(c.executions[0]!);
+    expect(c.children.snapshot(runs[0]!).output).toBe("done");
     expect(c.children.snapshot(runs[0]!).state.status).toBe("running");
     expect(() => c.start()).toThrow("maximum 4");
     c.gates[0]!.resolve();
     await runs[0]!.promise;
     expect(c.children.snapshot(runs[0]!).state).toMatchObject({ status: "terminal", outcome: "completed" });
     c.start();
+    await c.children.close();
+  });
+  test("launch inputs, progress, and returned execution data do not alias session state", async () => {
+    const c = controlled();
+    const options = { prompt: "original task", tools: ["read"], cwd: process.cwd(), model: "fixture/model" };
+    const run = c.children.start({ ...options, emit(result) {
+      result.prompt = "rewritten";
+      result.tools.push("write");
+      result.output = "rewritten";
+      result.usage.input = 999;
+      result.usage.cost.total = 999;
+      result.state = { status: "terminal", outcome: "failed", exitCode: 1, finishedAt: 0 };
+    } });
+    options.tools.push("bash");
+    options.prompt = "later task";
+    expect(c.requests[0]!.task).toMatchObject({ prompt: "original task", tools: ["read"], model: "fixture/model" });
+    const data = c.executions[0]!;
+    data.output = "done";
+    data.usage.input = 5;
+    data.usage.cost.total = 1;
+    c.requests[0]!.onUpdate?.(data, "progress");
+    expect(c.children.snapshot(run)).toMatchObject({
+      prompt: "original task", tools: ["read"], output: "done", state: { status: "running" },
+      usage: { input: 5, cost: { total: 1 } },
+    });
+    data.output = "later backend update";
+    expect(c.children.snapshot(run).output).toBe("done");
+    c.gates[0]!.resolve();
+    await run.promise;
+    data.usage.input = 999;
+    data.usage.cost.total = 999;
+    expect(c.children.snapshot(run)).toMatchObject({ output: "done", state: { outcome: "completed" }, usage: { input: 5, cost: { total: 1 } } });
+    expect(c.children.takePendingUsage()).toMatchObject({ input: 5, cost: { total: 1 } });
     await c.children.close();
   });
   test("expired and cancelled waits release their completion listeners", async () => {
@@ -96,7 +133,7 @@ describe("session ownership", () => {
   test("overlapping waits and stop release listeners without duplicate notices or usage", async () => {
     const c = controlled();
     const a = c.start(); const b = c.start();
-    c.requests[0]!.result.usage.input = 5;
+    c.executions[0]!.usage.input = 5;
     const one = c.children.wait([a.result.id, b.result.id], 10000);
     const two = c.children.wait([a.result.id], 10000);
     const stop = c.children.stop(a.result.id);
@@ -152,7 +189,7 @@ describe("session ownership", () => {
   test("charges completed executions once, independently of joins and eviction", async () => {
     const c = controlled();
     const run = c.start();
-    c.requests[0]!.result.usage.input = 5;
+    c.executions[0]!.usage.input = 5;
     expect(c.children.takePendingUsage()).toBeUndefined(); // cleanup still running
     c.gates[0]!.resolve();
     await run.promise;
@@ -162,7 +199,7 @@ describe("session ownership", () => {
     expect(c.children.takePendingUsage()).toBeUndefined();
     for (let i = 1; i <= MAX_RETAINED_RUNS + 1; i++) {
       const next = c.start();
-      c.requests[i]!.result.usage.input = 2;
+      c.executions[i]!.usage.input = 2;
       c.gates[i]!.resolve();
       await next.promise;
       await c.children.wait([next.result.id], 1);
@@ -188,11 +225,11 @@ describe("session ownership", () => {
   test("shutdown discards pending usage and fences charges from stopped children", async () => {
     const c = controlled();
     const completed = c.start();
-    c.requests[0]!.result.usage.input = 5;
+    c.executions[0]!.usage.input = 5;
     c.gates[0]!.resolve();
     await completed.promise;
     c.start();
-    c.requests[1]!.result.usage.input = 7;
+    c.executions[1]!.usage.input = 7;
     await c.children.close();
     expect(c.children.takePendingUsage()).toBeUndefined();
   });
@@ -210,12 +247,12 @@ describe("session ownership", () => {
     let updates = 0;
     c.children.start({ prompt: "x", tools: [], cwd: process.cwd(), emit: () => { updates++; } });
     const closing = c.children.close();
-    c.requests[0]!.emit?.(c.requests[0]!.result, "stale update");
+    c.requests[0]!.onUpdate?.(c.executions[0]!, "stale update");
     await closing;
     expect(updates).toBe(0);
   });
   test("notification failure does not lose the completed result", async () => {
-    const children = new SessionChildren({ async run({ result }) { result.output = "answer"; return { outcome: "completed", exitCode: 0, stopReason: "stop" }; } }, () => { throw new Error("UI unavailable"); });
+    const children = new SessionChildren({ async run() { return { output: "answer", stderr: "", usage: emptyUsage(), outcome: "completed", exitCode: 0, stopReason: "stop" }; } }, () => { throw new Error("UI unavailable"); });
     const run = children.start({ prompt: "x", tools: [], cwd: process.cwd() });
     await run.promise;
     expect((await children.wait([run.result.id], 1))[0]!.output).toBe("answer");
@@ -223,7 +260,7 @@ describe("session ownership", () => {
   });
   test("lifecycle state never duplicates execution diagnostics", async () => {
     const children = new SessionChildren({ async run() {
-      return { outcome: "failed", exitCode: 1, stopReason: "error", errorMessage: "diagnostic".repeat(1000), stdout: "not lifecycle state" };
+      return { outcome: "failed", exitCode: 1, stopReason: "error", errorMessage: "diagnostic".repeat(1000), stdout: "not lifecycle state", stderr: "", usage: emptyUsage() };
     } }, () => {});
     const run = children.start({ prompt: "x", tools: [], cwd: process.cwd() });
     const result = await run.promise;
