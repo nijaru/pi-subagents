@@ -41,6 +41,9 @@ export const ChildResultSchema = Type.Object({
   prompt: Type.String(),
   cwd: Type.String(),
   tools: Type.Array(Type.String()),
+  omittedFields: Type.Optional(Type.Array(StringEnum(["prompt", "cwd", "tools"] as const), {
+    uniqueItems: true, description: "Context fields omitted to fit the response budget; empty placeholders are not execution values.",
+  })),
   output: Type.Optional(Type.String({ description: "Final assistant report, or partial output for an incomplete/failed child." })),
   outputTruncation: Type.Optional(OutputTruncationSchema),
   stdout: Type.Optional(Type.String({ description: "Diagnostic stdout; never the child protocol." })),

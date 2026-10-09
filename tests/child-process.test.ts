@@ -89,6 +89,18 @@ test("progress consumers cannot change the supervisor's report or accounting", a
   });
 });
 
+test("diagnostic pipes preserve UTF-8 split across writes", async () => {
+  await fixture(`const bytes=Buffer.from('diagnostic 🙂漢字');
+    const split=bytes.indexOf(Buffer.from('🙂'))+1;
+    for(const fd of [1,2]) writeSync(fd,bytes.subarray(0,split));
+    await new Promise(resolve=>setTimeout(resolve,50));
+    for(const fd of [1,2]) writeSync(fd,bytes.subarray(split));`, async (task, supervisor) => {
+    const execution = await supervisor.run({ task, signal: new AbortController().signal });
+    expect(execution.stdout).toBe("diagnostic 🙂漢字");
+    expect(execution.stderr).toBe("diagnostic 🙂漢字");
+  });
+});
+
 test.skipIf(process.platform === "win32")("watchdog startup failure stops the child before releasing the task", async () => {
   await fixture(`writeFileSync('task-received','yes');`, async (task, supervisor) => {
     const node = getChildInvocation().command;

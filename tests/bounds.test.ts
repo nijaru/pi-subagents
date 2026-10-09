@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { boundChildResult, boundDetails, jsonBytes, minimalChildResult, truncateOutput } from "../extensions/pi-subagents/bounds.ts";
 import { emptyUsage, type ChildResult } from "../extensions/pi-subagents/types.ts";
+import { childReports } from "../extensions/pi-subagents/reports.ts";
 import { Check } from "typebox/value";
 import { SubagentDetailsSchema } from "../extensions/pi-subagents/result-schema.ts";
 
@@ -38,7 +39,11 @@ describe("serialized result bounds", () => {
     const result = child();
     const minimal = minimalChildResult(result);
     const bytes = jsonBytes(minimal);
-    expect(boundChildResult(result, bytes)).toEqual(minimal);
+    // Restoring short context can cost less than describing its omission.
+    const bounded = boundChildResult(result, bytes);
+    expect(jsonBytes(bounded)).toBeLessThanOrEqual(bytes);
+    expect(bounded.id).toBe(result.id);
+    expect(bounded.state).toEqual(result.state);
     expect(() => boundChildResult(result, bytes - 1)).toThrow(RangeError);
     const details = { command: "wait" as const, results: [result, child("child-2")] };
     const minimalDetails = { ...details, results: details.results.map(minimalChildResult) };
@@ -48,6 +53,46 @@ describe("serialized result bounds", () => {
     expect(() => boundDetails(details, budget - 1)).toThrow(RangeError);
     expect(() => boundDetails({ command: "status", results: [] }, 0)).toThrow(RangeError);
     expect(() => boundDetails(details, NaN)).toThrow(RangeError);
+  });
+
+  test("large reports cannot starve task identity and diagnostic tails", () => {
+    const result = { ...child(), prompt: "Investigate the failure", errorMessage: undefined, model: undefined,
+      output: "x".repeat(51200), stderr: "early\n" + "s".repeat(10000) + "\nFINAL_STACK_TRACE",
+      outputTruncation: { truncated: false, originalBytes: 51200, retainedBytes: 51200 } };
+    const bounded = boundDetails({ command: "wait", results: [result] });
+    expect(jsonBytes(bounded)).toBeLessThanOrEqual(51200);
+    expect(bounded.results[0]!.prompt).toBe(result.prompt);
+    expect(bounded.results[0]!.stderr).toContain("FINAL_STACK_TRACE");
+    expect(bounded.results[0]!.output!.length).toBeGreaterThan(40000);
+  });
+
+  test("omitted context is explicit rather than a false empty execution value", () => {
+    const result = { ...child(), errorMessage: undefined, model: undefined,
+      tools: Array.from({ length: 64 }, (_, index) => `${index}-${"t".repeat(200)}`), cwd: "/" + "d".repeat(2000) };
+    const bounded = boundChildResult(result, 1100);
+    expect(bounded.tools).toEqual([]);
+    expect(bounded.cwd).toBe("");
+    expect(bounded.omittedFields).toEqual(["cwd", "tools"]);
+    expect(Check(SubagentDetailsSchema, { command: "wait", results: [bounded] })).toBe(true);
+    const rebound = boundDetails({ command: "status", results: [bounded] }).results[0]!;
+    expect(rebound.omittedFields).toEqual(["cwd", "tools"]);
+  });
+
+  test("small batch reports return unused space to the large report in both envelopes", () => {
+    const results = Array.from({ length: 32 }, (_, index) => {
+      const output = index === 0 ? "x".repeat(50000) : "ok";
+      return { ...child(`child-${index}`), errorMessage: undefined, model: undefined, stderr: "", output,
+        outputTruncation: { truncated: false, originalBytes: output.length, retainedBytes: output.length } };
+    });
+    const bounded = boundDetails({ command: "wait", results });
+    expect(bounded.results.map((result) => result.id)).toEqual(results.map((result) => result.id));
+    expect(bounded.results[0]!.output!.length).toBeGreaterThan(30000);
+    expect(bounded.results.slice(1).every((result) => result.output === "ok")).toBe(true);
+    expect(jsonBytes(bounded)).toBeLessThanOrEqual(51200);
+    const text = childReports(results);
+    expect(text).toContain("x".repeat(30000));
+    for (const result of results) expect(text).toContain(result.id);
+    expect(Buffer.byteLength(text)).toBeLessThanOrEqual(51200);
   });
 
   test("escaping is budgeted and existing truncation remains truthful", () => {

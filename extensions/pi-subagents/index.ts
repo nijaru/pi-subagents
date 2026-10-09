@@ -3,7 +3,7 @@ import { Check, Errors } from "typebox/value";
 import { SessionChildren } from "./children.ts";
 import { SubprocessChildSupervisor } from "./supervisor.ts";
 import { SubagentParamsSchema, resolveCwd, selectTools, validateCommand } from "./params.ts";
-import { DEFAULT_WAIT_MS, MAX_OUTPUT_BYTES, foregroundBudgetMs, isChildProcess } from "./limits.ts";
+import { DEFAULT_WAIT_MS, MAX_OUTPUT_BYTES, RUNNING_PROGRESS_TEXT, RUNTIME_UPDATE_INTERVAL_MS, foregroundBudgetMs, isChildProcess } from "./limits.ts";
 import { boundDetails, truncateOutput } from "./bounds.ts";
 import { addUsage, failed, isRunning } from "./types.ts";
 import { SubagentDetailsSchema } from "./result-schema.ts";
@@ -108,6 +108,12 @@ export default function (pi: ExtensionAPI) {
       const tools = selectTools(params.tools, pi.getActiveTools(), ctx.tools.map((tool) => tool.name));
       const cwd = resolveCwd(ctx.cwd || process.cwd(), params.cwd);
       const foreground = params.command === "run";
+      let presenting = foreground;
+      const present = (result: ChildResult, progress: string) => {
+        if (!presenting || !onUpdate || owner.isClosed) return;
+        try { onUpdate(answer("run", [{ ...result, state: { status: "running" } }], progress)); }
+        catch { presenting = false; }
+      };
       const parentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
       const model = params.model?.trim() ?? parentModel;
       // A different model uses its own Pi defaults, not a potentially expensive or unsupported parent effort.
@@ -117,9 +123,13 @@ export default function (pi: ExtensionAPI) {
       const run = owner.start({
         prompt: params.prompt!, tools, cwd,
         model, thinking, strictThinking: params.thinking !== undefined,
-        emit: foreground ? (result, progress) => onUpdate?.(answer("run", [{ ...result, state: { status: "running" } }], progress)) : undefined,
+        emit: foreground && onUpdate ? present : undefined,
       });
       if (!foreground) return answer("spawn", [owner.snapshot(run)], `Started child ${run.result.id}. Completion will be delivered at an active-turn boundary; idle parents are not woken. Continue non-overlapping work; use wait when its result blocks finishing your task, or status/stop with this id.`);
+      // Presentation stops at the foreground join, even when execution continues.
+      const timer = onUpdate ? setInterval(() => {
+        if (presenting && !owner.isClosed) present(owner.snapshot(run), RUNNING_PROGRESS_TEXT);
+      }, RUNTIME_UPDATE_INTERVAL_MS) : undefined;
       const abort = () => run.controller.abort();
       signal?.addEventListener("abort", abort, { once: true });
       if (signal?.aborted) abort();
@@ -130,7 +140,11 @@ export default function (pi: ExtensionAPI) {
           return answer("run", [result], `${summary(result)}\nStill running after ${Math.round(budget / 1000)}s; it continues as background work. Completion is delivered at an active-turn boundary, not by waking an idle parent. Use wait when its result blocks finishing your task, or status/stop with this id.`);
         }
         return outcome("run", [result]);
-      } finally { signal?.removeEventListener("abort", abort); }
+      } finally {
+        presenting = false;
+        if (timer) clearInterval(timer);
+        signal?.removeEventListener("abort", abort);
+      }
     },
     renderCall: renderChildCall,
     renderResult: renderChildResult,

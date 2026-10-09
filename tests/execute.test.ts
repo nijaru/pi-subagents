@@ -256,11 +256,14 @@ describe("background lifecycle", () => {
     const h = host();
     process.env.PI_SUBAGENT_FOREGROUND_MS = "50";
     fakePi('await delay(250); final("late result");');
-    const value = await h.execute({ command: "run", prompt: "x" });
+    let updates = 0;
+    const value = await h.execute({ command: "run", prompt: "x" }, undefined, () => { updates++; });
     expect(first(value).state.status).toBe("running");
     expect(value.content[0].text).toContain("Still running after");
+    const foregroundUpdates = updates;
     expect(h.notices).toHaveLength(0);
     await Bun.sleep(500);
+    expect(updates).toBe(foregroundUpdates);
     expect(h.notices).toHaveLength(0);
     h.boundary();
     expect(h.notices).toHaveLength(1);
@@ -301,6 +304,22 @@ describe("background lifecycle", () => {
     await expect(h.execute({ command: "status", id })).rejects.toThrow("Unknown child");
     fakePi();
     expect(first(await h.execute({ command: "run", prompt: "new session" })).state).toMatchObject({ outcome: "completed" });
+  });
+  test("shutdown fences foreground heartbeats while process cleanup is pending", async () => {
+    const h = host();
+    fakePi('process.on("SIGTERM",()=>{}); emit({kind:"progress",text:"ready"}); await delay(1200); final("done");');
+    const ready = Promise.withResolvers<void>();
+    let updates = 0;
+    const running = h.execute({ command: "run", prompt: "x" }, undefined, (value) => {
+      updates++;
+      if (value.content[0].text === "ready") ready.resolve();
+    });
+    await ready.promise;
+    const closing = h.shutdown();
+    const before = updates;
+    await Promise.all([closing, running]);
+    expect(updates).toBe(before);
+    expect(h.notices).toHaveLength(0);
   });
   test("enforces one shared capacity limit across sibling spawn/run calls", async () => {
     const h = host(); fakePi("await delay(10000);");

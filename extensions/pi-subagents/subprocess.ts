@@ -10,7 +10,7 @@ import { parseChildEvent, type ChildBootstrap, type ChildEvent } from "./child-p
 
 import { MAX_PROTOCOL_LINE_BYTES, MAX_STDERR_BYTES } from "./limits.ts";
 import type { AgentOutcome } from "./types.ts";
-import { capStderr, truncateHeadTail } from "./bounds.ts";
+import { appendDiagnostic, truncateHeadTail } from "./bounds.ts";
 import { processTimeoutMs } from "./limits.ts";
 import { spawnDeathWatchdog, sweepRootProcessGroup, terminateProcessTree } from "./process-tree.ts";
 import { childEnvironment } from "./env.ts";
@@ -53,7 +53,7 @@ export function getChildInvocation(): PiInvocation {
     throw new Error("PI_SUBAGENT_BIN/PI_BIN CLI overrides are no longer supported; children use the installed Pi SDK. Protocol tests may set PI_SUBAGENT_RUNNER.");
   }
   const runtime = path.basename(process.execPath).toLowerCase();
-  const command = /^node(\.exe)?$/.test(runtime) ? process.execPath : findOnPath("node");
+  const command = /^node(\.exe)?$/.test(runtime) ? process.execPath : findOnPath(process.platform === "win32" ? "node.exe" : "node");
   if (!command) throw new Error("Child SDK runner requires Node.js on PATH.");
   const sdk = path.join(getPackageDir(), "dist", "index.js");
   if (!fs.existsSync(sdk)) throw new Error("Child runner requires an installed Pi SDK (dist/index.js); standalone Pi binaries are not supported.");
@@ -94,7 +94,6 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
     let stderr = "";
     let stdout = "";
     let trailing = "";
-    let discardingLine = false;
     let killTimer: ReturnType<typeof setTimeout> | undefined;
     let processTimer: ReturnType<typeof setTimeout> | undefined;
     let timedOut = false;
@@ -205,15 +204,7 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
 
     const consumeProtocolText = (text: string) => {
       let cursor = 0;
-      while (cursor < text.length) {
-        if (discardingLine) {
-          const newline = text.indexOf("\n", cursor);
-          if (newline < 0) return;
-          discardingLine = false;
-          cursor = newline + 1;
-          continue;
-        }
-
+      while (cursor < text.length && !processFailure && !settled) {
         const newline = text.indexOf("\n", cursor);
         if (newline < 0) {
           const segment = text.slice(cursor);
@@ -221,7 +212,6 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
             // A dedicated protocol pipe cannot legitimately contain oversized noise.
             deliverLine("", true);
             trailing = "";
-            discardingLine = true;
           } else {
             trailing += segment;
           }
@@ -241,21 +231,21 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
     };
 
     (child.stdio[3] as Readable).on("data", (chunk: Buffer | string) => {
-      consumeProtocolText(decoder.write(chunk));
+      if (!processFailure && !settled) consumeProtocolText(decoder.write(chunk));
     });
-    child.stdout?.on("data", (chunk: Buffer | string) => {
-      stdout = capStderr(stdout, typeof chunk === "string" ? chunk : chunk.toString("utf8"));
+    child.stdout?.setEncoding("utf8").on("data", (chunk: string) => {
+      stdout = appendDiagnostic(stdout, chunk);
     });
-    child.stderr?.on("data", (chunk: Buffer | string) => {
-      stderr = capStderr(stderr, typeof chunk === "string" ? chunk : chunk.toString("utf8"));
+    child.stderr?.setEncoding("utf8").on("data", (chunk: string) => {
+      stderr = appendDiagnostic(stderr, chunk);
     });
     child.on("error", (error) => {
       finish({ exitCode: 1, stopReason: "error", outcome: "failed", errorMessage: processFailure ?? error.message, stderr });
     });
     child.on("close", (code) => {
       const finalText = decoder.end();
-      if (finalText && !discardingLine) consumeProtocolText(finalText);
-      if (trailing.trim() && !discardingLine && Buffer.byteLength(trailing, "utf8") <= MAX_PROTOCOL_LINE_BYTES) {
+      if (finalText) consumeProtocolText(finalText);
+      if (trailing.trim() && Buffer.byteLength(trailing, "utf8") <= MAX_PROTOCOL_LINE_BYTES) {
         deliverLine(trailing);
       }
       if (processFailure) {

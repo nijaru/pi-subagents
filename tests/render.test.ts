@@ -62,6 +62,14 @@ describe("compact child rendering", () => {
     expect(text.match(new RegExp(child.id, "g"))).toHaveLength(1);
     for (const value of [child.prompt, child.output!, "cwd: /project", "tools: read", "2 turns", "test/model"]) expect(text).toContain(value);
   });
+  test("omitted launch context is not rendered as a reasoning-only task", () => {
+    const omitted = { ...child, cwd: "", tools: [], omittedFields: ["cwd", "tools"] as const };
+    const text = lines("wait", { command: "wait", ids: [child.id] }, true, [{ ...omitted, omittedFields: [...omitted.omittedFields] }]).join("\n");
+    expect(text).toContain("cwd: not retained (response budget)");
+    expect(text).toContain("tools: not retained (response budget)");
+    expect(text).not.toContain("tools: none");
+    expect(lines("wait", { command: "wait", ids: [child.id] }, true, [{ ...child, tools: [] }]).join("\n")).toContain("tools: none");
+  });
   test("running rows carry the task label and wait expiry stays explicit", () => {
     const active = { ...child, state: { status: "running" } as const, startedAt: undefined };
     expect(lines("spawn", { command: "spawn", prompt: child.prompt }, false, [active])).toEqual([
@@ -138,7 +146,10 @@ describe("compact child rendering", () => {
   });
   test("old or malformed transcript details fall back to text; oversized output stays bounded", () => {
     for (const expanded of [false, true]) {
-      for (const details of [{ results: [{ agent: "worker" }] }, { command: "run", results: [{ ...child, model: {} }] }]) {
+      for (const details of [
+        { results: [{ agent: "worker" }] }, { command: "run", results: [{ ...child, model: {} }] },
+        { command: "run", results: [{ ...child, usage: { ...child.usage, turns: -1.5 } }] },
+      ]) {
         const value = { content: [{ type: "text" as const, text: "old output" }], details } as any;
         expect(renderChildResult(value, { expanded }, theme).render(80).join("\n")).toContain("old output");
       }

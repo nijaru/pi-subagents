@@ -1,5 +1,6 @@
 import { createWriteStream } from "node:fs";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import type { Usage } from "@earendil-works/pi-ai";
 import { createChildSession, closeChildSession, type ChildSessionPolicy } from "./child-session.ts";
 import { addUsage, emptyUsage, isThinkingLevel } from "./types.ts";
 import { boundedDiagnostic, truncateOutput } from "./bounds.ts";
@@ -46,17 +47,23 @@ export async function runChild(policy: ChildSessionPolicy): Promise<void> {
     let report = emptyReport();
     const usage = emptyUsage();
     session.subscribe((event) => {
+      let eventUsage: Usage | undefined;
       if (event.type === "message_end") {
         const message = event.message;
         if (message.role === "assistant") {
           usage.turns++;
           report = assistantReport(message);
         }
-        if ((message.role === "assistant" || message.role === "toolResult") && message.usage) addUsage(usage, message.usage);
-        // Coalesce under backpressure. The final report always includes full usage.
-        if (pipe.writableLength < 8192) pipe.write(JSON.stringify({ version: CHILD_PROTOCOL_VERSION, kind: "usage", usage }) + "\n");
+        if (message.role === "assistant" || message.role === "toolResult") eventUsage = message.usage;
+      } else if (event.type === "compaction_end") {
+        eventUsage = event.result?.usage;
       } else if (event.type === "tool_execution_start" && pipe.writableLength < 8192) {
         pipe.write(JSON.stringify({ version: CHILD_PROTOCOL_VERSION, kind: "progress", text: `Running ${truncateOutput(event.toolName, 256)}...` }) + "\n");
+      }
+      if (eventUsage) {
+        addUsage(usage, eventUsage);
+        // Coalesce under backpressure. The final report always includes full usage.
+        if (pipe.writableLength < 8192) pipe.write(JSON.stringify({ version: CHILD_PROTOCOL_VERSION, kind: "usage", usage }) + "\n");
       }
     });
     abort.signal.throwIfAborted();

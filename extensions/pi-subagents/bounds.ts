@@ -1,5 +1,5 @@
 import { MAX_DIAGNOSTIC_BYTES, MAX_OUTPUT_BYTES, MAX_STDERR_BYTES } from "./limits.ts";
-import type { ChildResult, SubagentDetails } from "./types.ts";
+import { copyUsage, type ChildResult, type SubagentDetails } from "./types.ts";
 
 /** Return a UTF-8 prefix without splitting a code point. */
 export function utf8Prefix(value: string, maxBytes: number): string {
@@ -93,7 +93,7 @@ export function truncateOutput(value: string, maxBytes = MAX_OUTPUT_BYTES): stri
   return prefix + markerFor(Buffer.byteLength(prefix, "utf8"));
 }
 
-export function capStderr(current: string, next: string): string {
+export function appendDiagnostic(current: string, next: string): string {
   return truncateHeadTail(current + next, MAX_STDERR_BYTES);
 }
 
@@ -114,17 +114,20 @@ function truncationFor(result: ChildResult, output: string) {
 }
 
 export function minimalChildResult(result: ChildResult): ChildResult {
+  const omittedFields = (["prompt", "cwd", "tools"] as const).filter((key) =>
+    result[key].length > 0 || result.omittedFields?.includes(key));
   return {
     id: result.id,
     prompt: "",
     cwd: "",
     tools: [],
+    ...(omittedFields.length ? { omittedFields } : {}),
     startedAt: result.startedAt,
     state: { ...result.state },
     outputTruncation: truncationFor(result, ""),
     stderr: "",
     stdout: result.stdout === undefined ? undefined : "",
-    usage: result.usage,
+    usage: copyUsage(result.usage),
   };
 }
 
@@ -136,6 +139,10 @@ export function boundChildResult(result: ChildResult, maxBytes: number): ChildRe
   }
   const addCandidate = (key: keyof ChildResult, value: unknown): boolean => {
     const next = { ...bounded, [key]: value } as ChildResult;
+    if ((key === "prompt" || key === "cwd" || key === "tools") && (value as string | string[]).length > 0) {
+      next.omittedFields = next.omittedFields?.filter((field) => field !== key);
+      if (!next.omittedFields?.length) delete next.omittedFields;
+    }
     if (key === "output") next.outputTruncation = truncationFor(result, value as string);
     if (jsonBytes(next) > maxBytes) return false;
     bounded = next;
@@ -156,16 +163,33 @@ export function boundChildResult(result: ChildResult, maxBytes: number): ChildRe
   };
   // Optional metadata must pay for JSON escaping just like report text.
   addText("errorMessage", result.errorMessage, 512);
+  // Reserve task identity and actionable diagnostics before filling the report.
+  addText("prompt", result.prompt, 256);
+  addText("stderr", result.stderr, 1024, truncateHeadTail);
+  addText("stdout", result.stdout, 512, truncateHeadTail);
   addText("model", result.model, 256);
   if (result.thinking !== undefined) addCandidate("thinking", result.thinking);
-  addCandidate("tools", result.tools);
+  addCandidate("tools", [...result.tools]);
   addCandidate("cwd", result.cwd);
   addText("output", result.output, MAX_OUTPUT_BYTES);
+  // Expand context only when the report leaves room.
   addText("prompt", result.prompt, MAX_DIAGNOSTIC_BYTES);
-  // Stderr keeps both ends: its actionable evidence is the final exception.
   addText("stderr", result.stderr, MAX_DIAGNOSTIC_BYTES, truncateHeadTail);
   addText("stdout", result.stdout, MAX_DIAGNOSTIC_BYTES, truncateHeadTail);
   return bounded;
+}
+
+/** Share a byte budget fairly, redistributing the space small items don't need. */
+export function allocateBudget(needs: number[], maxBytes: number): number[] {
+  const allocations = needs.map(() => 0);
+  const ordered = needs.map((need, index) => ({ need, index })).sort((a, b) => a.need - b.need);
+  let remaining = Math.max(0, Math.floor(maxBytes));
+  for (const [position, { need, index }] of ordered.entries()) {
+    const share = Math.floor(remaining / (ordered.length - position));
+    allocations[index] = Math.min(need, share);
+    remaining -= allocations[index]!;
+  }
+  return allocations;
 }
 
 export function boundDetails(details: SubagentDetails, maxBytes = MAX_OUTPUT_BYTES): SubagentDetails {
@@ -177,7 +201,10 @@ export function boundDetails(details: SubagentDetails, maxBytes = MAX_OUTPUT_BYT
     throw new RangeError("Details budget cannot hold all minimal child representations");
   }
   if (baseBytes === maxBytes || minimalResults.length === 0) return bounded;
-  const perResult = Math.floor((maxBytes - baseBytes) / minimalResults.length);
-  bounded.results = details.results.map((result, index) => boundChildResult(result, jsonBytes(minimalResults[index]!) + perResult));
+  const minima = minimalResults.map(jsonBytes);
+  const needs = details.results.map((result, index) =>
+    Math.max(0, jsonBytes(boundChildResult(result, maxBytes)) - minima[index]!));
+  const allocations = allocateBudget(needs, maxBytes - baseBytes);
+  bounded.results = details.results.map((result, index) => boundChildResult(result, minima[index]! + allocations[index]!));
   return bounded;
 }

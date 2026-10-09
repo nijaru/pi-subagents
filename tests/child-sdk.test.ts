@@ -32,13 +32,17 @@ export default function(pi) {
       const input = context.messages.find(m => m.role === 'user');
       const text = typeof input.content === 'string' ? input.content : input.content.map(p => p.text ?? '').join('');
       const names = getCurrentTools(context.messages).map(t => t.name);
+      const summary = text.startsWith('<conversation>') || text.startsWith('# Conversation');
+      if (summary) writeFileSync(process.cwd() + '/summary-called', 'yes');
       const stream = createAssistantMessageEventStream();
       const retryError = text === 'retry' && attempts++ === 0;
       const output = {
         role:'assistant', api:model.api, provider:model.provider, model:model.id, timestamp:Date.now(),
-        usage:{input:3,output:2,cacheRead:0,cacheWrite:0,totalTokens:5,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},
+        usage:{input:summary ? 7 : text === 'compact' ? 120000 : 3,output:summary ? 4 : 2,cacheRead:0,cacheWrite:0,
+          totalTokens:summary ? 11 : text === 'compact' ? 120002 : 5,
+          cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:summary ? 0.25 : text === 'compact' ? 1 : 0}},
         content:[{type:'thinking',thinking:'X'.repeat(2000000),thinkingSignature:'Y'.repeat(2000000)},
-          {type:'text',text:text === 'huge' ? '😀'.repeat(100000) : JSON.stringify({text,names})}],
+          {type:'text',text:summary ? 'checkpoint' : text === 'huge' ? '😀'.repeat(100000) : JSON.stringify({text,names})}],
         stopReason:retryError ? 'error' : text === 'length' ? 'length' : 'stop',
         ...(retryError ? {errorMessage:'503 service unavailable'} : {})
       };
@@ -82,6 +86,7 @@ afterAll(() => rmSync(dir, { recursive: true, force: true }));
 async function run(overrides: Partial<ChildBootstrap> = {}, packed = false, cancel = false) {
   rmSync(join(dir, "provider-called"), { force: true });
   rmSync(join(dir, "child-shutdown"), { force: true });
+  rmSync(join(dir, "summary-called"), { force: true });
   const invocation = getChildInvocation();
   const child = spawn("node", [packed ? packedRunner : invocation.args[0]!, invocation.args[1]!], {
     cwd: dir, env: { HOME: dir, PATH: process.env.PATH, PI_CODING_AGENT_DIR: dir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_SUBAGENT_DEPTH: "1" },
@@ -167,6 +172,21 @@ test("successful SDK retry clears earlier assistant failure and counts both atte
   expect(result.code).toBe(0);
   expect(result.events.at(-1)).toMatchObject({ kind: "result", report: { stopReason: "stop" }, usage: { turns: 2, input: 6 } });
   expect((result.events.at(-1) as any).report.errorMessage).toBeUndefined();
+});
+
+test("SDK compaction usage is counted without replacing the report or adding an assistant turn", async () => {
+  const settingsPath = join(dir, "settings.json");
+  const previous = readFileSync(settingsPath, "utf8");
+  try {
+    writeFileSync(settingsPath, JSON.stringify({ ...JSON.parse(previous), compaction: { keepRecentTokens: 1 } }));
+    const result = await run({ prompt: "compact" });
+    expect(result.code).toBe(0);
+    expect(existsSync(join(dir, "summary-called"))).toBe(true);
+    expect(result.events.at(-1)).toMatchObject({
+      kind: "result", report: { output: JSON.stringify({ text: "compact", names: [] }) },
+      usage: { turns: 1, input: 120007, output: 6, totalTokens: 120013, cost: { total: 1.25 } },
+    });
+  } finally { writeFileSync(settingsPath, previous); }
 });
 
 test("SDK cancellation runs child extension shutdown before exiting", async () => {

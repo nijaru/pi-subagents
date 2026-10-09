@@ -8,7 +8,7 @@ Delegate a self-contained task to a fresh [Pi](https://github.com/earendil-works
 pi install npm:@nijaru/pi-subagents
 ```
 
-Requires a Node/npm installation of Pi 1.0.4 or newer with its SDK files, and Node 22.19+ available to launch children. The current compatibility gate is Pi 1.1.0. Host-provided peer dependencies use `*` per Pi's package contract, not as a guarantee that every Pi version works. Standalone Pi binaries are not supported. Restart Pi or use `/reload`. The package registers one tool, `subagent`.
+Requires a Node/npm installation of Pi 1.0.4 or newer with its SDK files, and Node 22.19+ available to launch children. CI checks both the Pi 1.0.4 floor and the pinned development version (currently 1.1.0). Host-provided peer dependencies use `*` per Pi's package contract, not as a guarantee that every Pi version works. Standalone Pi binaries are not supported. Restart Pi or use `/reload`. The package registers one tool, `subagent`.
 
 ## Usage
 
@@ -43,7 +43,7 @@ The TUI hides agent-facing text — delegated prompts and child reports — behi
 
 ### Programmatic results
 
-Codemode calls receive `{ command, results, waitExpired? }`, not report text. Each child carries its id, lifecycle `state`, bounded report and diagnostics, truncation metadata, and usage. The same bounded envelope is returned as tool `details`; the model still receives a text summary. Child reports do not have to be JSON.
+Codemode calls receive `{ command, results, waitExpired? }`, not report text. Each child carries its id, lifecycle `state`, bounded report and diagnostics, truncation metadata, and usage. The same bounded envelope is returned as tool `details`; the model still receives a text summary. Child reports do not have to be JSON. When launch context cannot fit, `omittedFields` identifies removed `prompt`, `cwd`, or `tools` fields; their empty placeholders are not execution values.
 
 ```javascript
 const result = await tools.subagent({
@@ -58,7 +58,7 @@ Failed children remain structured results, even when Pi marks the call as a tool
 
 ### Usage accounting
 
-Child usage includes assistant calls and usage reported by child tools, including reported reasoning tokens. Reasoning tokens are a breakdown of output tokens, not extra tokens added to the total. After cleanup finishes, each child's usage is added once to the next parent tool result, including failed results. Repeated `status`, `wait`, or `stop` calls do not charge it again. Pi includes this usage in its footer, `/session`, and RPC totals.
+Child usage includes assistant calls, completed compaction summaries, and usage reported by child tools, including reported reasoning tokens. Summary calls do not increment the assistant-turn count. Reasoning tokens are a breakdown of output tokens, not extra tokens added to the total. After cleanup finishes, each child's usage is added once to the next parent tool result, including failed results. Repeated `status`, `wait`, or `stop` calls do not charge it again. Pi includes this usage in its footer, `/session`, and RPC totals.
 
 Pi cannot attach usage to a custom completion message. Background costs therefore enter native totals only when another parent tool finishes; until then, they remain visible in the child details. Quit, reload, or session replacement discards any unreported usage, including usage from children stopped during shutdown. No extra tool call or model turn is created just to report costs.
 
@@ -102,7 +102,7 @@ Normal completion and cancellation sweep the child's process group before releas
 
 A successful child must produce terminal assistant output. Failures, cancellation, timeouts, and token-limit termination (`incomplete`) remain distinguishable in retained status. Process cancellation and deadlines take precedence over earlier assistant errors. `run` and `wait` return native tool errors with retained details for failed or incomplete children; a mixed wait still includes its successful reports and running children. Failure causes precede partial output so report truncation cannot hide the reason. `status` remains available to inspect retained state. `stop` reports the resulting state without treating requested cancellation as a tool failure.
 
-Reports remain bounded rather than spilling to disk. `outputTruncation` records whether text was shortened and its original/retained UTF-8 byte counts; expansion also shows this in the TUI. A completion excerpt can point to a longer retained report, but text beyond the retention limit is not recoverable.
+Reports remain bounded rather than spilling to disk. Batch budgets reserve every child's identity and status, then redistribute space that smaller reports do not need. Task labels and diagnostic excerpts get space before report output. `outputTruncation` records whether text was shortened and its original/retained UTF-8 byte counts; expansion also shows this in the TUI. A completion excerpt can point to a longer retained report, but text beyond the retention limit is not recoverable.
 
 **Parent death.** Children run detached in their own process groups, so they do not die with the parent by default. Each child is watched by a detached supervisor that holds a pipe from the parent: when that pipe closes—graceful shutdown, crash, or `SIGKILL`—the watcher terminates the child's process group. On Windows there is no equivalent without a native job object, so only graceful shutdown, the leader process, and a best-effort `taskkill /T` sweep are guaranteed there.
 
@@ -160,7 +160,7 @@ bun install --frozen-lockfile
 bun run check
 ```
 
-Pi loads the TypeScript extension directly; there is no build step. The child bootstrap uses the same installation's SDK and TypeScript loader. Checks use pinned Pi 1.1.0 packages and exercise real CLI/RPC parents, SDK children, packed artifacts, project trust, cancellation, and abrupt parent death with local mock providers. No live model calls are needed. The process-tree and death-watchdog tests are POSIX-only and skip on Windows.
+Pi loads the TypeScript extension directly; there is no build step. The child bootstrap uses the same installation's SDK and TypeScript loader. Checks use pinned Pi 1.1.0 packages; CI also runs the full check against Pi 1.0.4. They exercise real CLI/RPC parents, SDK children, packed artifacts, project trust, compaction usage, cancellation, and abrupt parent death with local mock providers. No live model calls are needed. The process-tree and death-watchdog tests are POSIX-only and skip on Windows.
 
 Pi 1.1.0 does not publicly export its project-trust resolver or CLI built-in extension registry. The bootstrap reuses the selected installation's internal implementations rather than duplicating discovery or trust policy. The pinned version and packed-artifact tests gate both dependencies.
 

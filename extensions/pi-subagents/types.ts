@@ -33,7 +33,7 @@ export function copyUsage(usage: UsageSummary): UsageSummary {
 
 /** Snapshots never lend mutable session-owned fields to callers. */
 export function copyResult(result: ChildResult): ChildResult {
-  return { ...result, tools: [...result.tools], state: { ...result.state },
+  return { ...result, tools: [...result.tools], omittedFields: result.omittedFields ? [...result.omittedFields] : undefined, state: { ...result.state },
     outputTruncation: result.outputTruncation ? { ...result.outputTruncation } : undefined,
     usage: copyUsage(result.usage) };
 }

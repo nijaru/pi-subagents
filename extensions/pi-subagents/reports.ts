@@ -1,4 +1,4 @@
-import { truncateOutput } from "./bounds.ts";
+import { allocateBudget, truncateOutput } from "./bounds.ts";
 import { MAX_OUTPUT_BYTES } from "./limits.ts";
 import { failed, isFiniteNumber, isRunning, type ChildResult } from "./types.ts";
 
@@ -38,16 +38,22 @@ export function childSummary(result: ChildResult, includePrompt = true): string 
 export function childReports(results: ChildResult[], { includePrompt = true, maxReportBytes = MAX_OUTPUT_BYTES } = {}): string {
   if (!results.length) return "No retained children.";
   const separator = "\n\n---\n\n";
-  // Leave room for the caller's short wait/completion preamble.
-  const perResult = Math.floor((MAX_OUTPUT_BYTES - 512 - separator.length * (results.length - 1)) / results.length);
-  return results.map((result) => {
-    let head = childSummary(result, includePrompt);
+  const heads = results.map((result) => {
+    const head = childSummary(result, includePrompt);
+    return !isRunning(result) && result.outputTruncation?.truncated
+      ? `${head}\nChild report truncated: ${result.outputTruncation.retainedBytes}/${result.outputTruncation.originalBytes} UTF-8 bytes retained; discarded text cannot be retrieved.`
+      : head;
+  });
+  const outputs = results.map((result) => isRunning(result) ? "" : resultText(result));
+  // Reserve identities, truncation guidance, and the caller's short preamble.
+  const overhead = heads.reduce((bytes, head, index) => bytes + Buffer.byteLength(head) + (isRunning(results[index]!) ? 0 : 258), 0);
+  const allocations = allocateBudget(outputs.map((output) => Math.min(maxReportBytes, Buffer.byteLength(output))),
+    MAX_OUTPUT_BYTES - 512 - Buffer.byteLength(separator) * (results.length - 1) - overhead);
+  return results.map((result, index) => {
+    const head = heads[index]!;
     if (isRunning(result)) return head;
-    if (result.outputTruncation?.truncated) {
-      head += `\nChild report truncated: ${result.outputTruncation.retainedBytes}/${result.outputTruncation.originalBytes} UTF-8 bytes retained; discarded text cannot be retrieved.`;
-    }
-    const output = resultText(result);
-    const excerpt = truncateOutput(output, Math.max(0, Math.min(maxReportBytes, perResult - Buffer.byteLength(head) - 256)));
+    const output = outputs[index]!;
+    const excerpt = truncateOutput(output, allocations[index]!);
     const guidance = excerpt === output ? "" : results.length > 1 || maxReportBytes < MAX_OUTPUT_BYTES
       ? `\n\nExcerpt truncated; use subagent wait with ids: ["${result.id}"] for a longer retained report.`
       : "\n\nReport shortened to fit this response.";

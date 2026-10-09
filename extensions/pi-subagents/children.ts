@@ -13,7 +13,7 @@ export interface ChildRun {
   controller: AbortController;
   /** Terminal output is not publishable until process-tree cleanup finishes. */
   settled: boolean;
-  promise: Promise<ChildResult>;
+  promise: Promise<void>;
   /** Removable completion listeners; timed-out waits must not accumulate promise reactions. */
   waiters: Set<() => void>;
   /** In-flight joins. A blocking waiter claims delivery, so it suppresses the notice. */
@@ -38,6 +38,8 @@ export class SessionChildren {
 
   constructor(private readonly supervisor: ChildSupervisor, private readonly available: (result: ChildResult) => void) {}
 
+  get isClosed(): boolean { return this.closed; }
+
   start(options: StartChild): ChildRun {
     if (this.closed) throw new Error("The parent session is closing; no new children can start.");
     const active = [...this.runs.values()].filter((run) => !run.settled);
@@ -51,7 +53,7 @@ export class SessionChildren {
       id: randomUUID(), prompt: options.prompt, cwd: options.cwd, tools: [...options.tools],
       model: options.model, state: { status: "running" }, stderr: "", usage: emptyUsage(),
     };
-    const completion = Promise.withResolvers<ChildResult>();
+    const completion = Promise.withResolvers<void>();
     const run: ChildRun = {
       result, delivery: "unread", controller: new AbortController(), settled: false,
       promise: completion.promise, waiters: new Set(), activeWaits: 0,
@@ -66,15 +68,17 @@ export class SessionChildren {
     return run;
   }
 
-  private async execute(run: ChildRun, task: ChildTask, emit: StartChild["emit"]): Promise<ChildResult> {
-    let presentationFailed = false;
+  private async execute(run: ChildRun, task: ChildTask, emit: StartChild["emit"]): Promise<void> {
+    const present = (progress: string) => {
+      if (this.closed || !emit) return;
+      try { emit(this.snapshot(run), progress); } catch { emit = undefined; }
+    };
     try {
       const { outcome, exitCode, stopReason, ...data } = await this.supervisor.run({
         task, signal: run.controller.signal,
         onUpdate: (data, progress) => {
           run.result = copyResult({ ...run.result, ...data });
-          if (this.closed || presentationFailed || !emit || progress === undefined) return;
-          try { emit(this.snapshot(run), progress); } catch { presentationFailed = true; }
+          if (progress !== undefined) present(progress);
         },
       });
       run.result = copyResult({
@@ -101,7 +105,6 @@ export class SessionChildren {
       run.waiters.clear();
     }
     this.signalAvailable(run);
-    return copyResult(run.result);
   }
 
   private signalAvailable(run: ChildRun): void {
@@ -171,7 +174,8 @@ export class SessionChildren {
     // stop itself returns the result; do not wake a second parent turn for it.
     run.delivery = "delivered";
     run.controller.abort();
-    return run.promise;
+    await run.promise;
+    return this.snapshot(run);
   }
 
   /** Join any selected child under one deadline; acknowledge only returned terminal reports. */

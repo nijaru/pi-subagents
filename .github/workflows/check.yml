@@ -13,6 +13,9 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      matrix:
+        pi: [development, "1.0.4"]
     steps:
       # Actions are pinned to reviewed release SHAs; update pins deliberately.
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -24,4 +27,7 @@ jobs:
           node-version: 24.21.0
           package-manager-cache: false
       - run: bun install --frozen-lockfile
+      - name: Select compatibility-floor host
+        if: matrix.pi != 'development'
+        run: bun add --dev --exact @earendil-works/pi-ai@${{ matrix.pi }} @earendil-works/pi-coding-agent@${{ matrix.pi }} @earendil-works/pi-tui@${{ matrix.pi }}
       - run: bun run check

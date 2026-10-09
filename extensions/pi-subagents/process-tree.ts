@@ -96,22 +96,33 @@ export async function spawnDeathWatchdog(child: ChildProcess, command: string): 
   watchdog.stdin?.on("error", () => {});
   try {
     await new Promise<void>((resolve, reject) => {
+      const stdout = watchdog.stdout!;
       let ready = "";
-      const timer = setTimeout(() => reject(new Error("Watchdog readiness timed out.")), 5000);
-      const fail = () => reject(new Error("Watchdog exited before readiness."));
-      watchdog.once("error", reject);
-      watchdog.once("exit", fail);
-      watchdog.stdout!.on("data", (chunk) => {
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        watchdog.off("error", fail);
+        watchdog.off("exit", exited);
+        stdout.off("data", data);
+        stdout.off("end", ended);
+        stdout.off("error", fail);
+        if (error) reject(error); else resolve();
+      };
+      const fail = (error: Error) => finish(error);
+      const exited = () => finish(new Error("Watchdog exited before readiness."));
+      const data = (chunk: Buffer) => {
         ready += chunk.toString();
-        if (ready.length > 16) reject(new Error("Invalid watchdog readiness."));
-      });
-      watchdog.stdout!.once("end", () => ready === "ready\n" ? resolve() : fail());
-      watchdog.stdout!.once("error", reject);
-      // Detach the startup listeners and timer on either outcome.
-      const cleanup = () => { clearTimeout(timer); watchdog.off("error", reject); watchdog.off("exit", fail); };
-      watchdog.stdout!.once("end", cleanup);
-      watchdog.once("error", cleanup);
-      watchdog.once("exit", cleanup);
+        if (ready.length > 16) finish(new Error("Invalid watchdog readiness."));
+      };
+      const ended = () => ready === "ready\n" ? finish() : exited();
+      const timer = setTimeout(() => finish(new Error("Watchdog readiness timed out.")), 5000);
+      watchdog.once("error", fail);
+      watchdog.once("exit", exited);
+      stdout.on("data", data);
+      stdout.once("end", ended);
+      stdout.once("error", fail);
     });
     watchdog.on("error", () => {});
     watchdog.stdout?.destroy();

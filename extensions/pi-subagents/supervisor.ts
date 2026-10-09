@@ -1,6 +1,6 @@
 import type { AgentOutcome, ChildResult } from "./types.ts";
 import type { ModelThinkingLevel, StopReason } from "@earendil-works/pi-ai";
-import { RUNNING_PROGRESS_TEXT, RUNTIME_UPDATE_INTERVAL_MS } from "./limits.ts";
+import { RUNNING_PROGRESS_TEXT } from "./limits.ts";
 import { boundedDiagnostic } from "./bounds.ts";
 import { copyUsage, emptyUsage } from "./types.ts";
 import { runPiProcess, type ProcessResult } from "./subprocess.ts";
@@ -53,12 +53,10 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
     let ready = false;
     let terminal: ChildReport | undefined;
     let protocolFailure: string | undefined;
-    let runtimeTimer: ReturnType<typeof setInterval> | undefined;
     try {
       if (signal.aborted) throw new Error("Child aborted before launch.");
       data.startedAt = Date.now();
       publish(RUNNING_PROGRESS_TEXT);
-      if (onUpdate) runtimeTimer = setInterval(() => publish(RUNNING_PROGRESS_TEXT), RUNTIME_UPDATE_INTERVAL_MS);
       const processResult = await runPiProcess({
         bootstrap: { version: CHILD_PROTOCOL_VERSION, prompt: task.prompt, tools: [...task.tools], model: task.model,
           thinking: task.thinking, strictThinking: task.strictThinking },
@@ -104,8 +102,6 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
       const cancelled = signal.aborted;
       return { ...snapshot(), outcome: cancelled ? "cancelled" : "failed", exitCode: 1, stopReason: cancelled ? "aborted" : "error",
         errorMessage: boundedDiagnostic(error instanceof Error ? error.message : String(error)) ?? "Child failed." };
-    } finally {
-      if (runtimeTimer) clearInterval(runtimeTimer);
     }
   }
 }

@@ -5,7 +5,9 @@ import { truncateHeadTail, truncateOutput } from "./bounds.ts";
 import { MAX_OUTPUT_BYTES, MAX_RETAINED_RUNS } from "./limits.ts";
 import { resultText, runtimeLabel } from "./reports.ts";
 import type { SubagentDetails } from "./types.ts";
-import { failed, isFiniteNumber, isOutputTruncation, isThinkingLevel, isUsage } from "./types.ts";
+import { Check } from "typebox/value";
+import { ChildResultSchema } from "./result-schema.ts";
+import { failed, isOutputTruncation } from "./types.ts";
 import type { ChildResult, UsageSummary } from "./types.ts";
 
 interface ChildRenderContext {
@@ -13,31 +15,9 @@ interface ChildRenderContext {
   args: { id?: unknown; ids?: unknown };
 }
 
-export function isRenderableUsage(value: unknown): value is UsageSummary {
-  return isUsage(value) && isFiniteNumber((value as Partial<UsageSummary>).turns);
-}
-
-export function isRenderableChildResult(value: unknown): value is ChildResult {
-  if (!value || typeof value !== "object") return false;
-  const result = value as Partial<ChildResult>;
-  return typeof result.id === "string"
-    && typeof result.prompt === "string"
-    && typeof result.cwd === "string"
-    && Array.isArray(result.tools) && result.tools.every((tool) => typeof tool === "string")
-    && (result.output === undefined || typeof result.output === "string")
-    && (result.stdout === undefined || typeof result.stdout === "string")
-    && (result.outputTruncation === undefined || isOutputTruncation(result.outputTruncation))
-    && (result.errorMessage === undefined || typeof result.errorMessage === "string")
-    && (result.model === undefined || typeof result.model === "string")
-    && (result.thinking === undefined || isThinkingLevel(result.thinking))
-    && isFiniteNumber(result.startedAt ?? 0)
-    && (result.state?.status === "running"
-      || (result.state?.status === "terminal"
-        && (result.state.outcome === "completed" || result.state.outcome === "incomplete" || result.state.outcome === "failed" || result.state.outcome === "cancelled" || result.state.outcome === "timed_out")
-        && isFiniteNumber(result.state.exitCode)
-        && isFiniteNumber(result.state.finishedAt)))
-    && typeof result.stderr === "string"
-    && isRenderableUsage(result.usage);
+function isRenderableChildResult(value: unknown): value is ChildResult {
+  return Check(ChildResultSchema, value)
+    && (value.outputTruncation === undefined || isOutputTruncation(value.outputTruncation));
 }
 
 export function formatTokens(value: number): string {
@@ -86,7 +66,7 @@ function oneLine(text: string): string {
  */
 function collapsedPreview(child: ChildResult, command: SubagentDetails["command"] | undefined, notification: boolean): string {
   const statusList = !notification && command === "status";
-  if (child.state.status === "running" || statusList) return oneLine(child.prompt);
+  if (child.state.status === "running" || statusList) return child.omittedFields?.includes("prompt") ? "task not retained" : oneLine(child.prompt);
   if (child.state.outcome === "completed") return "";
   // The timeout heading already says what happened and how long it ran.
   if (child.state.outcome === "timed_out" && child.errorMessage === "Subagent timed out.") return "";
@@ -172,7 +152,7 @@ function renderChildren(details: unknown, expanded: boolean, theme: Theme, targe
     if (expanded) {
       // Status/wait/stop rows need task labels; run/spawn show the prompt in their call header.
       if (data?.command !== "run" && data?.command !== "spawn") {
-        container.addChild(new Text(theme.fg("dim", clean(child.prompt, 8192)), 0, 0));
+        container.addChild(new Text(theme.fg("dim", child.omittedFields?.includes("prompt") ? "Task prompt omitted to fit the response budget." : clean(child.prompt, 8192)), 0, 0));
       }
       const report = resultText(child);
       if (!active) {
@@ -189,7 +169,9 @@ function renderChildren(details: unknown, expanded: boolean, theme: Theme, targe
         remaining -= Buffer.byteLength(diagnostic);
         container.addChild(new Text(theme.fg("dim", `${label}: ${stripTerminalControls(diagnostic)}`), 0, 0));
       }
-      container.addChild(new Text(theme.fg("dim", `cwd: ${clean(child.cwd, 1024)}\ntools: ${clean(child.tools.join(", "), 1024) || "none"}`), 0, 0));
+      const cwd = child.omittedFields?.includes("cwd") ? "not retained (response budget)" : clean(child.cwd, 1024);
+      const tools = child.omittedFields?.includes("tools") ? "not retained (response budget)" : clean(child.tools.join(", "), 1024) || "none";
+      container.addChild(new Text(theme.fg("dim", `cwd: ${cwd}\ntools: ${tools}`), 0, 0));
       if (!active) container.addChild(new Text(theme.fg("dim", formatUsage(child.usage, child.model ? clean(child.model, 256) : undefined) + (child.thinking ? ` · thinking: ${child.thinking}` : "")), 0, 0));
     }
   }

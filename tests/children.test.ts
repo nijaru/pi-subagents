@@ -84,6 +84,23 @@ describe("session ownership", () => {
     expect(c.children.takePendingUsage()).toMatchObject({ input: 5, cost: { total: 1 } });
     await c.children.close();
   });
+  test("repeated stops return independent snapshots after cleanup", async () => {
+    const c = controlled();
+    const run = c.start();
+    c.executions[0]!.usage.input = 5;
+    c.executions[0]!.usage.cost.total = 1;
+    const first = await c.children.stop(run.result.id);
+    first.tools.push("bash");
+    first.usage.input = 999;
+    first.usage.cost.total = 999;
+    first.state = { status: "running" };
+    expect(await c.children.stop(run.result.id)).toMatchObject({
+      tools: ["read"], state: { status: "terminal", outcome: "cancelled" },
+      usage: { input: 5, cost: { total: 1 } },
+    });
+    expect(c.children.takePendingUsage()).toMatchObject({ input: 5, cost: { total: 1 } });
+    await c.children.close();
+  });
   test("expired and cancelled waits release their completion listeners", async () => {
     const c = controlled();
     const run = c.start();
@@ -263,7 +280,8 @@ describe("session ownership", () => {
       return { outcome: "failed", exitCode: 1, stopReason: "error", errorMessage: "diagnostic".repeat(1000), stdout: "not lifecycle state", stderr: "", usage: emptyUsage() };
     } }, () => {});
     const run = children.start({ prompt: "x", tools: [], cwd: process.cwd() });
-    const result = await run.promise;
+    await run.promise;
+    const result = children.snapshot(run);
     expect(Object.keys(result.state).sort()).toEqual(["exitCode", "finishedAt", "outcome", "status", "stopReason"]);
     expect(result.errorMessage).toContain("diagnostic");
     await children.close();
@@ -272,7 +290,8 @@ describe("session ownership", () => {
     const children = new SessionChildren({ async run() { throw new Error("setup failed"); } }, () => {});
     for (let i = 0; i < 8; i++) {
       const run = children.start({ prompt: "x", tools: [], cwd: process.cwd() });
-      expect((await run.promise).errorMessage).toBe("setup failed");
+      await run.promise;
+      expect(children.snapshot(run).errorMessage).toBe("setup failed");
       expect(children.snapshot(run).state).toMatchObject({ status: "terminal", outcome: "failed" });
     }
     await children.close();
