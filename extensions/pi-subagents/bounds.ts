@@ -202,9 +202,13 @@ export function boundDetails(details: SubagentDetails, maxBytes = MAX_OUTPUT_BYT
   }
   if (baseBytes === maxBytes || minimalResults.length === 0) return bounded;
   const minima = minimalResults.map(jsonBytes);
-  const needs = details.results.map((result, index) =>
-    Math.max(0, jsonBytes(boundChildResult(result, maxBytes)) - minima[index]!));
+  const candidates = details.results.map((result) => boundChildResult(result, maxBytes));
+  const needs = candidates.map((result, index) => Math.max(0, jsonBytes(result) - minima[index]!));
   const allocations = allocateBudget(needs, maxBytes - baseBytes);
-  bounded.results = details.results.map((result, index) => boundChildResult(result, minima[index]! + allocations[index]!));
+  // Restoring context can remove more omission metadata than it adds text.
+  // Keep fully funded candidates instead of rebuilding them through that overhead.
+  bounded.results = details.results.map((result, index) => allocations[index] === needs[index]
+    ? candidates[index]!
+    : boundChildResult(result, minima[index]! + allocations[index]!));
   return bounded;
 }

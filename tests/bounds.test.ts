@@ -55,6 +55,17 @@ describe("serialized result bounds", () => {
     expect(() => boundDetails(details, NaN)).toThrow(RangeError);
   });
 
+  test.each([1, 32])("small failures keep their causes when omission metadata is more expensive (%s children)", (count) => {
+    const results = Array.from({ length: count }, (_, index) => ({
+      ...child(`child-${index}`), prompt: "x", cwd: "/tmp", tools: [], model: undefined,
+      output: undefined, outputTruncation: undefined, errorMessage: "bad",
+    }));
+    expect(jsonBytes(results[0]!)).toBeLessThan(jsonBytes(minimalChildResult(results[0]!)));
+    const bounded = boundDetails({ command: "wait", results });
+    expect(bounded.results).toEqual(results);
+    expect(jsonBytes(bounded)).toBeLessThanOrEqual(51200);
+  });
+
   test("large reports cannot starve task identity and diagnostic tails", () => {
     const result = { ...child(), prompt: "Investigate the failure", errorMessage: undefined, model: undefined,
       output: "x".repeat(51200), stderr: "early\n" + "s".repeat(10000) + "\nFINAL_STACK_TRACE",
