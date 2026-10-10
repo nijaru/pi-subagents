@@ -63,6 +63,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_start", (_event, ctx) => runtime.delivery.started(ctx));
   pi.on("agent_end", (event, ctx) => runtime.delivery.ended(event, ctx));
   pi.on("turn_start", (_event, ctx) => { runtime.delivery.reconcile(ctx); });
+  pi.on("message_end", (event, ctx) => runtime.delivery.responded(event, ctx));
   pi.on("turn_end", (event, ctx) => runtime.delivery.boundary(event, ctx));
   pi.on("agent_before_settle", (event, ctx) => runtime.delivery.boundary(event, ctx));
   pi.on("agent_settled", (_event, ctx) => runtime.delivery.settled(ctx));

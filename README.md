@@ -27,7 +27,9 @@ Ask Pi to delegate a specific task, or use these tool-call shapes:
 {"command":"stop","id":"<child-id>"}
 ```
 
-Unread background results arrive at the next successful active-turn boundary. Results ready together share one completion message and continuation. **Completions never wake an idle parent.** Results finishing after the last boundary, or during parent errors or cancellation, remain unread until another natural turn or an explicit `wait`. The TUI status indicator shows the unread count. This avoids undoing a late idle abort that Pi does not expose to extensions.
+Unread background results arrive at the next successful active-turn boundary. Results ready together share one completion message and continuation. **Completions never wake an idle parent.** Results finishing after the last boundary, or during parent errors or cancellation, remain unread until another natural turn or an explicit `wait`. This avoids undoing a late idle abort that Pi does not expose to extensions.
+
+A committed notice suppresses duplicates, but remains unread until a successful subsequent assistant response with the notice still in Pi's projected history, or an explicit join. Cancellation before that response preserves the report. If compaction or a context edit removes the notice first, use `wait` to retrieve and acknowledge it. The TUI status indicator shows the unread count.
 
 Spawn independent tasks before waiting. Calls can execute in parallel when Pi's tool scheduling permits it; one foreground child no longer forces sibling tool calls to run sequentially.
 

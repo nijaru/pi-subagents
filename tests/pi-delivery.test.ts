@@ -6,9 +6,12 @@ import * as path from "node:path";
 // Hold the parent's next model response until its real child has completed.
 // A read-only tool probe supplies that barrier without consuming the report.
 // This reproduces the completion-before-wait race against Pi's actual queues.
-test.each(["wait", "unread", "batch"])("real Pi delivers completed children once: %s", async (mode) => {
+test.each(["wait", "unread", "batch", "abort-before", "abort-after"])("real Pi delivers completed children once: %s", async (mode) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-child-delivery-"));
   const expectedChildren = mode === "batch" ? 2 : 1;
+  const cancelled = mode.startsWith("abort-");
+  const expectedRequests = mode === "abort-before" ? 4 : 3;
+  const releaseChild = Promise.withResolvers<void>();
   let parentRequests = 0;
   const requests: any[] = [];
   let proc: ReturnType<typeof Bun.spawn> | undefined;
@@ -21,6 +24,7 @@ test.each(["wait", "unread", "batch"])("real Pi delivers completed children once
       let delta: any;
       let finish = "stop";
       if (!parent) {
+        await releaseChild.promise;
         delta = { content: "CHILD_REPORT" };
       } else {
         parentRequests++;
@@ -29,6 +33,7 @@ test.each(["wait", "unread", "batch"])("real Pi delivers completed children once
           delta = { tool_calls: Array.from({ length: expectedChildren }, (_, i) => call(`spawn_${i}`, "subagent", { command: "spawn", prompt: `Independent child ${i}`, tools: [] }, i)) };
           finish = "tool_calls";
         } else if (parentRequests === 2) {
+          releaseChild.resolve();
           const deadline = Date.now() + 15000;
           let ids: string[] = [];
           while (Date.now() < deadline) {
@@ -41,7 +46,7 @@ test.each(["wait", "unread", "batch"])("real Pi delivers completed children once
             ? call("wait_call", "subagent", { command: "wait", ids: [ids[0]] })
             : call("read_call", "read", { path: "fixture.txt" })] };
           finish = "tool_calls";
-        } else delta = { content: parentRequests === 3 ? "PARENT_DONE" : "REDUNDANT_NOTICE" };
+        } else delta = { content: parentRequests < expectedRequests ? "RESUMING" : parentRequests === expectedRequests ? "PARENT_DONE" : "REDUNDANT_NOTICE" };
       }
       const chunk = (part: any, finish_reason: string | null) => `data: ${JSON.stringify({ id: "completion", object: "chat.completion.chunk", created: 0, model: "model", choices: [{ index: 0, delta: part, finish_reason }] })}\n\n`;
       return new Response(chunk({ role: "assistant", ...delta }, null) + chunk({}, finish) + "data: [DONE]\n\n", { headers: { "Content-Type": "text/event-stream" } });
@@ -58,12 +63,27 @@ test.each(["wait", "unread", "batch"])("real Pi delivers completed children once
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 export default function (pi) {
-  let tool;
+  let tool, status;
+  const settlements = [];
   const timers = new Set();
+  pi.on("session_start", (_event, ctx) => {
+    const setStatus = ctx.ui.setStatus;
+    ctx.ui.setStatus = (key, value) => { if (key === "subagents") status = value; setStatus(key, value); };
+  });
+  const abortToolTurn = (event, ctx) => {
+    if (event.toolResults.some(result => result.toolName === "read")) ctx.abort();
+  };
+  if (${JSON.stringify(mode)} === "abort-before") pi.on("turn_end", abortToolTurn);
   extension(new Proxy(pi, { get(target, name) {
     if (name === "registerTool") return (definition) => { tool = definition; pi.registerTool(definition); };
     return Reflect.get(target, name);
   } }));
+  if (${JSON.stringify(mode)} === "abort-after") pi.on("turn_end", abortToolTurn);
+  pi.on("agent_settled", (_event, ctx) => {
+    settlements.push({ status: status ?? null,
+      notices: ctx.sessionManager.getBranch().filter(entry => entry.type === "custom_message" && entry.customType === "subagent-complete").length });
+    writeFileSync(join(ctx.cwd, "settlements.json"), JSON.stringify(settlements));
+  });
   pi.on("tool_result", (event, ctx) => {
     if (event.toolName !== "subagent" || event.input.command !== "spawn" || event.isError) return;
     const id = event.details.results[0].id;
@@ -79,7 +99,7 @@ export default function (pi) {
 }`);
     const cli = path.resolve(import.meta.dir, "../node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
     const invocation = process.env.PI_CHILD_TEST_CLI ? [process.env.PI_CHILD_TEST_CLI] : ["node", cli];
-    const child = Bun.spawn([...invocation, "--mode", "json", "-p", "--no-session", "--extension", wrapper, "--tools", "read,subagent", "--model", "fixture/model", "Delegate independent work and incorporate each result once."], {
+    const child = Bun.spawn([...invocation, "--mode", "json", "-p", "--no-session", "--extension", wrapper, "--tools", "read,subagent", "--model", "fixture/model", "Delegate independent work and incorporate each result once.", ...(cancelled ? ["Resume and incorporate the child result."] : [])], {
       cwd: dir,
       env: { HOME: dir, PATH: process.env.PATH, PI_CODING_AGENT_DIR: dir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_SUBAGENT_TIMEOUT_MS: "15000" },
       stdout: "pipe", stderr: "pipe",
@@ -92,10 +112,17 @@ export default function (pi) {
     clearTimeout(deadline);
     const out = await output;
     expect({ exit, stderr: await stderr }).toEqual({ exit: 0, stderr: "" });
-    expect(parentRequests).toBe(3);
+    expect(parentRequests).toBe(expectedRequests);
     expect(out).toContain("PARENT_DONE");
     expect(out).not.toContain("REDUNDANT_NOTICE");
-    expect(JSON.stringify(requests[2].messages)).toContain("CHILD_REPORT");
+    expect(JSON.stringify(requests.at(-1).messages)).toContain("CHILD_REPORT");
+    if (cancelled) {
+      const settlements = JSON.parse(fs.readFileSync(path.join(dir, "settlements.json"), "utf8"));
+      expect(settlements).toEqual([
+        { status: "1 unread child result", notices: mode === "abort-before" ? 0 : 1 },
+        { status: null, notices: 1 },
+      ]);
+    }
     const events = out.trim().split("\n").map((line) => JSON.parse(line));
     const notices = events.filter((event) => event.type === "entry_appended" && event.entry.type === "custom_message" && event.entry.customType === "subagent-complete");
     expect(notices).toHaveLength(mode === "wait" ? 0 : 1);
@@ -103,6 +130,7 @@ export default function (pi) {
     expect(out).not.toContain('"type":"queue_update","steering":[],"followUp":[{"role":"custom","customType":"subagent-complete"');
   } finally {
     proc?.kill();
+    releaseChild.resolve();
     server.stop(true);
     fs.rmSync(dir, { recursive: true, force: true });
   }

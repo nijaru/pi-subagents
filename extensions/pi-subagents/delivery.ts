@@ -1,4 +1,4 @@
-import type { AgentBeforeSettleEvent, AgentEndEvent, BoundaryResult, ExtensionContext, TurnEndEvent } from "@earendil-works/pi-coding-agent";
+import type { AgentBeforeSettleEvent, AgentEndEvent, BoundaryResult, ExtensionContext, MessageEndEvent, TurnEndEvent } from "@earendil-works/pi-coding-agent";
 import { boundDetails } from "./bounds.ts";
 import { SessionChildren } from "./children.ts";
 import { MAX_COMPLETION_BYTES } from "./limits.ts";
@@ -14,6 +14,11 @@ function completionMessage(results: ChildResult[]) {
   };
 }
 
+function completionIds(details: unknown): string[] {
+  const results = (details as Partial<SubagentDetails> | undefined)?.results;
+  return Array.isArray(results) ? results.flatMap((result) => typeof result?.id === "string" ? [result.id] : []) : [];
+}
+
 /** Host turn policy only. SessionChildren owns whether a result is still unread. */
 export class CompletionDelivery {
   private ctx?: ExtensionContext;
@@ -26,7 +31,7 @@ export class CompletionDelivery {
 
   refreshStatus(): void {
     if (this.closed) return;
-    const count = this.children.pendingCompletions().length;
+    const count = this.children.unreadCompletionCount();
     try { this.ctx?.ui?.setStatus("subagents", count ? `${count} unread child result${count === 1 ? "" : "s"}` : undefined); } catch { /* Display is best effort. */ }
   }
 
@@ -48,10 +53,7 @@ export class CompletionDelivery {
     const ids = new Set<string>();
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type !== "custom_message" || entry.customType !== "subagent-complete") continue;
-      const details = entry.details as Partial<SubagentDetails> | undefined;
-      if (Array.isArray(details?.results)) {
-        for (const result of details.results) if (typeof result?.id === "string") ids.add(result.id);
-      }
+      for (const id of completionIds(entry.details)) ids.add(id);
     }
     const dropped = this.children.reconcileCompletions(ids);
     if (dropped) this.suppressDelivery = true;
@@ -59,10 +61,34 @@ export class CompletionDelivery {
     return dropped;
   }
 
+  responded(event: MessageEndEvent, ctx: ExtensionContext): void {
+    if (this.closed || ctx.signal?.aborted || event.message.role !== "assistant") return;
+    if (!["stop", "toolUse", "length"].includes(event.message.stopReason)) return;
+    this.reconcile(ctx);
+    if (!this.children.hasPublishedCompletions()) return;
+    // A successful assistant response acknowledges the preceding visible notices
+    // before its tools run, so admission can reclaim their retained handles.
+    // This is canonical-context evidence, not a provider-specific wire receipt.
+    const ids = new Set<string>();
+    for (const entry of ctx.sessionManager.buildSessionProjection().entries) {
+      const source = entry.sourceEntry;
+      if (source.type !== "custom_message" || source.customType !== "subagent-complete") continue;
+      // Do not acknowledge a notice removed, compacted or redacted out of context.
+      if (!entry.messages.some((message) => message.role === "custom" && message.content === source.content)) continue;
+      for (const id of completionIds(source.details)) ids.add(id);
+    }
+    this.children.acknowledgeCompletions(ids);
+    this.refreshStatus();
+  }
+
   boundary(event: TurnEndEvent | AgentBeforeSettleEvent, ctx: ExtensionContext): BoundaryResult | undefined {
     if (this.closed) return;
     this.reconcile(ctx);
-    this.suppressDelivery ||= event.outcome !== "completed";
+    // Pi's outcome follows the assistant stop reason, so an aborted tool turn
+    // can still report "completed". Publication alone is not acknowledgement:
+    // a later boundary handler may abort before the next request starts.
+    const stopped = event.outcome !== "completed" || ctx.signal?.aborted === true;
+    this.suppressDelivery ||= stopped;
     // Never turn an abort or provider failure into an automatic restart.
     if (this.suppressDelivery) return;
     const results = this.children.pendingCompletions();

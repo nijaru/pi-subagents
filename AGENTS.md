@@ -21,7 +21,7 @@ Release through the manual `publish` workflow, never from a working tree. Verify
 ## Ownership and contracts
 
 - `extensions/pi-subagents/index.ts`: registration, parent session lifecycle, completion notices, command dispatch, rendering.
-- `children.ts`: session-owned handles, synchronous admission, wait/stop, unread/offered/delivered result state, usage accounting, retention, shutdown fencing.
+- `children.ts`: session-owned handles, synchronous admission, wait/stop, completion ownership, usage accounting, retention, shutdown fencing.
 - `delivery.ts`: active-turn boundary batching; never wake idle parents. Boundary drafts remain provisional until confirmed in the transcript; no busy-parent follow-up queue.
 - `supervisor.ts`: the single child execution boundary used by both run and spawn; it accepts an immutable task, owns execution data, and returns detached snapshots and a final result after cleanup. No session registry here, and no lifecycle state ownership.
 - `child-bootstrap.mjs`, `child-session.ts`: selected-installation SDK loading, canonical CLI built-ins and noninteractive project trust, exact model/tool verification and readiness, and session teardown.

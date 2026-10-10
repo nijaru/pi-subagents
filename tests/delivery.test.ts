@@ -18,17 +18,34 @@ function controlled() {
       return { output: "report", stderr: "", usage: emptyUsage(), outcome: signal.aborted ? "cancelled" : "completed", exitCode: 0, stopReason: "stop" };
     },
   }, () => delivery.refreshStatus());
-  const ctx: any = { sessionManager: { getBranch: () => entries }, ui: { setStatus: (_key: string, value: string | undefined) => statuses.push(value) } };
+  let nextEntry = 0;
+  const ctx: any = {
+    signal: new AbortController().signal,
+    sessionManager: {
+      getBranch: () => entries,
+      buildSessionProjection: () => ({ entries: entries.map((sourceEntry) => ({
+        sourceEntry,
+        messages: sourceEntry.type === "custom_message" ? [{ role: "custom", content: sourceEntry.content }] : [],
+      })) }),
+    },
+    ui: { setStatus: (_key: string, value: string | undefined) => statuses.push(value) },
+  };
   delivery = new CompletionDelivery(children);
   delivery.bind(ctx);
   const start = () => children.start({ prompt: "inspect", tools: [], cwd: process.cwd() });
-  const boundary = (outcome = "completed", drafts: any[] = []) => delivery.boundary({ type: "turn_end", entries: drafts, outcome } as any, ctx);
+  const responded = (stopReason = "stop") => delivery.responded({ type: "message_end", message: { role: "assistant", stopReason } } as any, ctx);
+  const boundary = (outcome = "completed", drafts: any[] = []) => {
+    responded(outcome === "completed" ? "stop" : outcome);
+    const messageEntryId = `entry-${++nextEntry}`;
+    entries.push({ type: "message", id: messageEntryId });
+    return delivery.boundary({ type: "turn_end", messageEntryId, entries: drafts, outcome } as any, ctx);
+  };
   const commit = (result: ReturnType<typeof boundary>) => {
-    entries.push(...(result?.entries ?? []));
+    entries.push(...(result?.entries ?? []).map((entry) => ({ ...entry, id: `entry-${++nextEntry}` })));
     delivery.reconcile(ctx);
   };
   const close = async () => { delivery.close(); await children.close(); };
-  return { children, delivery, gates, entries, statuses, ctx, start, boundary, commit, close };
+  return { children, delivery, gates, entries, statuses, ctx, start, responded, boundary, commit, close };
 }
 
 describe("parent completion delivery", () => {
@@ -85,6 +102,70 @@ describe("parent completion delivery", () => {
     c.delivery.started(c.ctx);
     c.commit(c.boundary());
     expect(c.children.pendingCompletions()).toEqual([]);
+    await c.close();
+  });
+
+  test("an aborted tool turn with a completed assistant stays unread", async () => {
+    const c = controlled();
+    const run = c.start();
+    c.gates[0]!.resolve();
+    await run.promise;
+    c.ctx.signal = AbortSignal.abort();
+    expect(c.boundary()).toBeUndefined();
+    c.delivery.settled(c.ctx);
+    expect(c.statuses.at(-1)).toBe("1 unread child result");
+    expect(c.children.pendingCompletions()).toHaveLength(1);
+    await c.close();
+  });
+
+  test.each(["aborted", "error", "signal"])("published reports survive %s continuation and resume without duplicates", async (failure) => {
+    const c = controlled();
+    const run = c.start();
+    c.gates[0]!.resolve();
+    await run.promise;
+    const draft = c.boundary();
+    // Cancellation can happen in a later hook, after offering but before commit.
+    if (failure === "signal") c.ctx.signal = AbortSignal.abort();
+    c.commit(draft);
+    if (failure !== "signal") c.boundary(failure);
+    c.delivery.settled(c.ctx);
+    expect(c.statuses.at(-1)).toBe("1 unread child result");
+    expect(c.children.pendingCompletions()).toEqual([]);
+    expect(c.children.get(run.result.id).delivery).toBe("published");
+    c.ctx.signal = new AbortController().signal;
+    c.delivery.started(c.ctx);
+    expect(c.boundary()).toBeUndefined();
+    expect(c.entries.filter((entry) => entry.customType === "subagent-complete")).toHaveLength(1);
+    expect(c.statuses.at(-1)).toBeUndefined();
+    await c.close();
+  });
+
+  test("an explicit join acknowledges a published report", async () => {
+    const c = controlled();
+    const run = c.start();
+    c.gates[0]!.resolve();
+    await run.promise;
+    c.commit(c.boundary());
+    expect((await c.children.wait([run.result.id], 1))[0]!.output).toBe("report");
+    c.delivery.settled(c.ctx);
+    expect(c.statuses.at(-1)).toBeUndefined();
+    expect(c.boundary()).toBeUndefined();
+    await c.close();
+  });
+
+  test.each(["removed", "redacted"])("a %s published notice is not acknowledged by unrelated successful turns", async (change) => {
+    const c = controlled();
+    const run = c.start();
+    c.gates[0]!.resolve();
+    await run.promise;
+    c.commit(c.boundary());
+    const project = c.ctx.sessionManager.buildSessionProjection;
+    c.ctx.sessionManager.buildSessionProjection = () => ({ entries: project().entries.map((entry: any) => ({
+      ...entry, messages: change === "removed" ? [] : [{ role: "custom", content: "redacted" }],
+    })) });
+    expect(c.boundary()).toBeUndefined();
+    expect(c.statuses.at(-1)).toBe("1 unread child result");
+    expect((await c.children.wait([run.result.id], 1))[0]!.output).toBe("report");
     await c.close();
   });
 
@@ -152,6 +233,11 @@ describe("parent completion delivery", () => {
     for (const run of c.children.list()) expect(draft.content).toContain(run.id);
     expect(draft.content).toContain("Excerpt truncated");
     c.commit(result);
+    expect(() => c.start()).toThrow("unread");
+    // The response acknowledges reports before its tools need admission.
+    c.responded("toolUse");
+    expect(c.start()).toBeDefined();
+    expect(c.boundary()).toBeUndefined();
     await c.close();
   });
 

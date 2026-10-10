@@ -9,7 +9,7 @@ import { truncateOutput } from "./bounds.ts";
 export interface ChildRun {
   result: ChildResult;
   /** Result delivery is independent of process completion and waiter lifetime. */
-  delivery: "unread" | "offered" | "delivered";
+  delivery: "unread" | "offered" | "published" | "delivered";
   controller: AbortController;
   /** Terminal output is not publishable until process-tree cleanup finishes. */
   settled: boolean;
@@ -121,6 +121,23 @@ export class SessionChildren {
       .map((run) => this.snapshot(run));
   }
 
+  /** Published notices suppress duplicates but are not yet acknowledged. */
+  unreadCompletionCount(): number {
+    if (this.closed) return 0;
+    return [...this.runs.values()].filter((run) => run.settled && run.delivery !== "delivered" && run.activeWaits === 0).length;
+  }
+
+  hasPublishedCompletions(): boolean {
+    return [...this.runs.values()].some((run) => run.delivery === "published");
+  }
+
+  acknowledgeCompletions(ids: ReadonlySet<string>): void {
+    for (const id of ids) {
+      const run = this.runs.get(id);
+      if (run?.delivery === "published") run.delivery = "delivered";
+    }
+  }
+
   /** Boundary drafts are provisional until Pi commits them to the transcript. */
   offerCompletions(ids: string[]): void {
     for (const id of ids) {
@@ -139,7 +156,7 @@ export class SessionChildren {
     for (const run of this.runs.values()) {
       if (run.delivery !== "offered") continue;
       const committed = committedIds.has(run.result.id);
-      run.delivery = committed ? "delivered" : "unread";
+      run.delivery = committed ? "published" : "unread";
       dropped ||= !committed;
     }
     return dropped;
