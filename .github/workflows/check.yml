@@ -29,5 +29,24 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: Select compatibility-floor host
         if: matrix.pi != 'development'
-        run: bun add --dev --exact @earendil-works/pi-ai@${{ matrix.pi }} @earendil-works/pi-coding-agent@${{ matrix.pi }} @earendil-works/pi-tui@${{ matrix.pi }}
+        env:
+          PI_COMPAT_VERSION: ${{ matrix.pi }}
+        run: |
+          # Older hosts use caret ranges for sibling packages. Pin the complete
+          # host family, then reinstall so no newer nested copy survives.
+          node --input-type=module <<'JS'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+          const version = process.env.PI_COMPAT_VERSION;
+          for (const name of Object.keys(pkg.devDependencies)) {
+            if (name.startsWith('@earendil-works/')) pkg.devDependencies[name] = version;
+          }
+          pkg.overrides = { ...pkg.overrides };
+          for (const name of ['chord', 'pi-ai', 'pi-agent-core', 'pi-codemode', 'pi-mcp', 'pi-tui']) {
+            pkg.overrides[`@earendil-works/${name}`] = version;
+          }
+          writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          JS
+          rm -rf node_modules
+          bun install
       - run: bun run check
