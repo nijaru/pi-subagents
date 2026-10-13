@@ -27,6 +27,8 @@ export interface StartChild {
   model?: string;
   thinking?: ModelThinkingLevel;
   strictThinking?: boolean;
+  /** Per-task execution deadline; omitted uses the global child deadline. */
+  executionTimeoutMs?: number;
   emit?: (result: ChildResult, progress: string) => void;
 }
 
@@ -61,6 +63,7 @@ export class SessionChildren {
     const task: ChildTask = Object.freeze({
       id: result.id, prompt: options.prompt, cwd: options.cwd, tools: Object.freeze([...options.tools]),
       model: options.model, thinking: options.thinking, strictThinking: options.strictThinking,
+      executionTimeoutMs: options.executionTimeoutMs,
     });
     // Register before execution can emit, await, or invoke extension callbacks.
     this.runs.set(result.id, run);

@@ -11,13 +11,9 @@ import { parseChildEvent, type ChildBootstrap, type ChildEvent } from "./child-p
 import { MAX_PROTOCOL_LINE_BYTES, MAX_STDERR_BYTES } from "./limits.ts";
 import type { AgentOutcome } from "./types.ts";
 import { appendDiagnostic, truncateHeadTail } from "./bounds.ts";
-import { processTimeoutMs } from "./limits.ts";
+import { timeoutSummary } from "./reports.ts";
 import { spawnDeathWatchdog, sweepRootProcessGroup, terminateProcessTree } from "./process-tree.ts";
 import { childEnvironment } from "./env.ts";
-
-// Result headings already carry elapsed runtime; don't repeat the deadline in
-// machine units in the cause.
-const TIMED_OUT_MESSAGE = "Subagent timed out.";
 
 export interface PiInvocation {
   command: string;
@@ -76,15 +72,17 @@ export interface PiProcessRequest {
   bootstrap: ChildBootstrap;
   cwd: string;
   childRunId: string;
+  /** Execution deadline; the process timer below is its only owner. */
+  timeoutMs: number;
   signal?: AbortSignal;
   onEvent: (event: ChildEvent) => void;
 }
 
 export async function runPiProcess(request: PiProcessRequest): Promise<ProcessResult> {
-  const { bootstrap, cwd, childRunId, signal, onEvent } = request;
+  const { bootstrap, cwd, childRunId, timeoutMs, signal, onEvent } = request;
   if (signal?.aborted) return { exitCode: 1, stopReason: "aborted", outcome: "cancelled", errorMessage: "Subagent aborted.", stderr: "" };
-  const timeoutMs = processTimeoutMs();
 
+  const startedAt = Date.now();
   const invocation = getChildInvocation();
   return new Promise((resolve) => {
     let settled = false;
@@ -125,7 +123,7 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
         if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
         // Cancellation/deadline during the cleanup join is still authoritative.
         const termination = timedOut
-          ? { outcome: "timed_out" as const, exitCode: 1, stopReason: "error" as const, errorMessage: TIMED_OUT_MESSAGE }
+          ? { outcome: "timed_out" as const, exitCode: 1, stopReason: "error" as const, errorMessage: timeoutSummary(Date.now() - startedAt, timeoutMs) }
           : aborted || signal?.aborted
             ? { outcome: "cancelled" as const, exitCode: 1, stopReason: "aborted" as const, errorMessage: "Subagent aborted." }
             : processFailure ? { outcome: "failed" as const, exitCode: 1, stopReason: "error" as const, errorMessage: processFailure } : {};

@@ -81,6 +81,7 @@ export default function (pi: ExtensionAPI) {
       "Prefer direct work over subagent for routine or tightly coupled tasks. Do not duplicate delegated work; the parent owns integration and verification.",
       "Spawn independent subagent tasks before waiting. Background results arrive at active-turn boundaries, never by waking idle parents. Use subagent wait with ids when blocked; it wakes when any finishes. Do not poll or wait again on reports already received. Cancelling wait leaves children running; stop cancels them.",
       "subagent run joins within a bounded foreground budget; if it expires the child keeps working and reports completion like spawn, so never relaunch it as a duplicate.",
+      "Bound task execution with executionTimeoutMs (default 30m, at most 2h), separate from wait's timeoutMs join budget. A timed-out result keeps partial output and states elapsed runtime and the deadline, so split the task or raise the deadline instead of relaunching it unchanged.",
       "Give concurrent subagent writers separate worktrees, including parent-versus-child writers. Child processes share the selected working tree; subagent does not arbitrate write ownership.",
     ],
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -124,6 +125,7 @@ export default function (pi: ExtensionAPI) {
       const run = owner.start({
         prompt: params.prompt!, tools, cwd,
         model, thinking, strictThinking: params.thinking !== undefined,
+        executionTimeoutMs: params.executionTimeoutMs,
         emit: foreground && onUpdate ? present : undefined,
       });
       if (!foreground) return answer("spawn", [owner.snapshot(run)], `Started child ${run.result.id}. Completion will be delivered at an active-turn boundary; idle parents are not woken. Continue non-overlapping work; use wait when its result blocks finishing your task, or status/stop with this id.`);

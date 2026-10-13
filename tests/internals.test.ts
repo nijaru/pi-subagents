@@ -11,6 +11,7 @@ import { executable, getChildInvocation } from "../extensions/pi-subagents/subpr
 import { spawnDeathWatchdog } from "../extensions/pi-subagents/process-tree.ts";
 import { assistantReport, parseChildEvent } from "../extensions/pi-subagents/child-protocol.ts";
 import { classifyExecution } from "../extensions/pi-subagents/supervisor.ts";
+import { isTimeoutSummary, timeoutSummary } from "../extensions/pi-subagents/reports.ts";
 
 const assistant: AssistantMessage = {
   role: "assistant", content: [{ type: "text", text: "hello" }], usage: emptyUsage(),
@@ -48,11 +49,20 @@ describe("compact child protocol", () => {
   });
   test("timeouts and cancellation outrank assistant and protocol errors", () => {
     for (const outcome of ["timed_out", "cancelled"] as const) {
-      const classified = classifyExecution({ outcome, exitCode: 1, stderr: "diagnostic", stdout: "stdout diagnostic" }, assistantReport({ ...assistant, stopReason: "error", errorMessage: "earlier" }), "protocol");
-      expect(classified.outcome).toBe(outcome);
-      expect(classified).not.toHaveProperty("stderr");
-      expect(classified).not.toHaveProperty("stdout");
+      for (const report of [assistantReport({ ...assistant, stopReason: "error", errorMessage: "earlier" }), assistantReport(assistant)]) {
+        const classified = classifyExecution({ outcome, exitCode: 1, stderr: "diagnostic", stdout: "stdout diagnostic" }, report, "protocol");
+        expect(classified.outcome).toBe(outcome);
+        expect(classified).not.toHaveProperty("stderr");
+        expect(classified).not.toHaveProperty("stdout");
+      }
     }
+  });
+  test("timeout summaries name elapsed runtime and the deadline, nothing else", () => {
+    expect(timeoutSummary(250, 200)).toBe("Subagent timed out. Elapsed 250ms; execution deadline 200ms.");
+    expect(timeoutSummary(1_800_000, 3_600_000)).toBe("Subagent timed out. Elapsed 30m 0s; execution deadline 1h 0m 0s.");
+    expect(isTimeoutSummary(timeoutSummary(0, 0))).toBe(true);
+    expect(isTimeoutSummary("assistant failed")).toBe(false);
+    expect(isTimeoutSummary(undefined)).toBe(false);
   });
   test("rejects inconsistent output truncation metadata", () => {
     for (const outputTruncation of [

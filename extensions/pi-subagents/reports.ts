@@ -2,16 +2,35 @@ import { allocateBudget, truncateOutput } from "./bounds.ts";
 import { MAX_OUTPUT_BYTES } from "./limits.ts";
 import { failed, isFiniteNumber, isRunning, type ChildResult } from "./types.ts";
 
-export function formatDuration(startedAt?: number, finishedAt?: number): string | undefined {
-  if (!isFiniteNumber(startedAt)) return undefined;
-  const end = isFiniteNumber(finishedAt) ? finishedAt : Date.now();
-  const totalSeconds = Math.max(0, Math.floor((end - startedAt) / 1000));
+/** Human units; sub-second values keep millisecond precision. */
+function formatElapsed(elapsedMs: number): string {
+  if (elapsedMs < 1000) return `${Math.round(elapsedMs)}ms`;
+  const totalSeconds = Math.floor(elapsedMs / 1000);
   if (totalSeconds < 60) return `${totalSeconds}s`;
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   if (minutes < 60) return `${minutes}m ${seconds}s`;
   const hours = Math.floor(minutes / 60);
   return `${hours}h ${minutes % 60}m ${seconds}s`;
+}
+
+export function formatDuration(startedAt?: number, finishedAt?: number): string | undefined {
+  if (!isFiniteNumber(startedAt)) return undefined;
+  const end = isFiniteNumber(finishedAt) ? finishedAt : Date.now();
+  return formatElapsed(Math.max(0, end - startedAt));
+}
+
+/**
+ * Deadline expiry names elapsed runtime and the applied execution deadline in
+ * human units. Environment values, paths, and child diagnostics stay out of it.
+ */
+export function timeoutSummary(elapsedMs: number, deadlineMs: number): string {
+  return `Subagent timed out. Elapsed ${formatElapsed(elapsedMs)}; execution deadline ${formatElapsed(deadlineMs)}.`;
+}
+
+/** The built-in timeout cause; anything else is a real diagnostic worth showing. */
+export function isTimeoutSummary(message: string | undefined): boolean {
+  return message !== undefined && message.startsWith("Subagent timed out.");
 }
 
 export function runtimeLabel(result: ChildResult): string {

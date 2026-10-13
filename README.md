@@ -21,7 +21,7 @@ Ask Pi to delegate a specific task, or use these tool-call shapes:
 `run` joins the child within a foreground budget (60 seconds by default) and returns its final result. If the budget expires first, the child keeps working in the background and reports completion like `spawn`. For independent work while the parent continues:
 
 ```json
-{"command":"spawn","prompt":"Implement the parser regression test in tests/parser.test.ts. Own only that file, run its tests, and report changes and results.","cwd":"../parser-worktree"}
+{"command":"spawn","prompt":"Implement the parser regression test in tests/parser.test.ts. Own only that file, run its tests, and report changes and results.","cwd":"../parser-worktree","executionTimeoutMs":900000}
 {"command":"status"}
 {"command":"wait","ids":["<child-id>"]}
 {"command":"stop","id":"<child-id>"}
@@ -34,6 +34,8 @@ A committed notice suppresses duplicates, but remains unread until a successful 
 Spawn independent tasks before waiting. Calls can execute in parallel when Pi's tool scheduling permits it; one foreground child no longer forces sibling tool calls to run sequentially.
 
 Use `wait` before finishing a task that depends on child results. Pass one or more `ids`: the call wakes when **any** selected child finishes, returns all ready reports, and identifies those still running. It waits up to five minutes by default, or up to ten minutes with `timeoutMs`. A longer budget does not delay early completion. Wait again only on remaining ids when their results block progress, rather than polling. `wait_expired: true` means the wait budget expired without a completed child; it is not a child execution timeout.
+
+`run` and `spawn` take an optional `executionTimeoutMs`: a positive per-task execution deadline in milliseconds, at most two hours, defaulting to 30 minutes or to `PI_SUBAGENT_TIMEOUT_MS` when set. It is separate from `wait`'s `timeoutMs`, which only bounds one join; `status`, `wait`, and `stop` never change a child's deadline. At expiry the child is stopped and its result keeps any partial output, with the cause naming the elapsed runtime and the applied deadline.
 
 Cancelling a wait does **not** cancel its children; `stop` cancels one child and waits for cleanup. Cancelling `run` cancels its child.
 
@@ -91,8 +93,8 @@ Children are separate processes that share your working tree. The extension coun
 | Active children | 4 per parent session; excess starts are rejected |
 | Retained handles | 32; oldest completed, delivered handles are evicted first; unread results block admission rather than disappearing |
 | Foreground `run` | 60 seconds by default; `PI_SUBAGENT_FOREGROUND_MS` changes it, and expiry hands the child to background work |
-| Child execution | 30 minutes by default; `PI_SUBAGENT_TIMEOUT_MS` may set up to 2 hours |
-| One wait call | 5 minutes by default, at most 10 minutes, shared across selected ids; wakes on any completion and never extends child deadlines |
+| Child execution | 30 minutes by default (`PI_SUBAGENT_TIMEOUT_MS`, up to 2 hours); `executionTimeoutMs` bounds one task within the same limit |
+| One wait call | 5 minutes by default, at most 10 minutes, shared across selected ids; wakes on any completion and never sets or extends child deadlines |
 | Task prompt | 100 KiB |
 | Tool response and result details | 50 KiB each |
 | Child stdout and stderr | 50 KiB each, keeping both ends; diagnostics cannot be interpreted as result frames |

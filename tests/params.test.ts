@@ -2,9 +2,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { selectTools } from "../extensions/pi-subagents/params.ts";
+import { selectTools, validateCommand, SubagentParamsSchema } from "../extensions/pi-subagents/params.ts";
+import { Check } from "typebox/value";
 import { childEnvironment } from "../extensions/pi-subagents/env.ts";
-import { isChildProcess, processTimeoutMs, DEFAULT_PROCESS_TIMEOUT_MS } from "../extensions/pi-subagents/limits.ts";
+import { isChildProcess, processTimeoutMs, DEFAULT_PROCESS_TIMEOUT_MS, MAX_PROCESS_TIMEOUT_MS } from "../extensions/pi-subagents/limits.ts";
 
 let env: NodeJS.ProcessEnv;
 const dirs: string[] = [];
@@ -45,6 +46,19 @@ describe("tool selection", () => {
     }
     process.env.PI_SUBAGENT_TIMEOUT_MS = "1234";
     expect(processTimeoutMs()).toBe(1234);
+  });
+  test("executionTimeoutMs is a run/spawn option within the two-hour bound", () => {
+    expect(Check(SubagentParamsSchema, { command: "run", prompt: "x", executionTimeoutMs: 1 })).toBe(true);
+    expect(Check(SubagentParamsSchema, { command: "spawn", prompt: "x", executionTimeoutMs: MAX_PROCESS_TIMEOUT_MS })).toBe(true);
+    for (const value of [0, -1, 1.5, "1000", MAX_PROCESS_TIMEOUT_MS + 1]) {
+      expect(Check(SubagentParamsSchema, { command: "run", prompt: "x", executionTimeoutMs: value })).toBe(false);
+    }
+    expect(() => validateCommand({ command: "run", prompt: "x", executionTimeoutMs: 1000 })).not.toThrow();
+    expect(() => validateCommand({ command: "spawn", prompt: "x", executionTimeoutMs: 1000 })).not.toThrow();
+    expect(() => validateCommand({ command: "run", prompt: "x", timeoutMs: 1000 })).toThrow("executionTimeoutMs");
+    expect(() => validateCommand({ command: "wait", ids: ["x"], executionTimeoutMs: 1000 })).toThrow("does not accept child creation options");
+    expect(() => validateCommand({ command: "status", executionTimeoutMs: 1000 })).toThrow("does not accept child creation options");
+    expect(() => validateCommand({ command: "stop", id: "x", executionTimeoutMs: 1000 })).toThrow("does not accept child creation options");
   });
 });
 

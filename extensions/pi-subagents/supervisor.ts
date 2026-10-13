@@ -1,6 +1,6 @@
 import type { AgentOutcome, ChildResult } from "./types.ts";
 import type { ModelThinkingLevel, StopReason } from "@earendil-works/pi-ai";
-import { RUNNING_PROGRESS_TEXT } from "./limits.ts";
+import { RUNNING_PROGRESS_TEXT, processTimeoutMs } from "./limits.ts";
 import { boundedDiagnostic } from "./bounds.ts";
 import { copyUsage, emptyUsage } from "./types.ts";
 import { runPiProcess, type ProcessResult } from "./subprocess.ts";
@@ -14,6 +14,8 @@ export interface ChildTask {
   readonly model?: string;
   readonly thinking?: ModelThinkingLevel;
   readonly strictThinking?: boolean;
+  /** Per-task execution deadline; omitted falls back to PI_SUBAGENT_TIMEOUT_MS. */
+  readonly executionTimeoutMs?: number;
 }
 
 /** Execution data never includes session identity, lifecycle, or delivery state. */
@@ -60,7 +62,7 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
       const processResult = await runPiProcess({
         bootstrap: { version: CHILD_PROTOCOL_VERSION, prompt: task.prompt, tools: [...task.tools], model: task.model,
           thinking: task.thinking, strictThinking: task.strictThinking },
-        cwd: task.cwd, childRunId: task.id, signal,
+        cwd: task.cwd, childRunId: task.id, timeoutMs: task.executionTimeoutMs ?? processTimeoutMs(), signal,
         onEvent: (event) => {
           if (terminal || protocolFailure !== undefined) throw new Error("Child sent a frame after its terminal result.");
           if (event.kind === "error") {

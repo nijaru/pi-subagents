@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
-import { MAX_RETAINED_RUNS, MAX_TASK_BYTES, MAX_WAIT_MS } from "./limits.ts";
+import { MAX_PROCESS_TIMEOUT_MS, MAX_RETAINED_RUNS, MAX_TASK_BYTES, MAX_WAIT_MS } from "./limits.ts";
 import { THINKING_LEVELS } from "./types.ts";
 
 export const SubagentParamsSchema = Type.Object({
@@ -23,7 +23,8 @@ export const SubagentParamsSchema = Type.Object({
     description: "wait only: child ids to join. Returns all ready reports and identifies still-running children when any finishes. Wait again only on remaining ids when blocked.",
     minItems: 1, maxItems: MAX_RETAINED_RUNS, uniqueItems: true,
   })),
-  timeoutMs: Type.Optional(Type.Integer({ description: "wait only: shared wait budget, not a child deadline. Default 5 minutes, maximum 10; wakes early on completion. Cancelling wait leaves children running.", minimum: 1, maximum: MAX_WAIT_MS })),
+  timeoutMs: Type.Optional(Type.Integer({ description: "wait only: shared wait budget, not a child deadline. Default 5 minutes, maximum 10; wakes early on completion. Cancelling wait leaves children running. It never sets or changes execution deadlines.", minimum: 1, maximum: MAX_WAIT_MS })),
+  executionTimeoutMs: Type.Optional(Type.Integer({ description: "run/spawn only: per-task execution deadline that stops the child at expiry. Positive integer milliseconds, at most 2 hours; defaults to PI_SUBAGENT_TIMEOUT_MS (30 minutes). Distinct from wait's timeoutMs. A timed-out result keeps partial output and reports elapsed runtime and the deadline.", minimum: 1, maximum: MAX_PROCESS_TIMEOUT_MS })),
 }, { additionalProperties: false });
 
 export type SubagentParams = Static<typeof SubagentParamsSchema>;
@@ -48,11 +49,11 @@ export function validateCommand(params: SubagentParams): void {
   if (start) {
     if (!params.prompt?.trim()) throw new Error(`${params.command} requires a non-blank prompt.`);
     if (Buffer.byteLength(params.prompt, "utf8") > MAX_TASK_BYTES) throw new Error(`Prompt must be at most ${MAX_TASK_BYTES} bytes.`);
-    if (params.id !== undefined || params.ids !== undefined || params.timeoutMs !== undefined) throw new Error(`${params.command} accepts only prompt, tools, model, thinking and cwd.`);
+    if (params.id !== undefined || params.ids !== undefined || params.timeoutMs !== undefined) throw new Error(`${params.command} accepts only prompt, tools, model, thinking, cwd and executionTimeoutMs.`);
     if (params.model !== undefined && !params.model.trim()) throw new Error("Model must not be blank.");
     if (params.cwd !== undefined && !params.cwd.trim()) throw new Error("Working directory must not be blank.");
   } else {
-    if (params.prompt !== undefined || params.tools !== undefined || params.model !== undefined || params.thinking !== undefined || params.cwd !== undefined) throw new Error(`${params.command} does not accept child creation options.`);
+    if (params.prompt !== undefined || params.tools !== undefined || params.model !== undefined || params.thinking !== undefined || params.cwd !== undefined || params.executionTimeoutMs !== undefined) throw new Error(`${params.command} does not accept child creation options.`);
     if (params.command === "wait") {
       if (params.id !== undefined || !params.ids?.length) throw new Error('wait requires ids: ["<child-id>", ...], not id.');
       if (params.ids.some((id) => !id.trim())) throw new Error("Child ids must not be blank.");

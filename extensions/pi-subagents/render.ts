@@ -3,7 +3,7 @@ import { getMarkdownTheme, keyText } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Markdown, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { truncateHeadTail, truncateOutput } from "./bounds.ts";
 import { MAX_OUTPUT_BYTES, MAX_RETAINED_RUNS } from "./limits.ts";
-import { resultText, runtimeLabel } from "./reports.ts";
+import { isTimeoutSummary, resultText, runtimeLabel } from "./reports.ts";
 import type { SubagentDetails } from "./types.ts";
 import { Check } from "typebox/value";
 import { ChildResultSchema } from "./result-schema.ts";
@@ -68,8 +68,9 @@ function collapsedPreview(child: ChildResult, command: SubagentDetails["command"
   const statusList = !notification && command === "status";
   if (child.state.status === "running" || statusList) return child.omittedFields?.includes("prompt") ? "task not retained" : oneLine(child.prompt);
   if (child.state.outcome === "completed") return "";
-  // The timeout heading already says what happened and how long it ran.
-  if (child.state.outcome === "timed_out" && child.errorMessage === "Subagent timed out.") return "";
+  // The timeout heading already says what happened and how long it ran; the
+  // expanded view carries the elapsed/deadline summary.
+  if (child.state.outcome === "timed_out" && isTimeoutSummary(child.errorMessage)) return "";
   return oneLine(clean(child.errorMessage || child.stderr || "", 1024));
 }
 

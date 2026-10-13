@@ -109,7 +109,7 @@ afterEach(async () => {
 describe("task-first tool", () => {
   test("exposes the lifecycle schema and allows parallel scheduling", () => {
     const tool = host().tool;
-    expect(Object.keys(tool.parameters.properties).sort()).toEqual(["command", "prompt", "tools", "model", "thinking", "cwd", "id", "ids", "timeoutMs"].sort());
+    expect(Object.keys(tool.parameters.properties).sort()).toEqual(["command", "prompt", "tools", "model", "thinking", "cwd", "id", "ids", "timeoutMs", "executionTimeoutMs"].sort());
     expect(tool.executionMode).toBe("parallel");
   });
   test("runs without profiles, inherits model/thinking, and delivers the prompt on stdin", async () => {
@@ -160,6 +160,10 @@ describe("task-first tool", () => {
     { command: "status", prompt: "x" }, { command: "wait" }, { command: "stop" },
     { command: "run", prompt: "x", model: " " }, { command: "run", prompt: "x", cwd: " " },
     { command: "wait", ids: ["x"], timeoutMs: 0 }, { command: "wait", ids: ["x"], timeoutMs: 600001 },
+    { command: "run", prompt: "x", timeoutMs: 1000 }, { command: "spawn", prompt: "x", executionTimeoutMs: 0 },
+    { command: "run", prompt: "x", executionTimeoutMs: 7200001 }, { command: "run", prompt: "x", executionTimeoutMs: 1.5 },
+    { command: "wait", ids: ["x"], executionTimeoutMs: 1000 }, { command: "status", executionTimeoutMs: 1000 },
+    { command: "stop", id: "x", executionTimeoutMs: 1000 },
     { command: "wait", id: "x" }, { command: "wait", ids: [] }, { command: "wait", ids: ["x", "x"] },
     { command: "wait", ids: [" "] }, { command: "stop", ids: ["x"] }, { command: "run", prompt: "x", thinking: "ultra" },
     { command: "status", thinking: "high" },
@@ -503,6 +507,52 @@ describe("subprocess regressions", () => {
     expect(status.stderr).toContain("EARLY_DIAGNOSTIC");
     expect(status.stderr).toContain("FINAL_STACK_TRACE");
   });
+});
 
-
+describe("per-task execution deadlines", () => {
+  test("executionTimeoutMs overrides the global deadline and the summary names elapsed and deadline only", async () => {
+    const h = host();
+    process.env.PI_SUBAGENT_TIMEOUT_MS = "600000";
+    fakePi("await delay(10000);");
+    const result = await h.execute({ command: "run", prompt: "x", executionTimeoutMs: 1000 });
+    expect(result.isError).toBe(true);
+    expect(first(result).state).toMatchObject({ outcome: "timed_out" });
+    // The cause reports elapsed runtime and the applied deadline as durations;
+    // the strict shape proves no environment values or paths leak into it.
+    expect(first(result).errorMessage).toMatch(/^Subagent timed out\. Elapsed \d+(ms|s|m \d+s|h \d+m \d+s); execution deadline 1s\.$/);
+    expect(result.content[0].text).toContain("Subagent timed out.");
+  });
+  test("a task deadline replaces the global one without changing it for other children", async () => {
+    const h = host();
+    process.env.PI_SUBAGENT_TIMEOUT_MS = "50";
+    fakePi('await delay(150); final("survived the global deadline");');
+    const bounded = await h.execute({ command: "run", prompt: "bounded", executionTimeoutMs: 60000 });
+    expect(first(bounded).state).toMatchObject({ outcome: "completed" });
+    expect(first(bounded).output).toBe("survived the global deadline");
+    fakePi("await delay(10000);");
+    const defaulted = await h.execute({ command: "run", prompt: "defaulted" });
+    expect(first(defaulted).state).toMatchObject({ outcome: "timed_out" });
+  });
+  test("deadline expiry outranks an earlier assistant report and keeps it as partial output", async () => {
+    const h = host();
+    process.env.PI_SUBAGENT_TIMEOUT_MS = "1000";
+    fakePi('final("early findings"); await delay(10000);');
+    const result = await h.execute({ command: "run", prompt: "x" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Partial report:");
+    expect(result.content[0].text).toContain("early findings");
+    expect(first(result).state).toMatchObject({ outcome: "timed_out" });
+    expect(first(result).output).toBe("early findings");
+  });
+  test("wait's timeoutMs is a join budget and never changes execution deadlines", async () => {
+    const h = host();
+    fakePi('await delay(150); final("finished under its own deadline");');
+    const id = await spawn(h);
+    const expired = await h.execute({ command: "wait", ids: [id], timeoutMs: 1 });
+    expect(expired.details.waitExpired).toBe(true);
+    expect(first(expired).state).toMatchObject({ status: "running" });
+    const done = await h.execute({ command: "wait", ids: [id] });
+    expect(first(done).state).toMatchObject({ outcome: "completed" });
+    expect(first(done).output).toBe("finished under its own deadline");
+  });
 });

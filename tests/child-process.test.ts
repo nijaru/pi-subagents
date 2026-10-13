@@ -129,6 +129,34 @@ test("process timeout outranks earlier protocol error", async () => {
     process.env.PI_SUBAGENT_TIMEOUT_MS = "200";
     const outcome = await supervisor.run({ task, signal: new AbortController().signal });
     expect(outcome.outcome).toBe("timed_out");
+    expect(outcome.errorMessage).toMatch(/^Subagent timed out\. Elapsed \d+(ms|s|m \d+s|h \d+m \d+s); execution deadline 200ms\.$/);
+  });
+});
+test("a per-task execution deadline overrides the global default in both directions", async () => {
+  const report = { output: "slow answer", stopReason: "stop", outputTruncation: { truncated: false, originalBytes: 11, retainedBytes: 11 } };
+  await fixture(`await new Promise(resolve=>setTimeout(resolve,300)); send(${JSON.stringify({ kind: "result", report, usage: emptyUsage() })});`, async (task, supervisor) => {
+    process.env.PI_SUBAGENT_TIMEOUT_MS = "100";
+    const completed = await supervisor.run({ task: { ...task, executionTimeoutMs: 5000 }, signal: new AbortController().signal });
+    expect(completed.outcome).toBe("completed");
+    expect(completed.output).toBe("slow answer");
+  });
+  await fixture(`setInterval(()=>{},1000);`, async (task, supervisor) => {
+    process.env.PI_SUBAGENT_TIMEOUT_MS = "10000";
+    const outcome = await supervisor.run({ task: { ...task, executionTimeoutMs: 200 }, signal: new AbortController().signal });
+    expect(outcome.outcome).toBe("timed_out");
+    expect(outcome.errorMessage).toContain("execution deadline 200ms");
+  });
+});
+test.skipIf(process.platform === "win32")("deadline expiry sweeps surviving descendants before reporting the timeout", async () => {
+  await fixture(`const child=spawn('sh',['-c','sleep 30'],{stdio:'ignore'});
+    writeFileSync('pid',String(child.pid)); child.unref(); setInterval(()=>{},1000);`, async (task, supervisor) => {
+    const outcome = await supervisor.run({ task: { ...task, executionTimeoutMs: 500 }, signal: new AbortController().signal });
+    expect(outcome.outcome).toBe("timed_out");
+    // Cleanup is authoritative: the timeout result is not released while a
+    // descendant of the child's process group can still mutate the system.
+    const pid = Number(readFileSync(join(task.cwd, "pid"), "utf8"));
+    try { expect(() => process.kill(pid, 0)).toThrow(); }
+    finally { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } }
   });
 });
 test("process cancellation outranks earlier protocol error", async () => {
