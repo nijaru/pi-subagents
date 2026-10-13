@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import type { AgentToolResult, Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import {
+  ToolExecutionComponent, initTheme,
+  type AgentToolResult, type Theme, type ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import { visibleWidth, type TUI } from "@earendil-works/pi-tui";
-import { ToolExecutionComponent } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/tool-execution.js";
-import { initTheme } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 import extension from "../extensions/pi-subagents/index.ts";
 import { renderChildCall, renderChildResult, renderChildCompletion, stripTerminalControls } from "../extensions/pi-subagents/render.ts";
 import { emptyUsage, type ChildResult, type SubagentDetails } from "../extensions/pi-subagents/types.ts";
