@@ -118,6 +118,7 @@ Environment variables are allowlisted, with standard model credentials, `$VAR` r
 
 `0.0.x` is pre-release: the tool schema, behavior, and exported `ChildResult` shape are not promised across patch releases. Read this file, not the version number, for what changed.
 
+- **0.0.8**: add per-task `executionTimeoutMs` for `run`/`spawn`, separate from wait budgets. Timeout reports retain partial output and name elapsed runtime and the applied deadline. Validate SDK children and packed artifacts against Pi 1.2.0.
 - **0.0.7**: preserve unread reports when parent cancellation prevents completion delivery. Committed notices suppress duplicates without making unseen reports evictable; a subsequent successful assistant response or explicit join acknowledges them. Resume without duplicate notices, and reclaim acknowledged handles before tools need admission.
 - **0.0.6**: count completed compaction usage; preserve UTF-8 diagnostics and failure causes under batch budgets; identify omitted launch context with `omittedFields`. Isolate execution snapshots from session state and tighten foreground progress and watchdog cleanup. Pi 1.0.4 remains supported.
 - **0.0.5**: require Pi 1.0.4; return structured codemode results, including failed child reports; allow explicit selection of parent-callable tools; preserve reasoning-token usage. Children load Pi's canonical CLI built-ins with exact nested tool allowlists. POSIX children wait for a ready parent-death watchdog before starting tasks. See the Pi 1.0.4 migration section below.
