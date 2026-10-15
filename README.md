@@ -8,7 +8,7 @@ Delegate a self-contained task to a fresh [Pi](https://github.com/earendil-works
 pi install npm:@nijaru/pi-subagents
 ```
 
-Requires a Node/npm installation of Pi 1.0.4 or newer with its SDK files, and Node 22.19+ available to launch children. CI checks both the Pi 1.0.4 floor and the pinned development version (currently 1.2.0). Host-provided peer dependencies use `*` per Pi's package contract, not as a guarantee that every Pi version works. Standalone Pi binaries are not supported. Restart Pi or use `/reload`. The package registers one tool, `subagent`.
+Requires a Node/npm installation of Pi 1.0.4 or newer with its SDK files, and Node 22.19+ available to launch children. CI checks both the Pi 1.0.4 floor and the pinned development version (currently 1.3.0). Host-provided peer dependencies use `*` per Pi's package contract, not as a guarantee that every Pi version works. Standalone Pi binaries are not supported. Restart Pi or use `/reload`. The package registers one tool, `subagent`.
 
 ## Usage
 
@@ -167,7 +167,7 @@ bun install --frozen-lockfile
 bun run check
 ```
 
-Pi loads the TypeScript extension directly; there is no build step. The child bootstrap uses the same installation's SDK and TypeScript loader. Checks use pinned Pi 1.2.0 packages; CI also runs the full check against Pi 1.0.4. They exercise real CLI/RPC parents, SDK children, packed artifacts, project trust, compaction usage, cancellation, and abrupt parent death with local mock providers. No live model calls are needed. The process-tree and death-watchdog tests are POSIX-only and skip on Windows.
+Pi loads the TypeScript extension directly; there is no build step. The child bootstrap uses the same installation's SDK and TypeScript loader. Checks use pinned Pi 1.3.0 packages; CI also runs the full check against Pi 1.0.4. They exercise real CLI/RPC parents, SDK children, packed artifacts, project trust, compaction usage, cancellation, and abrupt parent death with local mock providers. No live model calls are needed. The process-tree and death-watchdog tests are POSIX-only and skip on Windows.
 
 Pi 1.2.0 does not publicly export its project-trust resolver or CLI built-in extension registry. The bootstrap reuses the selected installation's internal implementations rather than duplicating discovery or trust policy. The pinned version and packed-artifact tests gate both dependencies.
 
