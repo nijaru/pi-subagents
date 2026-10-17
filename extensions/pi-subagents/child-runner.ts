@@ -2,9 +2,9 @@ import { createWriteStream } from "node:fs";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { Usage } from "@earendil-works/pi-ai";
 import { createChildSession, closeChildSession, type ChildSessionPolicy } from "./child-session.ts";
-import { addUsage, emptyUsage, isThinkingLevel } from "./types.ts";
+import { addUsage, emptyUsage, isThinkingLevel, textFromMessage } from "./types.ts";
 import { boundedDiagnostic, truncateOutput } from "./bounds.ts";
-import { MAX_TASK_BYTES } from "./limits.ts";
+import { MAX_OUTPUT_BYTES, MAX_TASK_BYTES } from "./limits.ts";
 import { assistantReport, CHILD_PROTOCOL_VERSION, emptyReport, type ChildBootstrap, type ChildEvent } from "./child-protocol.ts";
 
 /** SDK host for one leaf task. stdout/stderr remain extension diagnostics, never protocol. */
@@ -15,6 +15,21 @@ export async function runChild(policy: ChildSessionPolicy): Promise<void> {
   const send = async (event: ChildEvent) => {
     if (pipeError) throw pipeError;
     await new Promise<void>((resolve, reject) => pipe.write(JSON.stringify(event) + "\n", (error) => error ? reject(error) : resolve()));
+  };
+  let pendingOutput: (ChildEvent & { kind: "output" }) | undefined;
+  let finished = false;
+  const flushOutput = () => {
+    if (finished || !pendingOutput || pipe.writableLength >= 8192) return;
+    const event = pendingOutput;
+    pendingOutput = undefined;
+    pipe.write(JSON.stringify(event) + "\n");
+  };
+  pipe.on("drain", flushOutput);
+  const sendTerminal = async (event: ChildEvent) => {
+    finished = true;
+    pendingOutput = undefined;
+    pipe.off("drain", flushOutput);
+    await send(event);
   };
   let session: AgentSession | undefined;
   const abort = new AbortController();
@@ -53,6 +68,22 @@ export async function runChild(policy: ChildSessionPolicy): Promise<void> {
         if (message.role === "assistant") {
           usage.turns++;
           report = assistantReport(message);
+          // Persist the latest visible text before a terminal report exists. A
+          // deadline/cancel kills the process, so this is the only way an
+          // interrupted task's findings reach the parent.
+          const text = textFromMessage(message);
+          if (text) {
+            const output = truncateOutput(text, MAX_OUTPUT_BYTES);
+            pendingOutput = {
+              version: CHILD_PROTOCOL_VERSION, kind: "output",
+              report: { output, outputTruncation: {
+                truncated: output !== text,
+                originalBytes: Buffer.byteLength(text, "utf8"),
+                retainedBytes: Buffer.byteLength(output, "utf8"),
+              } },
+            };
+            flushOutput();
+          }
         }
         if (message.role === "assistant" || message.role === "toolResult") eventUsage = message.usage;
       } else if (event.type === "compaction_end") {
@@ -69,9 +100,9 @@ export async function runChild(policy: ChildSessionPolicy): Promise<void> {
     abort.signal.throwIfAborted();
     await session.prompt(request.prompt, { expandPromptTemplates: false, source: "extension" });
     await session.waitForIdle();
-    await send({ version: CHILD_PROTOCOL_VERSION, kind: "result", report, usage });
+    await sendTerminal({ version: CHILD_PROTOCOL_VERSION, kind: "result", report, usage });
   } catch (error) {
-    await send({ version: CHILD_PROTOCOL_VERSION, kind: "error", errorMessage: boundedDiagnostic(error instanceof Error ? error.message : String(error)) ?? "Child failed." });
+    await sendTerminal({ version: CHILD_PROTOCOL_VERSION, kind: "error", errorMessage: boundedDiagnostic(error instanceof Error ? error.message : String(error)) ?? "Child failed." });
     process.exitCode = 1;
   } finally {
     try {

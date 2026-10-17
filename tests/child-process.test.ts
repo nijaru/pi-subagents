@@ -204,6 +204,15 @@ test("auth-shaped protocol errors carry the credential hint", async () => {
   });
 });
 
+test("a deadline keeps the last streamed output as partial output", async () => {
+  await fixture(`send({kind:"output",report:{output:"early findings",outputTruncation:{truncated:false,originalBytes:14,retainedBytes:14}}}); setInterval(()=>{},1000);`, async (task, supervisor) => {
+    const outcome = await supervisor.run({ task: { ...task, executionTimeoutMs: 250 }, signal: new AbortController().signal });
+    expect(outcome.outcome).toBe("timed_out");
+    expect(outcome.output).toBe("early findings");
+    expect(outcome.outputTruncation).toEqual({ truncated: false, originalBytes: 14, retainedBytes: 14 });
+  });
+});
+
 test("process cancellation outranks earlier protocol error", async () => {
   await fixture(failure, async (task, supervisor) => {
     const controller = new AbortController();

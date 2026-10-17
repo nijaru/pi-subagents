@@ -23,6 +23,8 @@ export type ChildEvent =
   | { version: typeof CHILD_PROTOCOL_VERSION; kind: "ready"; model: string; thinking: ModelThinkingLevel; tools: string[] }
   | { version: typeof CHILD_PROTOCOL_VERSION; kind: "usage"; usage: UsageSummary }
   | { version: typeof CHILD_PROTOCOL_VERSION; kind: "progress"; text: string }
+  /** Latest visible assistant text, kept for a deadline/cancel before a final report. */
+  | { version: typeof CHILD_PROTOCOL_VERSION; kind: "output"; report: Pick<ChildReport, "output" | "outputTruncation"> }
   | { version: typeof CHILD_PROTOCOL_VERSION; kind: "result"; report: ChildReport; usage: UsageSummary }
   | { version: typeof CHILD_PROTOCOL_VERSION; kind: "error"; errorMessage: string };
 
@@ -52,6 +54,14 @@ export function parseChildEvent(line: string): ChildEvent {
   if (event.kind === "progress" && typeof event.text === "string") return event;
   if (event.kind === "error" && typeof event.errorMessage === "string") return event;
   if (event.kind === "usage" && usageValid(event.usage)) return event;
+  if (event.kind === "output") {
+    const report = event.report;
+    const truncation = report?.outputTruncation;
+    if (typeof report?.output === "string" && Buffer.byteLength(report.output) <= MAX_OUTPUT_BYTES
+      && isOutputTruncation(truncation)
+      && truncation.retainedBytes === Buffer.byteLength(report.output)) return event;
+    throw new Error("Malformed child protocol frame.");
+  }
   if (event.kind === "result" && usageValid(event.usage)) {
     const report = event.report;
     const truncation = report?.outputTruncation;

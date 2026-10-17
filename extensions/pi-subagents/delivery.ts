@@ -19,6 +19,22 @@ function completionIds(details: unknown): string[] {
   return Array.isArray(results) ? results.flatMap((result) => typeof result?.id === "string" ? [result.id] : []) : [];
 }
 
+/** Child ids the response's own tool calls still need before admission runs. */
+function referencedChildIds(message: MessageEndEvent["message"]): Set<string> {
+  const ids = new Set<string>();
+  const content = (message as { content?: unknown }).content;
+  if (!Array.isArray(content)) return ids;
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue;
+    const block = part as { type?: unknown; name?: unknown; arguments?: unknown };
+    if (block.type !== "toolCall" || block.name !== "subagent" || !block.arguments || typeof block.arguments !== "object") continue;
+    const args = block.arguments as { id?: unknown; ids?: unknown };
+    if (typeof args.id === "string") ids.add(args.id);
+    if (Array.isArray(args.ids)) for (const id of args.ids) if (typeof id === "string") ids.add(id);
+  }
+  return ids;
+}
+
 /** Host turn policy only. SessionChildren owns whether a result is still unread. */
 export class CompletionDelivery {
   private ctx?: ExtensionContext;
@@ -77,7 +93,10 @@ export class CompletionDelivery {
       if (!entry.messages.some((message) => message.role === "custom" && message.content === source.content)) continue;
       for (const id of completionIds(source.details)) ids.add(id);
     }
-    this.children.acknowledgeCompletions(ids);
+    // A response's tools have not run yet. Do not evict a handle that its own
+    // wait/status/stop call still references; the next response acknowledges it.
+    const protectedIds = referencedChildIds(event.message);
+    this.children.acknowledgeCompletions(new Set([...ids].filter((id) => !protectedIds.has(id))));
     this.refreshStatus();
   }
 

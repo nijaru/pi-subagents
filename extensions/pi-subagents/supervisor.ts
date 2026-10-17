@@ -84,6 +84,12 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
               publish();
             }
             if (event.kind === "progress") publish(event.text);
+            if (event.kind === "output") {
+              // Terminal reports overwrite this; otherwise it is the partial
+              // output retained by a deadline or cancellation.
+              data.output = event.report.output;
+              data.outputTruncation = event.report.outputTruncation;
+            }
             if (event.kind === "result") {
               terminal = event.report;
               data.usage = event.usage;

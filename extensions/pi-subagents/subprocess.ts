@@ -131,6 +131,9 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
     const settleNow = (result: ProcessResult) => {
       if (settled) return;
       settled = true;
+      // Force settlement can bypass finish(); never leave the watchdog pipe open
+      // for the rest of the parent session.
+      watchdog?.stdin?.end();
       if (killTimer) clearTimeout(killTimer);
       if (processTimer) clearTimeout(processTimer);
       if (forceTimer) clearTimeout(forceTimer);
@@ -269,7 +272,7 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
           stopTree();
         }
       });
-      if (finishing || aborted || timedOut || processFailure) watchdog?.stdin?.end();
+      if (settled || finishing || aborted || timedOut || processFailure) watchdog?.stdin?.end();
       else child.stdin?.end(JSON.stringify(bootstrap));
     }).catch((error) => {
       processFailure = `Subagent watchdog failed: ${error instanceof Error ? error.message : String(error)}`;

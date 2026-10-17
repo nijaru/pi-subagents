@@ -33,7 +33,7 @@ function controlled() {
   delivery = new CompletionDelivery(children);
   delivery.bind(ctx);
   const start = () => children.start({ prompt: "inspect", tools: [], cwd: process.cwd() });
-  const responded = (stopReason = "stop") => delivery.responded({ type: "message_end", message: { role: "assistant", stopReason } } as any, ctx);
+  const responded = (stopReason = "stop", content?: unknown[]) => delivery.responded({ type: "message_end", message: { role: "assistant", stopReason, ...(content ? { content } : {}) } } as any, ctx);
   const boundary = (outcome = "completed", drafts: any[] = []) => {
     responded(outcome === "completed" ? "stop" : outcome);
     const messageEntryId = `entry-${++nextEntry}`;
@@ -238,6 +238,24 @@ describe("parent completion delivery", () => {
     c.responded("toolUse");
     expect(c.start()).toBeDefined();
     expect(c.boundary()).toBeUndefined();
+    await c.close();
+  });
+
+  test("a response cannot evict a child its own tools still reference", async () => {
+    const c = controlled();
+    const runs: ReturnType<typeof c.start>[] = [];
+    for (let i = 0; i < MAX_RETAINED_RUNS; i++) {
+      const run = c.start();
+      runs.push(run);
+      c.gates[i]!.resolve();
+      await run.promise;
+    }
+    c.commit(c.boundary());
+    const protectedId = runs[0]!.result.id;
+    c.responded("toolUse", [{ type: "toolCall", id: "call", name: "subagent", arguments: { command: "wait", ids: [protectedId] } }]);
+    expect(c.children.get(protectedId).delivery).toBe("published");
+    expect(c.start()).toBeDefined();
+    expect(c.children.get(protectedId).result.id).toBe(protectedId);
     await c.close();
   });
 
