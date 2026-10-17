@@ -72,12 +72,11 @@ export function childStatus(result: ChildResult): string {
 }
 
 export function childSummary(result: ChildResult, includePrompt = true): string {
-  const status = result.state.status === "running" ? "running" : result.state.outcome;
+  const status = result.state.status === "running" ? (result.phase ?? "running") : result.state.outcome;
   const duration = runtimeLabel(result);
   const model = result.model ? `\nmodel: ${truncateOutput(result.model, 512)}${result.thinking ? ` · thinking: ${result.thinking}` : ""}` : "";
   const handle = result.handle ?? result.id;
-  const phase = result.state.status === "running" && result.phase ? ` · ${result.phase}` : "";
-  const head = `${handle} [${status}${phase}]${duration ? ` · ${duration}` : ""}${model}`;
+  const head = `${handle} [${status}]${duration ? ` · ${duration}` : ""}${model}`;
   return includePrompt ? `${head}\n${truncateOutput(result.prompt, 256)}` : head;
 }
 

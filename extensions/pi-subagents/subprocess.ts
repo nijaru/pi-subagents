@@ -114,6 +114,7 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
     let terminalSeen = false;
     let processFailure: string | undefined;
     let finishedAt: number | undefined;
+    let executionStartedAt: number | undefined;
     let lastResult: ProcessResult | undefined;
     let watchdog: ChildProcess | undefined;
     let watchdogSetup: Promise<void> | undefined;
@@ -128,7 +129,14 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
     // Cancellation and deadline remain authoritative even after a completed
     // report; cleanup must never turn a finished task into a timeout.
     const termination = (): Partial<ProcessResult> => timedOut
-      ? { outcome: "timed_out", exitCode: 1, stopReason: "error", errorMessage: timeoutSummary((finishedAt ?? Date.now()) - startedAt, deadlineMs, timeoutPhase), timeoutPhase }
+      ? {
+          outcome: "timed_out", exitCode: 1, stopReason: "error", timeoutPhase,
+          errorMessage: timeoutSummary(
+            (finishedAt ?? Date.now()) - (timeoutPhase === "execution" && executionStartedAt !== undefined ? executionStartedAt : startedAt),
+            deadlineMs,
+            timeoutPhase,
+          ),
+        }
       : aborted || signal?.aborted
         ? { outcome: "cancelled", exitCode: 1, stopReason: "aborted", errorMessage: "Subagent aborted." }
         : processFailure
@@ -287,6 +295,7 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
         if (event.kind === "ready" && processTimer === undefined && !timedOut && !aborted && !finishing) {
           if (startupTimer) clearTimeout(startupTimer);
           startupTimer = undefined;
+          executionStartedAt = Date.now();
           processTimer = setTimeout(() => stopForTimeout("execution"), timeoutMs);
           processTimer.unref?.();
         }

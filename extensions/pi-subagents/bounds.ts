@@ -121,6 +121,7 @@ export function minimalChildResult(result: ChildResult): ChildResult {
     ...(result.handle === undefined ? {} : { handle: result.handle }),
     ...(result.phase === undefined ? {} : { phase: result.phase }),
     ...(result.errorKind === undefined ? {} : { errorKind: result.errorKind }),
+    ...(result.timeoutPhase === undefined ? {} : { timeoutPhase: result.timeoutPhase }),
     ...(result.notify === undefined ? {} : { notify: result.notify }),
     prompt: "",
     cwd: "",

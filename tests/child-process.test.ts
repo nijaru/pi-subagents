@@ -205,6 +205,21 @@ test("auth-shaped protocol errors carry the credential hint", async () => {
   });
 });
 
+test("execution timeout elapsed excludes startup time", async () => {
+  await fixture(`await new Promise(resolve => setTimeout(resolve, 250));
+    send({kind:'ready',model:request.model,thinking:'off',tools:request.tools});
+    await new Promise(resolve => setTimeout(resolve, 500));`, async (task, supervisor) => {
+    const outcome = await supervisor.run({
+      task: { ...task, startupTimeoutMs: 1000, executionTimeoutMs: 100 },
+      signal: new AbortController().signal,
+    });
+    expect(outcome.outcome).toBe("timed_out");
+    expect(outcome.timeoutPhase).toBe("execution");
+    const elapsed = Number(/Elapsed (\d+)ms/.exec(outcome.errorMessage ?? "")?.[1]);
+    expect(elapsed).toBeLessThan(250);
+  }, { ready: false });
+}, 20000);
+
 test("a cancellation that races a deadline stays cancelled", async () => {
   await fixture(`process.on('SIGTERM',()=>{}); setInterval(()=>{},1000);`, async (task, supervisor) => {
     const controller = new AbortController();

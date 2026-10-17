@@ -122,7 +122,9 @@ function childHeading(child: ChildResult, theme: Theme, options: { expanded: boo
   const { expanded, showId, notification, command } = options;
   const active = child.state.status === "running";
   const outcome = child.state.status === "terminal" ? child.state.outcome : undefined;
-  const status = active ? `${command === "spawn" ? "started" : "running"}${child.phase ? ` · ${child.phase}` : ""}` : outcome!.replaceAll("_", " ");
+  const status = active
+    ? child.phase === "starting" ? "starting" : command === "spawn" ? "started" : "running"
+    : outcome!.replaceAll("_", " ");
   const color = active ? "muted" : outcome === "cancelled" || outcome === "incomplete" ? "warning" : failed(child) ? "error" : "success";
   const icon = active ? "○" : outcome === "cancelled" ? "−" : outcome === "incomplete" ? "!" : failed(child) ? "✗" : "✓";
   const id = showId ? `${theme.fg("accent", displayId(child.handle ?? child.id, expanded))} ` : "";

@@ -17,6 +17,20 @@ function child(id = "child-1"): ChildResult {
 }
 
 describe("serialized result bounds", () => {
+  test("timeoutPhase survives minimal and bounded results", () => {
+    const timedOut = {
+      ...child(),
+      state: { status: "terminal", outcome: "timed_out", exitCode: 1, finishedAt: 2 } as const,
+      errorKind: "deadline" as const,
+      timeoutPhase: "startup" as const,
+      errorMessage: "Subagent timed out during startup.",
+    };
+    expect(minimalChildResult(timedOut).timeoutPhase).toBe("startup");
+    const bounded = boundDetails({ command: "status", results: [timedOut] });
+    expect(bounded.results[0]!.timeoutPhase).toBe("startup");
+    expect(Check(SubagentDetailsSchema, bounded)).toBe(true);
+  });
+
   test("32 escaped diagnostics retain every identity within the default budget", () => {
     const results = Array.from({ length: 32 }, (_, i) => child(`child-${i}`));
     const original = JSON.stringify(results);

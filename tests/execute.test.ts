@@ -12,6 +12,8 @@ interface Host {
   tool: any;
   cwd: string;
   notices: any[];
+  commands: Map<string, any>;
+  notifications: string[];
   execute(params: any, signal?: AbortSignal, update?: (value: any) => void): Promise<any>;
   toolResult(event?: any): any;
   boundary(): void;
@@ -28,19 +30,22 @@ function tempDir(): string {
 function host(active = ["read", "bash", "edit", "write", "web_search", "web_fetch", "web_research", "query-docs"]): Host {
   let tool: any;
   const events = new Map<string, (...args: any[]) => any>();
+  const commands = new Map<string, any>();
   const notices: any[] = [];
+  const notifications: string[] = [];
   extension({
     registerTool(value: any) { tool = value; },
     registerMessageRenderer() {},
+    registerCommand(name: string, command: any) { commands.set(name, command); },
     on(name: string, fn: (...args: any[]) => any) { events.set(name, fn); },
     getActiveTools() { return active; },
   } as any);
   const cwd = tempDir();
   const entries: any[] = [];
   const context = { cwd, hasUI: false, tools: active.map((name) => ({ name })), model: { provider: "parent", id: "model" }, thinkingLevel: "high",
-    sessionManager: { getBranch: () => entries } };
+    sessionManager: { getBranch: () => entries }, ui: { notify: (message: string) => notifications.push(message) } };
   const instance = {
-    tool, cwd, notices,
+    tool, cwd, notices, commands, notifications,
     execute: (params: any, signal?: AbortSignal, update?: (value: any) => void) => tool.execute("test-call", params, signal, update, context),
     toolResult: (event = { toolName: "subagent" }) => events.get("tool_result")!(event),
     boundary: () => {
@@ -236,6 +241,16 @@ describe("background lifecycle", () => {
     expect(first(await h.execute({ command: "status", id: handle })).handle).toBe(handle);
     expect(first(await h.execute({ command: "wait", ids: [handle] })).output).toBe("handle report");
     expect(first(await h.execute({ command: "stop", id: handle })).state).toMatchObject({ status: "terminal", outcome: "completed" });
+  });
+  test("/subagents lists retained handles and unread state", async () => {
+    const h = host();
+    fakePi('await delay(50); final("listed");');
+    const handle = first(await h.execute({ command: "spawn", prompt: "inspect", tools: [] })).handle;
+    await Bun.sleep(300);
+    await h.commands.get("subagents").handler("", { ui: { notify: (message: string) => h.notifications.push(message) } });
+    const text = h.notifications.at(-1)!;
+    expect(text).toContain("1 retained · 1 unread");
+    expect(text).toContain(handle);
   });
   test("a delivering wait claims the result and suppresses the notice", async () => {
     const h = host();

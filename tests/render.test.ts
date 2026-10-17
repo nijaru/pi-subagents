@@ -58,6 +58,12 @@ describe("compact child rendering", () => {
       "subagent run", "✓ 900c096e completed · 8s",
     ]);
   });
+  test("a running row shows its phase once", () => {
+    const running = { ...child, state: { status: "running" } as const, phase: "running" as const, startedAt: undefined };
+    expect(lines("run", { command: "run", prompt: child.prompt }, false, [running])).toEqual([
+      "subagent run", "○ 900c096e running · Read the package version.",
+    ]);
+  });
   test("targeted status and wait show the ID only in the call header", () => {
     expect(lines("status", { command: "status", id: child.id })).toEqual([
       "subagent status 900c096e", "✓ completed · 8s · Read the package version.",
