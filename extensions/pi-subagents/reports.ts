@@ -28,6 +28,13 @@ export function timeoutSummary(elapsedMs: number, deadlineMs: number): string {
   return `Subagent timed out. Elapsed ${formatElapsed(elapsedMs)}; execution deadline ${formatElapsed(deadlineMs)}.`;
 }
 
+const AUTH_HINT = "Hint: Child env passes model refs and *_API_KEY/*_TOKEN credentials automatically. For non-credential variables, set PI_SUBAGENT_PASSTHROUGH_ENV with an exact name or glob and restart Pi. Auth in ~/.pi/agent/auth.json via /login needs no passthrough.";
+
+/** Attach the child-credential hint to every auth-shaped failure. */
+export function withCredentialHint(message: string): string {
+  return /No API key|No models match pattern|API key.*not found/i.test(message) ? `${message}\n\n${AUTH_HINT}` : message;
+}
+
 /** The built-in timeout cause; anything else is a real diagnostic worth showing. */
 export function isTimeoutSummary(message: string | undefined): boolean {
   return message !== undefined && message.startsWith("Subagent timed out.");
@@ -42,7 +49,26 @@ export function runtimeLabel(result: ChildResult): string {
 export function resultText(result: ChildResult): string {
   if (!failed(result)) return result.output || "(no output)";
   const cause = result.errorMessage || result.stderr || result.stdout || "Child did not complete.";
-  return result.output ? `${cause}\n\nPartial report:\n${result.output}` : cause;
+  // A generic wrapper cause must not hide the child's own diagnostic.
+  const detail = /no terminal assistant output|did not complete/i.test(cause) && result.stderr.trim()
+    ? `${cause}\n\n${truncateOutput(result.stderr, 2_048)}`
+    : cause;
+  return result.output ? `${detail}\n\nPartial report:\n${result.output}` : detail;
+}
+
+/**
+ * Status text for one inspected child. Unlike `wait`, status is read-only, so a
+ * terminal failure must carry its cause (and a bounded partial report) here.
+ */
+export function childStatus(result: ChildResult): string {
+  const head = childSummary(result, false);
+  if (result.state.status !== "terminal" || !failed(result)) return head;
+  const cause = result.errorMessage || result.stderr || result.stdout;
+  const lines = [head];
+  if (cause) lines.push(`cause: ${truncateOutput(cause, 500)}`);
+  const preview = result.output?.trim() ?? "";
+  if (preview) lines.push(`partial output: ${truncateOutput(preview, 400)}`);
+  return lines.join("\n");
 }
 
 export function childSummary(result: ChildResult, includePrompt = true): string {

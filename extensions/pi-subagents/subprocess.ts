@@ -11,7 +11,7 @@ import { parseChildEvent, type ChildBootstrap, type ChildEvent } from "./child-p
 import { MAX_PROTOCOL_LINE_BYTES, MAX_STDERR_BYTES } from "./limits.ts";
 import type { AgentOutcome } from "./types.ts";
 import { appendDiagnostic, truncateHeadTail } from "./bounds.ts";
-import { timeoutSummary } from "./reports.ts";
+import { timeoutSummary, withCredentialHint } from "./reports.ts";
 import { spawnDeathWatchdog, sweepRootProcessGroup, terminateProcessTree } from "./process-tree.ts";
 import { childEnvironment } from "./env.ts";
 
@@ -59,6 +59,13 @@ export function getChildInvocation(): PiInvocation {
   return { command: fs.realpathSync.native(command), args: [runner, sdk] };
 }
 
+/** Bound the cleanup join so escaped descendants cannot prevent settlement. */
+const CLEANUP_SETTLE_MS = 6_000;
+/** Absolute settlement deadline after a timeout/abort stops the process tree. */
+const FORCE_SETTLE_MS = 7_000;
+/** A child that reported a terminal result still gets time to exit on its own. */
+const TERMINAL_EXIT_GRACE_MS = 5_000;
+
 export interface ProcessResult {
   exitCode: number;
   stopReason?: StopReason;
@@ -94,41 +101,86 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
     let trailing = "";
     let killTimer: ReturnType<typeof setTimeout> | undefined;
     let processTimer: ReturnType<typeof setTimeout> | undefined;
+    let forceTimer: ReturnType<typeof setTimeout> | undefined;
+    let terminalTimer: ReturnType<typeof setTimeout> | undefined;
     let timedOut = false;
+    let terminalSeen = false;
     let processFailure: string | undefined;
+    let finishedAt: number | undefined;
+    let lastResult: ProcessResult | undefined;
     let watchdog: ChildProcess | undefined;
     let watchdogSetup: Promise<void> | undefined;
     const decoder = new StringDecoder("utf8");
     let abortHandler: (() => void) | undefined;
 
+    const delay = (ms: number): Promise<void> => new Promise((resolveDelay) => {
+      const timer = setTimeout(resolveDelay, ms);
+      timer.unref?.();
+    });
+
+    // Cancellation and deadline remain authoritative even after a completed
+    // report; cleanup must never turn a finished task into a timeout.
+    const termination = (): Partial<ProcessResult> => timedOut
+      ? { outcome: "timed_out", exitCode: 1, stopReason: "error", errorMessage: timeoutSummary((finishedAt ?? Date.now()) - startedAt, timeoutMs) }
+      : aborted || signal?.aborted
+        ? { outcome: "cancelled", exitCode: 1, stopReason: "aborted", errorMessage: "Subagent aborted." }
+        : processFailure
+          ? { outcome: "failed", exitCode: 1, stopReason: "error", errorMessage: processFailure }
+          : {};
+
+    const settleNow = (result: ProcessResult) => {
+      if (settled) return;
+      settled = true;
+      if (killTimer) clearTimeout(killTimer);
+      if (processTimer) clearTimeout(processTimer);
+      if (forceTimer) clearTimeout(forceTimer);
+      if (terminalTimer) clearTimeout(terminalTimer);
+      if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
+      resolve({
+        ...result,
+        ...termination(),
+        stderr: truncateHeadTail(stderr, MAX_STDERR_BYTES),
+        stdout: truncateHeadTail(stdout, MAX_STDERR_BYTES),
+      });
+    };
+
     const finish = (result: ProcessResult) => {
       if (settled || finishing) return;
       finishing = true;
+      lastResult = result;
       // Release the death watchdog: the child is already exiting, and its pipe
       // must not stay open once this run is accounted for.
       watchdog?.stdin?.end();
       void (async () => {
         // A background run must not release mutation ownership while a
-        // descendant from its detached root group can still be alive.
-        await watchdogSetup;
-        watchdog?.stdin?.end();
-        if (rootSweepPromise) await rootSweepPromise;
+        // descendant from its detached root group can still be alive. Bound the
+        // join: a leader that handed its pipes to an escaped descendant may
+        // never emit `close`, which must not keep the run unsettled forever.
+        await Promise.race([
+          (async () => {
+            await watchdogSetup;
+            watchdog?.stdin?.end();
+            if (rootSweepPromise) await rootSweepPromise;
+          })(),
+          delay(CLEANUP_SETTLE_MS),
+        ]);
         // A leader can close before the escalation timer fires while a
         // descendant ignores SIGTERM and does not hold an inherited pipe open.
         // Force the retained tree snapshot before dropping the timer.
         if (aborted || timedOut || processFailure) terminateProcessTree(child, "SIGKILL");
-        settled = true;
-        if (killTimer) clearTimeout(killTimer);
-        if (processTimer) clearTimeout(processTimer);
-        if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
-        // Cancellation/deadline during the cleanup join is still authoritative.
-        const termination = timedOut
-          ? { outcome: "timed_out" as const, exitCode: 1, stopReason: "error" as const, errorMessage: timeoutSummary(Date.now() - startedAt, timeoutMs) }
-          : aborted || signal?.aborted
-            ? { outcome: "cancelled" as const, exitCode: 1, stopReason: "aborted" as const, errorMessage: "Subagent aborted." }
-            : processFailure ? { outcome: "failed" as const, exitCode: 1, stopReason: "error" as const, errorMessage: processFailure } : {};
-        resolve({ ...result, ...termination, stderr: truncateHeadTail(stderr, MAX_STDERR_BYTES), stdout: truncateHeadTail(stdout, MAX_STDERR_BYTES) });
+        settleNow(result);
       })();
+    };
+
+    const forceSettle = () => {
+      if (settled) return;
+      settleNow(lastResult ?? {
+        exitCode: terminalSeen ? 0 : 1,
+        stopReason: terminalSeen ? undefined : "error",
+        outcome: terminalSeen ? "completed" : "failed",
+        errorMessage: terminalSeen ? undefined : "Subagent process did not exit after termination.",
+        stderr,
+      });
     };
 
     let child: ChildProcess;
@@ -151,7 +203,12 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
       // `close` waits for stdio streams; a descendant can keep an inherited
       // pipe open after the leader exits. Sweep on `exit` first so that child
       // cannot defer cleanup until the hard timeout.
-      child.once("exit", sweepRoot);
+      child.once("exit", () => {
+        finishedAt ??= Date.now();
+        if (processTimer) clearTimeout(processTimer);
+        processTimer = undefined;
+        sweepRoot();
+      });
       child.once("close", sweepRoot);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -165,15 +222,34 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
       killTimer = setTimeout(() => {
         if (!settled) terminateProcessTree(child, "SIGKILL");
       }, 5000);
+      killTimer.unref?.();
+      // `close` waits for every inherited stdio pipe. A descendant that escaped
+      // the process group can keep one open forever, so settlement gets its own
+      // deadline independent of pipe EOF.
+      forceTimer = setTimeout(forceSettle, FORCE_SETTLE_MS);
+      forceTimer.unref?.();
     };
-    const stopForAbort = () => { if (!settled) { aborted = true; stopTree(); } };
-    const stopForTimeout = () => { if (!settled) { timedOut = true; stopTree(); } };
+    const stopForAbort = () => { if (!settled) { aborted = true; finishedAt ??= Date.now(); stopTree(); } };
+    const stopForTimeout = () => { if (!settled) { timedOut = true; finishedAt ??= Date.now(); stopTree(); } };
     processTimer = setTimeout(stopForTimeout, timeoutMs);
     const deliverLine = (line: string, oversized = false) => {
       if (settled || processFailure) return;
       try {
         if (oversized) throw new Error("Oversized child protocol frame.");
-        onEvent(parseChildEvent(line));
+        const event = parseChildEvent(line);
+        if (event.kind === "result" || event.kind === "error") {
+          terminalSeen = true;
+          if (terminalTimer === undefined) {
+            terminalTimer = setTimeout(() => {
+              if (!settled) {
+                terminateProcessTree(child, "SIGKILL");
+                forceSettle();
+              }
+            }, TERMINAL_EXIT_GRACE_MS);
+            terminalTimer.unref?.();
+          }
+        }
+        onEvent(event);
       } catch (error) {
         processFailure = `Subagent event handling failed: ${error instanceof Error ? error.message : String(error)}`;
         stopTree();
@@ -240,30 +316,29 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
     child.on("error", (error) => {
       finish({ exitCode: 1, stopReason: "error", outcome: "failed", errorMessage: processFailure ?? error.message, stderr });
     });
-    child.on("close", (code) => {
+    child.on("close", (code, signalName) => {
       const finalText = decoder.end();
       if (finalText) consumeProtocolText(finalText);
       if (trailing.trim() && Buffer.byteLength(trailing, "utf8") <= MAX_PROTOCOL_LINE_BYTES) {
         deliverLine(trailing);
       }
       if (processFailure) {
-        finish({ exitCode: 1, stopReason: "error", outcome: "failed", errorMessage: processFailure, stderr });
+        finish({ exitCode: 1, stopReason: "error", outcome: "failed", errorMessage: withCredentialHint(processFailure), stderr });
         return;
       }
       const exitCode = code ?? 1;
       let errorMessage: string | undefined;
-      if (exitCode !== 0) {
+      if (signalName !== null) {
+        errorMessage = `Subagent terminated by ${signalName}.`;
+      } else if (exitCode !== 0) {
         const cleanStderr = stderr.trim();
         if (cleanStderr) {
-          errorMessage = `Subagent exited with code ${exitCode}.\n${truncateHeadTail(cleanStderr, 2048)}`;
-          if (/No API key|No models match pattern|API key.*not found/i.test(cleanStderr)) {
-            errorMessage += `\n\nHint: Child env passes model refs and *_API_KEY/*_TOKEN credentials automatically. For non-credential variables, set PI_SUBAGENT_PASSTHROUGH_ENV with an exact name or glob and restart Pi. Auth in ~/.pi/agent/auth.json via /login needs no passthrough.`;
-          }
+          errorMessage = withCredentialHint(`Subagent exited with code ${exitCode}.\n${truncateHeadTail(cleanStderr, 2048)}`);
         } else {
           errorMessage = `Subagent exited with code ${exitCode}.`;
         }
       }
-      finish({ exitCode, stderr, stopReason: exitCode === 0 ? undefined : "error", outcome: exitCode === 0 ? "completed" : "failed", errorMessage });
+      finish({ exitCode, stderr, stopReason: exitCode === 0 && signalName === null ? undefined : "error", outcome: exitCode === 0 && signalName === null ? "completed" : "failed", errorMessage });
     });
 
     if (signal?.aborted) stopForAbort();

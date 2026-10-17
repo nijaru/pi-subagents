@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync, rmSync, readFileSync, symlinkSync, chmodSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { SubprocessChildSupervisor, type ChildTask } from "../extensions/pi-subagents/supervisor.ts";
 import { emptyUsage } from "../extensions/pi-subagents/types.ts";
@@ -159,6 +159,51 @@ test.skipIf(process.platform === "win32")("deadline expiry sweeps surviving desc
     finally { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } }
   });
 });
+test.skipIf(process.platform === "win32")("cleanup after a completed child cannot turn it into a timeout", async () => {
+  const report = { output: "done", stopReason: "stop", outputTruncation: { truncated: false, originalBytes: 4, retainedBytes: 4 } };
+  await fixture(`const child=spawn('sh',['-c','trap "" TERM; while :; do sleep 1; done'],{stdio:['ignore','inherit','inherit']});
+    writeFileSync('pid',String(child.pid)); child.unref();
+    send(${JSON.stringify({ kind: "result", report, usage: emptyUsage() })});`, async (task, supervisor) => {
+    const outcome = await supervisor.run({ task: { ...task, executionTimeoutMs: 300 }, signal: new AbortController().signal });
+    expect(outcome.outcome).toBe("completed");
+    expect(outcome.output).toBe("done");
+    const pid = Number(readFileSync(join(task.cwd, "pid"), "utf8"));
+    try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+  });
+}, 20000);
+
+const hasPython = (() => {
+  try { return spawnSync("python3", ["-c", "import os"], { stdio: "ignore" }).status === 0; } catch { return false; }
+})();
+test.skipIf(process.platform === "win32" || !hasPython)("a timeout settles even when an escaped descendant keeps stdio open", async () => {
+  await fixture(`spawn('python3',['-c',"import os,time; os.fork() and os._exit(0); os.setsid(); open('escaped-pid','w').write(str(os.getpid())); time.sleep(30)"],{stdio:['ignore','inherit','inherit']});
+    setInterval(()=>{},1000);`, async (task, supervisor) => {
+    const started = Date.now();
+    const outcome = await supervisor.run({ task: { ...task, executionTimeoutMs: 300 }, signal: new AbortController().signal });
+    expect(outcome.outcome).toBe("timed_out");
+    expect(Date.now() - started).toBeLessThan(10000);
+    const pid = Number(readFileSync(join(task.cwd, "escaped-pid"), "utf8"));
+    try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+  });
+}, 20000);
+
+test.skipIf(process.platform === "win32")("an externally signaled child reports the signal, not a fabricated exit code", async () => {
+  await fixture(`process.kill(process.pid,'SIGKILL');`, async (task, supervisor) => {
+    const outcome = await supervisor.run({ task, signal: new AbortController().signal });
+    expect(outcome.outcome).toBe("failed");
+    expect(outcome.errorMessage).toContain("SIGKILL");
+    expect(outcome.errorMessage).not.toContain("exited with code 1");
+  });
+});
+
+test("auth-shaped protocol errors carry the credential hint", async () => {
+  await fixture(`send({kind:'error',errorMessage:'No API key found for provider fixture. Run /login fixture.'});`, async (task, supervisor) => {
+    const outcome = await supervisor.run({ task, signal: new AbortController().signal });
+    expect(outcome.outcome).toBe("failed");
+    expect(outcome.errorMessage).toContain("PI_SUBAGENT_PASSTHROUGH_ENV");
+  });
+});
+
 test("process cancellation outranks earlier protocol error", async () => {
   await fixture(failure, async (task, supervisor) => {
     const controller = new AbortController();

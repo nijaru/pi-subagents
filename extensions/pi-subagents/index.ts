@@ -10,7 +10,7 @@ import { SubagentDetailsSchema } from "./result-schema.ts";
 import type { ChildResult, SubagentDetails } from "./types.ts";
 import { renderChildCall, renderChildResult, renderChildCompletion } from "./render.ts";
 import { CompletionDelivery } from "./delivery.ts";
-import { childSummary as summary, childReports } from "./reports.ts";
+import { childStatus as summary, childReports } from "./reports.ts";
 
 export { SubagentParamsSchema } from "./params.ts";
 export type { SubagentParams } from "./params.ts";

@@ -6,7 +6,7 @@ import {
 import { visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import extension from "../extensions/pi-subagents/index.ts";
 import { renderChildCall, renderChildResult, renderChildCompletion, stripTerminalControls } from "../extensions/pi-subagents/render.ts";
-import { timeoutSummary } from "../extensions/pi-subagents/reports.ts";
+import { childStatus, timeoutSummary } from "../extensions/pi-subagents/reports.ts";
 import { emptyUsage, type ChildResult, type SubagentDetails } from "../extensions/pi-subagents/types.ts";
 
 const theme = { fg: (_: string, text: string) => text, bg: (_: string, text: string) => text, bold: (text: string) => text } as Theme;
@@ -15,6 +15,19 @@ const child: ChildResult = {
   output: "pi-subagents 0.1.0", state: { status: "terminal", outcome: "completed", exitCode: 0, stopReason: "stop", finishedAt: 8000 }, startedAt: 0,
   stderr: "", usage: { ...emptyUsage(), turns: 2 }, model: "test/model",
 };
+test("status includes a terminal failure cause and bounded partial output", () => {
+  const failedChild: ChildResult = {
+    ...child,
+    output: "partial report",
+    state: { status: "terminal", outcome: "failed", exitCode: 1, stopReason: "error", finishedAt: 8000 },
+    errorMessage: "child failed for a concrete reason",
+  };
+  const text = childStatus(failedChild);
+  expect(text).toContain("cause: child failed for a concrete reason");
+  expect(text).toContain("partial output: partial report");
+  expect(childStatus(child)).not.toContain("cause:");
+});
+
 const result = (command: SubagentDetails["command"], children = [child]): AgentToolResult<SubagentDetails> => ({
   content: [{ type: "text", text: "fallback" }], details: { command, results: children },
 });

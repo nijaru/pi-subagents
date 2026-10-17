@@ -2,6 +2,7 @@ import type { AgentOutcome, ChildResult } from "./types.ts";
 import type { ModelThinkingLevel, StopReason } from "@earendil-works/pi-ai";
 import { RUNNING_PROGRESS_TEXT, processTimeoutMs } from "./limits.ts";
 import { boundedDiagnostic } from "./bounds.ts";
+import { withCredentialHint } from "./reports.ts";
 import { copyUsage, emptyUsage } from "./types.ts";
 import { runPiProcess, type ProcessResult } from "./subprocess.ts";
 import { CHILD_PROTOCOL_VERSION, type ChildReport } from "./child-protocol.ts";
@@ -116,7 +117,7 @@ export function classifyExecution(process: ProcessResult, report?: ChildReport, 
   };
   if (protocolFailure !== undefined || process.outcome !== "completed") return {
     outcome: "failed", exitCode: process.exitCode || 1, stopReason: "error",
-    errorMessage: boundedDiagnostic(protocolFailure ?? process.errorMessage) || "Child failed.",
+    errorMessage: withCredentialHint(boundedDiagnostic(protocolFailure ?? process.errorMessage) || "Child failed."),
   };
   if (report?.stopReason === "length") return {
     outcome: "incomplete", exitCode: 0, stopReason: "length", errorMessage: "Child reached the model output limit; response is incomplete.",
