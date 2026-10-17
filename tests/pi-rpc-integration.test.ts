@@ -91,6 +91,7 @@ export default (pi: any) => pi.registerCommand("capture", { handler: async () =>
     expect(fs.existsSync(path.join(dir, "command-ran"))).toBe(false);
     expect(JSON.stringify(childRequests[0].messages)).toContain("/capture CHILD_SENTINEL");
     expect(JSON.stringify(childRequests[0].messages)).not.toContain("subagent-probe");
+    expect(JSON.stringify(childRequests[0].messages)).not.toContain('"token"');
   } finally {
     proc?.kill();
     server.stop(true);

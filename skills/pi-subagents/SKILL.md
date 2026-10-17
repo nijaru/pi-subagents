@@ -31,7 +31,7 @@ The prompt must carry the relevant evidence, decisions, scope, constraints, expe
 
 ## Persist and resume
 
-`persist: true` stores the child Pi session under the agent directory (`~/.pi/agent/subagents/sessions/<id>.jsonl` by default) and returns `sessionFile`; the path is included in `run`, `spawn`, `wait`, and `status` text. Reuse it later with `run` or `spawn` and `resume: "<path>"` to continue that conversation instead of starting fresh; do not resume a session while another child is using it. `persist` and `resume` are mutually exclusive. Persisted sessions are not the same as retained handles; `/subagents clear` only drops in-memory handles.
+`persist: true` stores the child Pi session under the agent directory (`~/.pi/agent/subagents/sessions/<id>.jsonl` by default) and returns `sessionFile`; the path is included in `run`, `spawn`, `wait`, and `status` text. Reuse it later with `run` or `spawn` and `resume: "<path>"` to continue that conversation instead of starting fresh; resume in the original `cwd`, and do not resume a session while another child is using it. `persist` and `resume` are mutually exclusive. Persisted sessions are not the same as retained handles; `/subagents clear` only drops in-memory handles.
 
 RPC mode cannot show Pi's project-trust prompt. Project-local resources are skipped unless a saved decision applies or the call sets `trustProject: true`, which passes `--approve` for that child. Parent trust and permission-hook state are not inherited.
 

@@ -144,16 +144,42 @@ interface Invocation {
   probe: boolean;
 }
 
+/** Read only the session header so a resume cannot silently change workspaces. */
+function sessionCwd(sessionFile: string): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(sessionFile, "r");
+    const buffer = Buffer.alloc(64 * 1024);
+    const length = fs.readSync(fd, buffer, 0, buffer.length, 0);
+    const line = buffer.toString("utf8", 0, length).split("\n", 1)[0] ?? "";
+    const header = JSON.parse(line) as { type?: unknown; cwd?: unknown };
+    return header.type === "session" && typeof header.cwd === "string" ? header.cwd : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch { /* best effort */ }
+  }
+}
+
+function canonicalDir(directory: string): string {
+  try { return fs.realpathSync.native(directory); } catch { return path.resolve(directory); }
+}
+
 export function getRpcInvocation(task: ChildTask): Invocation {
   const cli = getCliPath();
   const command = getNodeRuntime();
   const args = [cli, "--mode", "rpc"];
-  const useProbe = !process.env.PI_SUBAGENT_CLI;
+  const useProbe = !process.env.PI_SUBAGENT_CLI || process.env.PI_SUBAGENT_FORCE_PROBE === "1";
   if (useProbe) args.push("--extension", fileURLToPath(new URL("./probe-extension.ts", import.meta.url)));
   let sessionFile: string | undefined;
   if (task.resume !== undefined) {
     sessionFile = path.resolve(task.resume);
     if (!fs.existsSync(sessionFile)) throw new Error(`Child session to resume does not exist: ${sessionFile}`);
+    const savedCwd = sessionCwd(sessionFile);
+    if (!savedCwd) throw new Error(`Cannot verify the workspace of session ${sessionFile}.`);
+    if (canonicalDir(savedCwd) !== canonicalDir(task.cwd)) {
+      throw new Error(`Session workspace ${savedCwd} does not match requested cwd ${task.cwd}; resume in its original directory or start a new session.`);
+    }
     args.push("--session", sessionFile);
   } else if (task.persist) {
     sessionFile = sessionPathFor(task.id);
@@ -461,6 +487,12 @@ export class RpcChildSupervisor implements ChildSupervisor {
             await onceExit(child, 1_000);
           }
         }
+        if (!orderly) {
+          // The leader can exit after SIGTERM while a descendant that ignored
+          // it remains in a different process group. Re-apply SIGKILL to the
+          // descendant snapshot captured by terminateProcessTree().
+          terminateProcessTree(child, "SIGKILL");
+        }
         // A completed leader can leave shell descendants in its detached group.
         // Sweep them before releasing the admission slot; the sweep has its own
         // bounded SIGTERM/SIGKILL escalation. The watchdog remains armed until
@@ -547,17 +579,14 @@ export class RpcChildSupervisor implements ChildSupervisor {
           }
           return;
         }
-        if (event.type === "message_end" && event.message?.role === "custom" && event.message.customType === PROBE_CUSTOM_TYPE) {
-          let report: ProbeReport | undefined;
-          try {
-            const parsed = typeof event.message.content === "string" ? JSON.parse(event.message.content) : undefined;
-            if (parsed && typeof parsed === "object" && parsed.token === probeToken
-              && Array.isArray(parsed.tools) && Array.isArray(parsed.requested)) {
-              report = parsed as ProbeReport;
-            }
-          } catch { /* malformed probe report */ }
-          if (report) resolveProbe(report);
-          else resolveProbe({ token: probeToken, tools: [], requested: [...task.tools], error: "Child probe returned malformed readiness." });
+        if (event.type === "entry_appended" && event.entry?.type === "custom" && event.entry.customType === PROBE_CUSTOM_TYPE) {
+          const parsed = event.entry.data;
+          if (parsed && typeof parsed === "object" && parsed.token === probeToken
+            && Array.isArray(parsed.tools) && Array.isArray(parsed.requested)) {
+            resolveProbe(parsed as ProbeReport);
+          } else {
+            resolveProbe({ token: probeToken, tools: [], requested: [...task.tools], error: "Child probe returned malformed readiness." });
+          }
           return;
         }
         if (event.type === "message_end") {
@@ -762,6 +791,14 @@ export class RpcChildSupervisor implements ChildSupervisor {
             }), remaining);
             probeTimer.unref?.();
             try {
+              // Preflight the command before sending it. An unknown slash prompt
+              // starts a model turn in RPC; a failed probe extension must not do
+              // that as a side effect.
+              const commandsResponse = await send({ type: "get_commands" }, remaining);
+              const commands = commandsResponse.success ? commandsResponse.data?.commands : undefined;
+              if (!Array.isArray(commands) || !commands.some((command) => command?.name === PROBE_COMMAND && command?.source === "extension")) {
+                throw new Error("Child probe extension is unavailable.");
+              }
               const probeResponse = await send({ type: "prompt", message: `/${PROBE_COMMAND}` }, remaining);
               if (!probeResponse.success) throw new Error(probeResponse.error || "Child probe command failed.");
               if (probeResponse.data?.disposition !== "handled") throw new Error("Child probe command was not handled.");

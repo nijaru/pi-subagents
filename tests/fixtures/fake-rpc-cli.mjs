@@ -65,6 +65,11 @@ function emitTask() {
     settle();
     return;
   }
+  if (scenario === "detached-descendant") {
+    const detached = spawn("sh", ["-c", "trap '' TERM; while :; do sleep 1; done"], { detached: true, stdio: "ignore" });
+    fs.writeFileSync("detached.pid", String(detached.pid));
+    return;
+  }
   if (scenario === "slow") {
     send({ type: "message_start", message: { role: "assistant", content: [] } });
     send({ type: "message_update", usage, assistantMessageEvent: { type: "text_delta", delta: "partial" } });
@@ -92,6 +97,11 @@ const input = readline.createInterface({ input: process.stdin, crlfDelay: Infini
 input.on("line", (line) => {
   let command;
   try { command = JSON.parse(line); } catch { return; }
+  if (command.type === "get_commands") {
+    const noProbe = args.includes("--name") && args[args.indexOf("--name") + 1] === "no-probe";
+    send({ id: command.id, type: "response", command: "get_commands", success: true, data: { commands: noProbe ? [] : [{ name: "__pi_subagent_ready", description: "probe", source: "extension" }] } });
+    return;
+  }
   if (command.type === "get_state") {
     if (startupScenario) return;
     send({ id: command.id, type: "response", command: "get_state", success: true, data: {
@@ -106,8 +116,7 @@ input.on("line", (line) => {
       let requested = [];
       try { requested = JSON.parse(process.env.PI_SUBAGENT_PROBE_TOOLS ?? "[]"); } catch { /* invalid */ }
       const payload = { token: process.env.PI_SUBAGENT_PROBE_TOKEN ?? "", tools: requested, requested };
-      send({ type: "message_start", message: { role: "custom", customType: "subagent-probe", content: JSON.stringify(payload), display: false } });
-      send({ type: "message_end", message: { role: "custom", customType: "subagent-probe", content: JSON.stringify(payload), display: false } });
+      send({ type: "entry_appended", entry: { type: "custom", customType: "subagent-probe", data: payload, id: "probe-entry", parentId: null, timestamp: new Date().toISOString() } });
       send({ id: command.id, type: "response", command: "prompt", success: true, data: { disposition: "handled" } });
       return;
     }

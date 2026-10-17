@@ -137,6 +137,7 @@ test("persisted child session can be resumed", async () => {
     expect(requests).toHaveLength(2);
     expect(JSON.stringify(requests[1].messages)).toContain("FIRST_MARKER");
     expect(JSON.stringify(requests[1].messages)).toContain("SECOND_MARKER");
+    expect(JSON.stringify(requests[1].messages)).not.toContain("subagent-probe");
   } finally {
     server.stop(true);
     Object.assign(process.env, saved);
@@ -334,5 +335,100 @@ export default (pi: any) => {
     Object.assign(process.env, saved);
     for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("probe deadline starts when readiness is requested, not during slow startup", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rpc-slow-start-"));
+  const server = Bun.serve({
+    hostname: "127.0.0.1", port: 0,
+    async fetch() {
+      const chunk = (part: any, finish_reason: string | null) => `data: ${JSON.stringify({
+        id: "completion", object: "chat.completion.chunk", created: 0, model: "model",
+        choices: [{ index: 0, delta: part, finish_reason }],
+        usage: finish_reason ? { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 } : undefined,
+      })}\n\n`;
+      return new Response(chunk({ role: "assistant", content: "OK" }, null) + chunk({}, "stop") + "data: [DONE]\n\n", {
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    },
+  });
+  const saved = { ...process.env };
+  try {
+    fs.writeFileSync(path.join(dir, "models.json"), JSON.stringify({ providers: { fixture: {
+      baseUrl: `http://127.0.0.1:${server.port}/v1`, api: "openai-completions", apiKey: "test-only",
+      models: [{ id: "model", contextWindow: 128000, maxTokens: 1024 }],
+    } } }));
+    fs.writeFileSync(path.join(dir, "slow.ts"), `import { setTimeout as delay } from "node:timers/promises";
+export default (pi: any) => {
+  pi.on("session_start", async () => {
+    await delay(3300);
+    setTimeout(() => pi.registerTool({ name: "slow_tool", label: "slow", description: "late", parameters: { type: "object", properties: {}, additionalProperties: false }, execute: async () => ({ content: [{ type: "text", text: "late" }] }) }), 200);
+  });
+}`);
+    fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ extensions: [path.join(dir, "slow.ts")] }));
+    process.env.PI_CODING_AGENT_DIR = dir;
+    process.env.PI_OFFLINE = "1";
+    process.env.PI_SKIP_VERSION_CHECK = "1";
+    delete process.env.PI_SUBAGENT_CLI;
+    const result = await new RpcChildSupervisor().run({
+      task: { id: "slow-start", prompt: "say OK", cwd: dir, tools: ["slow_tool"], model: "fixture/model", executionTimeoutMs: 10_000, startupTimeoutMs: 6_000 },
+      signal: new AbortController().signal,
+    });
+    expect(result.outcome).toBe("completed");
+    expect(result.output).toContain("OK");
+  } finally {
+    server.stop(true);
+    Object.assign(process.env, saved);
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("refuses to resume a real session in a different workspace", async () => {
+  const firstDir = fs.mkdtempSync(path.join(os.tmpdir(), "rpc-cwd-a-"));
+  const secondDir = fs.mkdtempSync(path.join(os.tmpdir(), "rpc-cwd-b-"));
+  const server = Bun.serve({
+    hostname: "127.0.0.1", port: 0,
+    async fetch() {
+      const chunk = (part: any, finish_reason: string | null) => `data: ${JSON.stringify({
+        id: "completion", object: "chat.completion.chunk", created: 0, model: "model",
+        choices: [{ index: 0, delta: part, finish_reason }],
+        usage: finish_reason ? { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 } : undefined,
+      })}\n\n`;
+      return new Response(chunk({ role: "assistant", content: "OK" }, null) + chunk({}, "stop") + "data: [DONE]\n\n", {
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    },
+  });
+  const saved = { ...process.env };
+  try {
+    fs.writeFileSync(path.join(firstDir, "models.json"), JSON.stringify({ providers: { fixture: {
+      baseUrl: `http://127.0.0.1:${server.port}/v1`, api: "openai-completions", apiKey: "test-only",
+      models: [{ id: "model", contextWindow: 128000, maxTokens: 1024 }],
+    } } }));
+    process.env.PI_CODING_AGENT_DIR = firstDir;
+    process.env.PI_OFFLINE = "1";
+    process.env.PI_SKIP_VERSION_CHECK = "1";
+    delete process.env.PI_SUBAGENT_CLI;
+    const supervisor = new RpcChildSupervisor();
+    const first = await supervisor.run({
+      task: { id: "cwd-a", prompt: "first", cwd: firstDir, tools: [], model: "fixture/model", persist: true, executionTimeoutMs: 10_000 },
+      signal: new AbortController().signal,
+    });
+    expect(first.outcome).toBe("completed");
+    const second = await supervisor.run({
+      task: { id: "cwd-b", prompt: "second", cwd: secondDir, tools: [], model: "fixture/model", resume: first.sessionFile, executionTimeoutMs: 10_000 },
+      signal: new AbortController().signal,
+    });
+    expect(second.outcome).toBe("failed");
+    expect(second.errorKind).toBe("startup");
+    expect(second.errorMessage).toContain("does not match requested cwd");
+  } finally {
+    server.stop(true);
+    Object.assign(process.env, saved);
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+    fs.rmSync(firstDir, { recursive: true, force: true });
+    fs.rmSync(secondDir, { recursive: true, force: true });
   }
 }, 30_000);

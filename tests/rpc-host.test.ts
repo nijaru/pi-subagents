@@ -110,6 +110,17 @@ describe("public RPC child host", () => {
     expect(alive()).toBe(false);
   });
 
+  test("kills detached descendants that ignore SIGTERM on timeout", async () => {
+    const dir = tempDir();
+    const result = await run(task(dir, { prompt: "SCENARIO=detached-descendant", executionTimeoutMs: 100 }));
+    expect(result.outcome).toBe("timed_out");
+    const pid = Number(fs.readFileSync(path.join(dir, "detached.pid"), "utf8"));
+    const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    const deadline = Date.now() + 2_000;
+    while (alive() && Date.now() < deadline) await Bun.sleep(25);
+    expect(alive()).toBe(false);
+  });
+
   test("surfaces process exits and startup failures as failures", async () => {
     const dir = tempDir();
     const result = await run(task(dir, { prompt: "SCENARIO=exit" }));
@@ -155,7 +166,7 @@ test("aborts during startup without mislabeling it as a timeout", async () => {
 test("resume and trustProject are passed to the child invocation", () => {
   const dir = tempDir();
   const session = path.join(dir, "existing.jsonl");
-  fs.writeFileSync(session, "");
+  fs.writeFileSync(session, `${JSON.stringify({ type: "session", version: 3, id: "existing", cwd: dir })}\n`);
   const invocation = getRpcInvocation(task(dir, { resume: session, trustProject: true }));
   expect(invocation.sessionFile).toBe(session);
   expect(invocation.args).toContain("--session");
@@ -222,4 +233,23 @@ test("startup command budgets use the remaining resolved deadline", () => {
   expect(startupRemainingMs(0, 60_000, 31_000)).toBe(29_000);
   expect(startupRemainingMs(0, 60_000, 1_000)).toBe(59_000);
   expect(startupRemainingMs(0, 500, 900)).toBe(1_000);
+});
+
+test("fails before prompting when the probe command is unavailable", async () => {
+  const dir = tempDir();
+  process.env.PI_SUBAGENT_FORCE_PROBE = "1";
+  const result = await run(task(dir, { id: "no-probe", prompt: "must not run" }));
+  expect(result.outcome).toBe("failed");
+  expect(result.errorKind).toBe("startup");
+  expect(result.errorMessage).toContain("probe extension is unavailable");
+  expect(fs.existsSync(path.join(fs.realpathSync.native(dir), ".fake-rpc-prompt"))).toBe(false);
+});
+
+
+test("refuses to resume a session from a different workspace", () => {
+  const first = tempDir();
+  const second = tempDir();
+  const session = path.join(first, "session.jsonl");
+  fs.writeFileSync(session, `${JSON.stringify({ type: "session", version: 3, id: "x", cwd: first })}\n`);
+  expect(() => getRpcInvocation(task(second, { resume: session }))).toThrow("does not match requested cwd");
 });

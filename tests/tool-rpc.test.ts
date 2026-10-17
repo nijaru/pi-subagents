@@ -86,7 +86,7 @@ describe("RPC-backed subagent tool", () => {
   test("resumes an existing child session", async () => {
     const h = host();
     const sessionFile = path.join(tempDir(), "previous.jsonl");
-    fs.writeFileSync(sessionFile, "");
+    fs.writeFileSync(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "previous", cwd: h.cwd })}\n`);
     const value = await h.execute({ command: "run", prompt: "continue", tools: [], resume: sessionFile });
     expect(value.details.results[0].sessionFile).toBe(sessionFile);
     expect(fs.readFileSync(path.join(h.cwd, ".fake-rpc-capture.json"), "utf8")).toContain("--session");

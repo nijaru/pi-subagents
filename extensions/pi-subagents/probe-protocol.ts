@@ -1,4 +1,4 @@
-/** Private command/message handshake between the parent and the child probe. */
+/** Private command/entry handshake between the parent and the child probe. */
 export const PROBE_COMMAND = "__pi_subagent_ready";
 export const PROBE_CUSTOM_TYPE = "subagent-probe";
 export const PROBE_TOKEN_ENV = "PI_SUBAGENT_PROBE_TOKEN";

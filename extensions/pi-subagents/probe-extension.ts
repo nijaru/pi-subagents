@@ -12,12 +12,13 @@ export default function subagentProbe(pi: ExtensionAPI): void {
   const token = process.env[PROBE_TOKEN_ENV] ?? "";
   const configured = Number(process.env[PROBE_TIMEOUT_ENV]);
   const timeout = Number.isSafeInteger(configured) && configured > 0 ? Math.min(configured, 5 * 60_000) : 10_000;
-  const deadline = Date.now() + timeout;
+  let deadline: number | undefined;
   const allowed = new Set(requested);
   let sending = false;
 
   const report = () => {
     if (sending) return;
+    deadline ??= Date.now() + timeout;
     let active: string[] = [];
     try { active = pi.getActiveTools(); } catch { /* runtime not ready */ }
     const missing = requested.filter((name) => !active.includes(name));
@@ -28,11 +29,7 @@ export default function subagentProbe(pi: ExtensionAPI): void {
     }
     sending = true;
     const payload: ProbeReport = { token, tools: active, requested, missing };
-    pi.sendMessage({
-      customType: PROBE_CUSTOM_TYPE,
-      content: JSON.stringify(payload),
-      display: false,
-    }, { triggerTurn: false });
+    pi.appendEntry(PROBE_CUSTOM_TYPE, payload);
   };
 
   // `--tools` controls the declared set, but `executeTool()` can still reach
