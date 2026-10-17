@@ -30,7 +30,7 @@ export function processTimeoutMs(): number {
     ? configured : DEFAULT_PROCESS_TIMEOUT_MS;
 }
 
-/** Deadline for process/watchdog/SDK/MCP readiness, before the task starts. */
+/** Deadline for RPC process, model selection, tool probe, and MCP readiness. */
 export function startupTimeoutMs(): number {
   const configured = Number(process.env[STARTUP_TIMEOUT_ENV]);
   return Number.isSafeInteger(configured) && configured > 0 && configured <= MAX_STARTUP_TIMEOUT_MS

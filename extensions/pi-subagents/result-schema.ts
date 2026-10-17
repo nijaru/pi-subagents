@@ -46,6 +46,7 @@ export const ChildResultSchema = Type.Object({
   taskFinishedAt: Type.Optional(Type.Number({ minimum: 0, description: "Leader exit or terminal-cause time, before cleanup." })),
   prompt: Type.String(),
   cwd: Type.String(),
+  sessionFile: Type.Optional(Type.String({ description: "Persisted child Pi session path, when persist was requested." })),
   tools: Type.Array(Type.String()),
   omittedFields: Type.Optional(Type.Array(StringEnum(["prompt", "cwd", "tools"] as const), {
     uniqueItems: true, description: "Context fields omitted to fit the response budget; empty placeholders are not execution values.",
@@ -65,7 +66,7 @@ export const ChildResultSchema = Type.Object({
 
 /** One bounded envelope for tool details, structured results, and completion notices. */
 export const SubagentDetailsSchema = Type.Object({
-  command: StringEnum(["run", "spawn", "status", "wait", "stop"] as const),
+  command: StringEnum(["run", "spawn", "status", "wait", "stop", "steer"] as const),
   results: Type.Array(ChildResultSchema),
   waitExpired: Type.Optional(Type.Boolean({ description: "Wait budget expired with no selected child complete; not a child timeout." })),
 }, { additionalProperties: false });

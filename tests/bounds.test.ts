@@ -17,6 +17,15 @@ function child(id = "child-1"): ChildResult {
 }
 
 describe("serialized result bounds", () => {
+  test("session and task-finish metadata survive bounding", () => {
+    const result = { ...child(), sessionFile: "/tmp/session.jsonl", taskFinishedAt: 3 };
+    const minimal = minimalChildResult(result);
+    expect(minimal.sessionFile).toBe("/tmp/session.jsonl");
+    expect(minimal.taskFinishedAt).toBe(3);
+    const bounded = boundDetails({ command: "wait", results: [result] });
+    expect(bounded.results[0]).toMatchObject({ sessionFile: "/tmp/session.jsonl", taskFinishedAt: 3 });
+  });
+
   test("timeoutPhase survives minimal and bounded results", () => {
     const timedOut = {
       ...child(),

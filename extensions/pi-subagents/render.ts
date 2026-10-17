@@ -175,7 +175,8 @@ function renderChildren(details: unknown, expanded: boolean, theme: Theme, targe
       }
       const cwd = child.omittedFields?.includes("cwd") ? "not retained (response budget)" : clean(child.cwd, 1024);
       const tools = child.omittedFields?.includes("tools") ? "not retained (response budget)" : clean(child.tools.join(", "), 1024) || "none";
-      container.addChild(new Text(theme.fg("dim", `cwd: ${cwd}\ntools: ${tools}`), 0, 0));
+      const session = child.sessionFile ? `\nsession: ${clean(child.sessionFile, 1024)}` : "";
+      container.addChild(new Text(theme.fg("dim", `cwd: ${cwd}\ntools: ${tools}${session}`), 0, 0));
       if (!active) {
         const cleanup = child.cleanupMs ? ` · cleanup ${formatElapsed(child.cleanupMs)}` : "";
         container.addChild(new Text(theme.fg("dim", formatUsage(child.usage, child.model ? clean(child.model, 256) : undefined) + (child.thinking ? ` · thinking: ${child.thinking}` : "") + cleanup), 0, 0));

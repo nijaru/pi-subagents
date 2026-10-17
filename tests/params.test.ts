@@ -105,3 +105,16 @@ describe("child environment", () => {
     expect(child.PI_SUBAGENT_DEPTH).toBe("1");
   });
 });
+
+describe("steering, persistence, and trust policy", () => {
+  test("accepts steer with id and message only", () => {
+    expect(() => validateCommand({ command: "steer", id: "sa-1", message: "focus" } as any)).not.toThrow();
+    expect(() => validateCommand({ command: "steer", message: "focus" } as any)).toThrow("id");
+    expect(() => validateCommand({ command: "steer", id: "sa-1" } as any)).toThrow("message");
+  });
+  test("rejects persist/resume on non-start commands and both together", () => {
+    expect(() => validateCommand({ command: "status", id: "sa-1", persist: true } as any)).toThrow();
+    expect(() => validateCommand({ command: "run", prompt: "x", persist: true, resume: "s.jsonl" } as any)).toThrow("mutually exclusive");
+    expect(() => validateCommand({ command: "run", prompt: "x", trustProject: true } as any)).not.toThrow();
+  });
+});

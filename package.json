@@ -1,8 +1,8 @@
 {
   "name": "@nijaru/pi-subagents",
-  "version": "0.0.12",
+  "version": "0.0.13",
   "type": "module",
-  "description": "Task-first child delegation for Pi: foreground runs, background completion notices, and bounded subprocess lifecycle.",
+  "description": "Task-first child delegation for Pi over the public RPC protocol, with background completion, steering, persistence, and bounded lifecycle.",
   "keywords": [
     "pi-package",
     "pi",
@@ -22,7 +22,7 @@
   },
   "pi": {
     "extensions": [
-      "./extensions"
+      "./extensions/pi-subagents/index.ts"
     ],
     "skills": [
       "./skills"

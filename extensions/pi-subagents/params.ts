@@ -6,8 +6,8 @@ import { MAX_PROCESS_TIMEOUT_MS, MAX_RETAINED_RUNS, MAX_STARTUP_TIMEOUT_MS, MAX_
 import { THINKING_LEVELS } from "./types.ts";
 
 export const SubagentParamsSchema = Type.Object({
-  command: StringEnum(["run", "spawn", "status", "wait", "stop"] as const, {
-    description: "run/spawn require prompt: run joins for up to 60s then continues in background; spawn returns immediately. wait requires ids and returns when any finishes. status optionally takes id; stop requires id and cancels/joins cleanup.",
+  command: StringEnum(["run", "spawn", "status", "wait", "stop", "steer"] as const, {
+    description: "run/spawn require prompt: run joins for up to 60s then continues in background; spawn returns immediately. steer requires id and message. wait requires ids and returns when any finishes. status optionally takes id; stop requires id and cancels/joins cleanup.",
   }),
   prompt: Type.Optional(Type.String({ description: "Self-contained task: scope, relevant evidence, constraints, expected output and checks", minLength: 1, maxLength: MAX_TASK_BYTES })),
   tools: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 256, pattern: "^[A-Za-z][A-Za-z0-9_.:-]*$" }), {
@@ -18,16 +18,20 @@ export const SubagentParamsSchema = Type.Object({
     description: "run/spawn only: reasoning effort supported by the selected model. Omitted inherits parent effort for the same model; a different model uses its Pi defaults. Unsupported explicit levels fail before prompting.",
   })),
   cwd: Type.Optional(Type.String({ description: "Child working directory; relative to the parent cwd", minLength: 1, maxLength: 4096 })),
-  id: Type.Optional(Type.String({ description: "status/stop only: child id; omit for status to list retained children", minLength: 1, maxLength: 128 })),
+  id: Type.Optional(Type.String({ description: "status/stop/steer only: child id; omit for status to list retained children", minLength: 1, maxLength: 128 })),
+  message: Type.Optional(Type.String({ description: "steer only: instruction to queue after the child's current tool turn", minLength: 1, maxLength: MAX_TASK_BYTES })),
   ids: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128 }), {
     description: "wait only: child ids to join. Returns all ready reports and identifies still-running children when any finishes. Wait again only on remaining ids when blocked.",
     minItems: 1, maxItems: MAX_RETAINED_RUNS, uniqueItems: true,
   })),
   timeoutMs: Type.Optional(Type.Integer({ description: "wait only: shared wait budget, not a child deadline. Default 5 minutes, maximum 10; wakes early on completion. Cancelling wait leaves children running. It never sets or changes execution deadlines.", minimum: 1, maximum: MAX_WAIT_MS })),
-  executionTimeoutMs: Type.Optional(Type.Integer({ description: "run/spawn only: model/tool execution deadline, starting once the child is ready. Positive integer milliseconds, at most 2 hours; defaults to PI_SUBAGENT_TIMEOUT_MS (30 minutes). Separate from startup, join, and wait budgets. A timed-out result keeps partial output and reports elapsed runtime and the deadline.", minimum: 1, maximum: MAX_PROCESS_TIMEOUT_MS })),
-  startupTimeoutMs: Type.Optional(Type.Integer({ description: "run/spawn only: deadline for process, watchdog, SDK, extension, and MCP readiness before the task starts. Positive integer milliseconds, at most 5 minutes; defaults to PI_SUBAGENT_STARTUP_TIMEOUT_MS (30 seconds).", minimum: 1, maximum: MAX_STARTUP_TIMEOUT_MS })),
+  executionTimeoutMs: Type.Optional(Type.Integer({ description: "run/spawn only: model/tool execution deadline, starting when Pi accepts the prompt. Positive integer milliseconds, at most 2 hours; defaults to PI_SUBAGENT_TIMEOUT_MS (30 minutes). Separate from startup, join, and wait budgets. A timed-out result keeps partial output and reports elapsed runtime and the deadline.", minimum: 1, maximum: MAX_PROCESS_TIMEOUT_MS })),
+  startupTimeoutMs: Type.Optional(Type.Integer({ description: "run/spawn only: deadline for the RPC process, model selection, tool probe, and MCP readiness before the task starts. Positive integer milliseconds, at most 5 minutes; defaults to PI_SUBAGENT_STARTUP_TIMEOUT_MS (30 seconds).", minimum: 1, maximum: MAX_STARTUP_TIMEOUT_MS })),
   joinTimeoutMs: Type.Optional(Type.Integer({ description: "run only: how long this call waits before returning the running child for background delivery. Does not change the execution deadline. Defaults to PI_SUBAGENT_FOREGROUND_MS (60 seconds).", minimum: 1, maximum: MAX_WAIT_MS })),
   notify: Type.Optional(StringEnum(["inbox", "turn"] as const, { description: "Completion delivery: inbox (default) advertises unread results on the next tool result; turn requests one continuation turn when the child finishes." })),
+  persist: Type.Optional(Type.Boolean({ description: "run/spawn only: keep the child Pi session under the agent directory for later inspection; default false." })),
+  resume: Type.Optional(Type.String({ description: "run/spawn only: existing child session file to continue instead of starting fresh. Mutually exclusive with persist.", minLength: 1, maxLength: 4096 })),
+  trustProject: Type.Optional(Type.Boolean({ description: "run/spawn only: pass --approve to the child so project-local resources load without a trust prompt; default false." })),
 }, { additionalProperties: false });
 
 export type SubagentParams = Static<typeof SubagentParamsSchema>;
@@ -54,17 +58,25 @@ export function validateCommand(params: SubagentParams): void {
   if (start) {
     if (!params.prompt?.trim()) throw new Error(`${params.command} requires a non-blank prompt.`);
     if (Buffer.byteLength(params.prompt, "utf8") > MAX_TASK_BYTES) throw new Error(`Prompt must be at most ${MAX_TASK_BYTES} bytes.`);
-    if (params.id !== undefined || params.ids !== undefined || params.timeoutMs !== undefined) throw new Error(`${params.command} accepts only prompt, tools, model, thinking, cwd, notify, startupTimeoutMs and executionTimeoutMs.`);
+    if (params.id !== undefined || params.ids !== undefined || params.timeoutMs !== undefined || params.message !== undefined) throw new Error(`${params.command} accepts only prompt, tools, model, thinking, cwd, notify, persist, resume, trustProject, startupTimeoutMs and executionTimeoutMs.`);
+    if (params.persist && params.resume !== undefined) throw new Error("persist and resume are mutually exclusive.");
     if (params.command === "spawn" && params.joinTimeoutMs !== undefined) throw new Error("spawn does not join; joinTimeoutMs is only accepted by run.");
     if (params.model !== undefined && !params.model.trim()) throw new Error("Model must not be blank.");
     if (params.cwd !== undefined && !params.cwd.trim()) throw new Error("Working directory must not be blank.");
   } else {
-    if (params.prompt !== undefined || params.tools !== undefined || params.model !== undefined || params.thinking !== undefined || params.cwd !== undefined || params.executionTimeoutMs !== undefined || params.startupTimeoutMs !== undefined || params.joinTimeoutMs !== undefined || params.notify !== undefined) throw new Error(`${params.command} does not accept child creation or join options.`);
+    if (params.prompt !== undefined || params.tools !== undefined || params.model !== undefined || params.thinking !== undefined || params.cwd !== undefined || params.executionTimeoutMs !== undefined || params.startupTimeoutMs !== undefined || params.joinTimeoutMs !== undefined || params.notify !== undefined || params.persist !== undefined || params.resume !== undefined || params.trustProject !== undefined) throw new Error(`${params.command} does not accept child creation or join options.`);
     if (params.command === "wait") {
       if (params.id !== undefined || !params.ids?.length) throw new Error('wait requires ids: ["<child-id>", ...], not id.');
+      if (params.message !== undefined) throw new Error("message is only accepted by steer.");
       if (params.ids.some((id) => !id.trim())) throw new Error("Child ids must not be blank.");
+    } else if (params.command === "steer") {
+      if (!params.id?.trim()) throw new Error("steer requires id.");
+      if (!params.message?.trim()) throw new Error("steer requires a non-blank message.");
+      if (params.message !== undefined && Buffer.byteLength(params.message, "utf8") > MAX_TASK_BYTES) throw new Error(`Steering message must be at most ${MAX_TASK_BYTES} bytes.`);
+      if (params.ids !== undefined || params.timeoutMs !== undefined) throw new Error("ids and timeoutMs are only accepted by wait.");
     } else {
       if (params.command === "stop" && !params.id?.trim()) throw new Error("stop requires id.");
+      if (params.message !== undefined) throw new Error("message is only accepted by steer.");
       if (params.id !== undefined && !params.id.trim()) throw new Error("Child id must not be blank.");
       if (params.ids !== undefined || params.timeoutMs !== undefined) throw new Error("ids and timeoutMs are only accepted by wait.");
     }

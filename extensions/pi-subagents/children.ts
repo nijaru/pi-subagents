@@ -2,7 +2,7 @@ import { randomInt, randomUUID } from "node:crypto";
 import type { ModelThinkingLevel, Usage } from "@earendil-works/pi-ai";
 import type { ChildResult } from "./types.ts";
 import { addUsage, copyResult, emptyUsage } from "./types.ts";
-import type { ChildSupervisor, ChildTask } from "./supervisor.ts";
+import type { ChildControl, ChildSupervisor, ChildTask } from "./supervisor.ts";
 import { MAX_CONCURRENCY, MAX_DIAGNOSTIC_BYTES, MAX_RETAINED_RUNS } from "./limits.ts";
 import { truncateOutput } from "./bounds.ts";
 
@@ -24,6 +24,8 @@ export interface ChildRun {
   waiters: Set<() => void>;
   /** In-flight joins. A blocking waiter claims delivery, so it suppresses the notice. */
   activeWaits: number;
+  /** Available once the child has accepted the prompt and can receive steering. */
+  control?: ChildControl;
 }
 
 export interface StartChild {
@@ -35,10 +37,16 @@ export interface StartChild {
   strictThinking?: boolean;
   /** Per-task execution deadline; omitted uses the global child deadline. */
   executionTimeoutMs?: number;
-  /** Startup deadline for watchdog/SDK/MCP readiness. */
+  /** Startup deadline for RPC process, tool probe, and MCP readiness. */
   startupTimeoutMs?: number;
   /** Inbox (default) or a forced parent turn. */
   notify?: "inbox" | "turn";
+  /** Keep the child Pi session for later inspection. */
+  persist?: boolean;
+  /** Trust project-local resources in the child. */
+  trustProject?: boolean;
+  /** Existing child session file to continue. */
+  resume?: string;
   emit?: (result: ChildResult, progress: string) => void;
 }
 
@@ -80,6 +88,9 @@ export class SessionChildren {
       model: options.model, thinking: options.thinking, strictThinking: options.strictThinking,
       executionTimeoutMs: options.executionTimeoutMs,
       startupTimeoutMs: options.startupTimeoutMs,
+      persist: options.persist,
+      trustProject: options.trustProject,
+      resume: options.resume,
     });
     // Register before execution can emit, await, or invoke extension callbacks.
     this.runs.set(result.id, run);
@@ -99,6 +110,7 @@ export class SessionChildren {
           run.result = copyResult({ ...run.result, ...data });
           if (progress !== undefined) present(progress);
         },
+        onControl: (control) => { run.control = control; },
       });
       const settledAt = Date.now();
       run.result = copyResult({
@@ -236,6 +248,20 @@ export class SessionChildren {
 
   list(): ChildResult[] {
     return [...this.runs.values()].map((run) => this.snapshot(run));
+  }
+
+  /** Queue a steering message into a running child. */
+  async steer(id: string, message: string): Promise<ChildResult> {
+    const run = this.get(id);
+    // A launch returns before the RPC child has accepted the prompt. Give the
+    // control channel a short, bounded window instead of making the caller poll.
+    for (let attempt = 0; attempt < 100 && !run.control && !run.settled; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    if (run.settled) throw new Error(`Child ${run.handle} is no longer running.`);
+    if (!run.control) throw new Error(`Child ${run.handle} did not become steerable in time.`);
+    await run.control.steer(message);
+    return this.snapshot(run);
   }
 
   async stop(id: string): Promise<ChildResult> {

@@ -1,7 +1,7 @@
 import type { AgentToolResult, ExtensionAPI, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
 import { Check, Errors } from "typebox/value";
 import { SessionChildren } from "./children.ts";
-import { SubprocessChildSupervisor } from "./supervisor.ts";
+import { RpcChildSupervisor } from "./supervisor.ts";
 import { SubagentParamsSchema, resolveCwd, selectTools, validateCommand } from "./params.ts";
 import { DEFAULT_WAIT_MS, MAX_OUTPUT_BYTES, RUNNING_PROGRESS_TEXT, RUNTIME_UPDATE_INTERVAL_MS, foregroundBudgetMs, isChildProcess } from "./limits.ts";
 import { boundDetails, truncateOutput } from "./bounds.ts";
@@ -58,7 +58,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerMessageRenderer("subagent-complete", renderChildCompletion);
   const createRuntime = () => {
     let delivery: CompletionDelivery;
-    const children = new SessionChildren(new SubprocessChildSupervisor(), () => delivery.refreshStatus());
+    const children = new SessionChildren(new RpcChildSupervisor(), () => delivery.refreshStatus());
     delivery = new CompletionDelivery(children);
     return { children, delivery };
   };
@@ -105,11 +105,11 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
-    description: "Delegate one self-contained task to a fresh child. run joins within a join budget, then lets the child finish as background work; spawn returns a handle immediately. status, wait and stop control session-scoped children. Defaults to read/search/web tools; request bash, edit, or write explicitly for mutating work. No profiles, nested delegation, shared history, or persistent child sessions.",
+    description: "Delegate one self-contained task to a fresh Pi child over the public RPC protocol. run joins within a join budget, then lets the child finish as background work; spawn returns a handle immediately. status, wait, stop, and steer control session-scoped children. Defaults to read/search/web tools; request bash, edit, or write explicitly for mutating work. Children are leaves.",
     parameters: SubagentParamsSchema,
     outputSchema: SubagentDetailsSchema,
     executionMode: "parallel",
-    promptSnippet: "Use run for a fresh-context result, or spawn for independent work alongside useful local work.",
+    promptSnippet: "Use run for a fresh-context result, spawn for independent work alongside useful local work, and steer to redirect a running child.",
     promptGuidelines: [
       "Give subagent children relevant evidence, scope, constraints, expected output and checks. Their conversations start fresh without parent history.",
       "Children default to read/search/web tools. Request bash, edit, or write explicitly only when the task needs mutations, and give concurrent writers separate worktrees.",
@@ -138,6 +138,10 @@ export default function (pi: ExtensionAPI) {
         const result = await owner.stop(params.id!);
         return answer("stop", [result], childReports([result]));
       }
+      if (params.command === "steer") {
+        const result = await owner.steer(params.id!, params.message!);
+        return answer("steer", [result], `Steering queued for ${result.handle ?? result.id}.`);
+      }
       if (params.command === "wait") {
         const results = await owner.wait(params.ids!, params.timeoutMs ?? DEFAULT_WAIT_MS, signal);
         return outcome("wait", results);
@@ -163,6 +167,9 @@ export default function (pi: ExtensionAPI) {
         model, thinking, strictThinking: params.thinking !== undefined,
         executionTimeoutMs: params.executionTimeoutMs,
         startupTimeoutMs: params.startupTimeoutMs,
+        persist: params.persist,
+        resume: params.resume,
+        trustProject: params.trustProject,
         notify: params.notify,
         emit: foreground && onUpdate ? present : undefined,
       });
