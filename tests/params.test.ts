@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { selectTools, validateCommand, SubagentParamsSchema } from "../extensions/pi-subagents/params.ts";
+import { excludedChildTools, MCP_RESOURCE_TOOLS, selectTools, validateCommand, SubagentParamsSchema } from "../extensions/pi-subagents/params.ts";
 import { Check } from "typebox/value";
 import { childEnvironment } from "../extensions/pi-subagents/env.ts";
 import { isChildProcess, processTimeoutMs, DEFAULT_PROCESS_TIMEOUT_MS, STARTUP_TIMEOUT_ENV, startupTimeoutMs, MAX_PROCESS_TIMEOUT_MS, MAX_STARTUP_TIMEOUT_MS } from "../extensions/pi-subagents/limits.ts";
@@ -116,5 +116,30 @@ describe("steering, persistence, and trust policy", () => {
     expect(() => validateCommand({ command: "status", id: "sa-1", persist: true } as any)).toThrow();
     expect(() => validateCommand({ command: "run", prompt: "x", persist: true, resume: "s.jsonl" } as any)).toThrow("mutually exclusive");
     expect(() => validateCommand({ command: "run", prompt: "x", trustProject: true } as any)).not.toThrow();
+  });
+});
+
+
+describe("nested MCP tool exclusions", () => {
+  test("no selected MCP tool denies the wildcard, unselected direct, and resource tools", () => {
+    const excluded = excludedChildTools(["read"], ["read", "unselected_direct", "mcp__server__a", "mcp__server__b", ...MCP_RESOURCE_TOOLS]);
+    expect(excluded).toContain("mcp__*");
+    expect(excluded).toContain("mcp__server__a");
+    expect(excluded).toContain("mcp__server__b");
+    expect(excluded).toContain("unselected_direct");
+    for (const name of MCP_RESOURCE_TOOLS) expect(excluded).toContain(name);
+  });
+  test("selected MCP tools deny only their unselected siblings", () => {
+    const excluded = excludedChildTools(["mcp__server__a"], ["mcp__server__a", "mcp__server__b", ...MCP_RESOURCE_TOOLS]);
+    expect(excluded).not.toContain("mcp__*");
+    expect(excluded).not.toContain("mcp__server__a");
+    expect(excluded).toContain("mcp__server__b");
+    for (const name of MCP_RESOURCE_TOOLS) expect(excluded).toContain(name);
+  });
+  test("a selected resource tool is not excluded", () => {
+    const excluded = excludedChildTools(["list_mcp_resources"], [...MCP_RESOURCE_TOOLS, "mcp__server__a"]);
+    expect(excluded).not.toContain("list_mcp_resources");
+    expect(excluded).toContain("read_mcp_resource");
+    expect(excluded).toContain("mcp__server__a");
   });
 });

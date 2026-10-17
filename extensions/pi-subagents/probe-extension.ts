@@ -8,24 +8,29 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
  * Public extension API only; it registers no tools or commands.
  */
 export default function subagentProbe(pi: ExtensionAPI): void {
+  let requested: string[] = [];
+  try { requested = JSON.parse(process.env.PI_SUBAGENT_PROBE_TOOLS ?? "[]"); } catch { /* invalid request */ }
+  const allowed = new Set(requested);
+  // `--tools` controls the declared set, but `executeTool()` can still reach
+  // registered tools. Enforce the same allowlist for direct and nested calls.
+  pi.on("tool_call", (event) => allowed.has(event.toolName)
+    ? undefined
+    : { block: true, reason: `Tool ${event.toolName} is not in this child's allowlist.` });
   pi.on("session_start", () => {
     const file = process.env.PI_SUBAGENT_PROBE_FILE;
     if (!file) return;
-    let requested: string[] = [];
-    try { requested = JSON.parse(process.env.PI_SUBAGENT_PROBE_TOOLS ?? "[]"); } catch { return; }
     const startedAt = Date.now();
-    const deadline = startedAt + 10_000;
+    const configured = Number(process.env.PI_SUBAGENT_PROBE_TIMEOUT_MS);
+    const timeout = Number.isSafeInteger(configured) && configured > 0 ? Math.min(configured, 5 * 60_000) : 10_000;
+    const deadline = startedAt + timeout;
     const report = () => {
       let active: string[] = [];
       try { active = pi.getActiveTools(); } catch { /* runtime not ready */ }
       const missing = requested.filter((name) => !active.includes(name));
-      // MCP registration is asynchronous; other tools should be present
-      // immediately, so report a missing built-in without burning the grace window.
-      const waitForMcp = missing.some((name) => name.startsWith("mcp__") || ["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"].includes(name));
-      // Give the runtime a short window to settle its initial tool set before
-      // declaring a built-in missing; MCP gets the full registration window.
-      const grace = Date.now() - startedAt < 1_000;
-      if (missing.length && (waitForMcp || grace) && Date.now() < deadline) {
+      // Tool registration can be asynchronous (MCP, codemode, slow extensions).
+      // Wait for the resolved startup window rather than declaring a built-in
+      // missing after an arbitrary one-second grace.
+      if (missing.length && Date.now() < deadline) {
         setTimeout(report, 50);
         return;
       }

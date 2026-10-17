@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { RpcChildSupervisor, getRpcInvocation, type ChildControl, type ChildTask } from "../extensions/pi-subagents/supervisor.ts";
+import { RpcChildSupervisor, getRpcInvocation, startupRemainingMs, type ChildControl, type ChildTask } from "../extensions/pi-subagents/supervisor.ts";
 
 const directories: string[] = [];
 function tempDir(): string {
@@ -91,7 +91,7 @@ describe("public RPC child host", () => {
     while (!control) await Bun.sleep(5);
     await control.steer("focus");
     const steered = await pending;
-    expect(steered.output).toBe("steered: focus");
+    expect(steered.output).toBe("steered: Steering instruction:\n\nfocus");
     expect(steered.outcome).toBe("completed");
 
     const second = run(task(dir, { prompt: "SCENARIO=slow" }), controller.signal);
@@ -161,4 +161,65 @@ test("resume and trustProject are passed to the child invocation", () => {
   expect(invocation.args).toContain("--session");
   expect(invocation.args).toContain("--approve");
   expect(invocation.args).not.toContain("--no-session");
+});
+
+test("wraps the task prompt so leading slash commands stay literal", async () => {
+  const dir = tempDir();
+  const result = await run(task(dir, { prompt: "/capture hello" }));
+  expect(result.outcome).toBe("completed");
+  expect(fs.readFileSync(path.join(fs.realpathSync.native(dir), ".fake-rpc-prompt"), "utf8")).toBe("Task:\n\n/capture hello");
+});
+
+test("normal completion allows an async stdin-close shutdown hook to finish", async () => {
+  const dir = tempDir();
+  const result = await run(task(dir, { prompt: "SCENARIO=shutdown" }));
+  expect(result.outcome).toBe("completed");
+  expect(fs.existsSync(path.join(dir, "shutdown.done"))).toBe(true);
+});
+
+test("ignores oversized agent_end history frames", async () => {
+  const dir = tempDir();
+  const result = await run(task(dir, { prompt: "SCENARIO=large-end" }));
+  expect(result.outcome).toBe("completed");
+  expect(result.output).toBe("done");
+});
+
+test("prefers the current streaming report when interrupted", async () => {
+  const dir = tempDir();
+  const result = await run(task(dir, { prompt: "SCENARIO=partial-after", executionTimeoutMs: 100 }));
+  expect(result.outcome).toBe("timed_out");
+  expect(result.output).toBe("SECOND");
+});
+
+test("malformed assistant content fails instead of hanging cleanup", async () => {
+  const dir = tempDir();
+  const result = await Promise.race([
+    run(task(dir, { prompt: "SCENARIO=malformed" })),
+    new Promise<"hung">((resolve) => setTimeout(() => resolve("hung"), 2_000)),
+  ]);
+  expect(result).not.toBe("hung");
+  expect((result as any).outcome).toBe("failed");
+});
+
+test("non-fatal child extension errors are retained as diagnostics", async () => {
+  const dir = tempDir();
+  const result = await run(task(dir, { prompt: "SCENARIO=extension-error" }));
+  expect(result.outcome).toBe("completed");
+  expect(result.stderr).toContain("hook boom");
+});
+
+test("passes explicit nested-tool exclusions to the child CLI", () => {
+  const invocation = getRpcInvocation(task(process.cwd(), {
+    excludeTools: ["mcp__*", "list_mcp_resources", "read_mcp_resource"],
+  }));
+  const index = invocation.args.indexOf("--exclude-tools");
+  expect(index).toBeGreaterThan(-1);
+  expect(invocation.args[index + 1]).toBe("mcp__*,list_mcp_resources,read_mcp_resource");
+});
+
+
+test("startup command budgets use the remaining resolved deadline", () => {
+  expect(startupRemainingMs(0, 60_000, 31_000)).toBe(29_000);
+  expect(startupRemainingMs(0, 60_000, 1_000)).toBe(59_000);
+  expect(startupRemainingMs(0, 500, 900)).toBe(1_000);
 });

@@ -2,7 +2,7 @@ import type { AgentToolResult, ExtensionAPI, ToolResultEventResult } from "@eare
 import { Check, Errors } from "typebox/value";
 import { SessionChildren } from "./children.ts";
 import { RpcChildSupervisor } from "./supervisor.ts";
-import { SubagentParamsSchema, resolveCwd, selectTools, validateCommand } from "./params.ts";
+import { SubagentParamsSchema, excludedChildTools, resolveCwd, selectTools, validateCommand } from "./params.ts";
 import { DEFAULT_WAIT_MS, MAX_OUTPUT_BYTES, RUNNING_PROGRESS_TEXT, RUNTIME_UPDATE_INTERVAL_MS, foregroundBudgetMs, isChildProcess } from "./limits.ts";
 import { boundDetails, truncateOutput } from "./bounds.ts";
 import { addUsage, failed, isRunning } from "./types.ts";
@@ -147,7 +147,11 @@ export default function (pi: ExtensionAPI) {
         return outcome("wait", results);
       }
       if (signal?.aborted) throw new Error("Child launch cancelled.");
-      const tools = selectTools(params.tools, pi.getActiveTools(), ctx.tools.map((tool) => tool.name));
+      const activeTools = pi.getActiveTools();
+      const callableTools = ctx.tools.map((tool) => tool.name);
+      const tools = selectTools(params.tools, activeTools, callableTools);
+      const allToolNames = typeof pi.getAllTools === "function" ? pi.getAllTools().map((tool) => tool.name) : [];
+      const excludeTools = excludedChildTools(tools, [...new Set([...activeTools, ...callableTools, ...allToolNames])]);
       const cwd = resolveCwd(ctx.cwd || process.cwd(), params.cwd);
       const foreground = params.command === "run";
       let presenting = foreground;
@@ -170,10 +174,15 @@ export default function (pi: ExtensionAPI) {
         persist: params.persist,
         resume: params.resume,
         trustProject: params.trustProject,
+        excludeTools,
         notify: params.notify,
         emit: foreground && onUpdate ? present : undefined,
       });
-      if (!foreground) return answer("spawn", [owner.snapshot(run)], `Started child ${run.handle}. Completion is delivered to the inbox${run.notify === "turn" ? " and requests one parent turn" : ""}; idle parents are not woken. Continue non-overlapping work; use wait when its result blocks finishing your task, or status/stop with this handle.`);
+      if (!foreground) {
+        const snapshot = owner.snapshot(run);
+        const session = snapshot.sessionFile ? `\nSession: ${snapshot.sessionFile}` : "";
+        return answer("spawn", [snapshot], `Started child ${run.handle}. Completion is delivered to the inbox${run.notify === "turn" ? " and requests one parent turn" : ""}; idle parents are not woken. Continue non-overlapping work; use wait when its result blocks finishing your task, or status/stop with this handle.${session}`);
+      }
       // Presentation stops at the foreground join, even when execution continues.
       const timer = onUpdate ? setInterval(() => {
         if (presenting && !owner.isClosed) present(owner.snapshot(run), RUNNING_PROGRESS_TEXT);

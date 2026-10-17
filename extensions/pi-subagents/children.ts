@@ -47,6 +47,8 @@ export interface StartChild {
   trustProject?: boolean;
   /** Existing child session file to continue. */
   resume?: string;
+  /** Tools that must remain unreachable through nested/codemode calls. */
+  excludeTools?: string[];
   emit?: (result: ChildResult, progress: string) => void;
 }
 
@@ -91,6 +93,7 @@ export class SessionChildren {
       persist: options.persist,
       trustProject: options.trustProject,
       resume: options.resume,
+      excludeTools: options.excludeTools ? Object.freeze([...options.excludeTools]) : undefined,
     });
     // Register before execution can emit, await, or invoke extension callbacks.
     this.runs.set(result.id, run);

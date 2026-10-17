@@ -26,6 +26,15 @@ describe("serialized result bounds", () => {
     expect(bounded.results[0]).toMatchObject({ sessionFile: "/tmp/session.jsonl", taskFinishedAt: 3 });
   });
 
+  test("batch truncation adds metadata even when the original budget was not reached", () => {
+    const result = { ...child(), output: "x".repeat(40_000), outputTruncation: undefined };
+    const bounded = boundChildResult(result, 5_000);
+    expect(bounded.output!.length).toBeLessThan(result.output.length);
+    expect(bounded.outputTruncation).toMatchObject({
+      truncated: true, originalBytes: 40_000, retainedBytes: Buffer.byteLength(bounded.output!),
+    });
+  });
+
   test("timeoutPhase survives minimal and bounded results", () => {
     const timedOut = {
       ...child(),

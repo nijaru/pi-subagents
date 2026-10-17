@@ -61,6 +61,9 @@ describe("RPC-backed subagent tool", () => {
     expect(child.model).toBe("parent/model");
     expect(child.thinking).toBe("high");
     expect(value.isError).toBe(false);
+    const capture = JSON.parse(fs.readFileSync(path.join(fs.realpathSync.native(h.cwd), ".fake-rpc-capture.json"), "utf8"));
+    expect(capture.args).toContain("--exclude-tools");
+    expect(capture.args[capture.args.indexOf("--exclude-tools") + 1]).toContain("mcp__*");
   });
 
   test("starts in the background, steers, and joins", async () => {
@@ -76,7 +79,7 @@ describe("RPC-backed subagent tool", () => {
     const steered = await h.execute({ command: "steer", id: handle, message: "focus" });
     expect(steered.details.command).toBe("steer");
     const joined = await h.execute({ command: "wait", ids: [handle], timeoutMs: 5000 });
-    expect(joined.details.results[0].output).toBe("steered: focus");
+    expect(joined.details.results[0].output).toBe("steered: Steering instruction:\n\nfocus");
     expect(joined.details.results[0].state).toMatchObject({ status: "terminal", outcome: "completed" });
   });
 
@@ -95,6 +98,7 @@ describe("RPC-backed subagent tool", () => {
     process.env.PI_SUBAGENT_SESSION_DIR = sessionDir;
     const value = await h.execute({ command: "run", prompt: "hello", tools: [], persist: true });
     expect(value.details.results[0].sessionFile).toContain("sessions");
+    expect(value.content[0].text).toContain("session:");
   });
 
   test("rejects invalid steering and obsolete fields before launch", async () => {

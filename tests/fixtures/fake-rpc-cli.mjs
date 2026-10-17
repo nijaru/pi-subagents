@@ -37,6 +37,34 @@ function emitTask() {
     settle();
     return;
   }
+  if (scenario === "malformed") {
+    send({ type: "message_end", message: { role: "assistant", stopReason: "stop" } });
+    settle();
+    return;
+  }
+  if (scenario === "large-end") {
+    send({ type: "message_end", message: message("done") });
+    send({ type: "agent_end", messages: Array.from({ length: 30 }, () => ({ role: "user", content: "x".repeat(45_000) })) });
+    settle();
+    return;
+  }
+  if (scenario === "partial-after") {
+    send({ type: "message_end", message: message("FIRST") });
+    send({ type: "message_start", message: { role: "assistant", content: [] } });
+    send({ type: "message_update", usage, assistantMessageEvent: { type: "text_delta", delta: "SECOND" } });
+    return;
+  }
+  if (scenario === "extension-error") {
+    send({ type: "extension_error", event: "tool_result", error: "hook boom" });
+    send({ type: "message_end", message: message("done") });
+    settle();
+    return;
+  }
+  if (scenario === "shutdown") {
+    send({ type: "message_end", message: message("done") });
+    settle();
+    return;
+  }
   if (scenario === "slow") {
     send({ type: "message_start", message: { role: "assistant", content: [] } });
     send({ type: "message_update", usage, assistantMessageEvent: { type: "text_delta", delta: "partial" } });
@@ -75,11 +103,13 @@ input.on("line", (line) => {
   }
   if (command.type === "prompt") {
     scenario = /SCENARIO=([a-z-]+)/.exec(command.message)?.[1] ?? "ok";
+    fs.writeFileSync(".fake-rpc-prompt", command.message);
     send({ id: command.id, type: "response", command: "prompt", success: true, data: { disposition: "started" } });
     setTimeout(emitTask, 5);
     return;
   }
   if (command.type === "steer") {
+    fs.writeFileSync(".fake-rpc-steer", command.message);
     send({ id: command.id, type: "response", command: "steer", success: true, data: { disposition: "queued" } });
     if (scenario === "descendant") {
     const descendant = spawn("sh", ["-c", "sleep 30"], { stdio: "ignore" });
@@ -101,4 +131,13 @@ input.on("line", (line) => {
   }
   send({ id: command.id, type: "response", command: command.type, success: false, error: "unsupported" });
 });
-input.on("close", () => process.exit(0));
+input.on("close", () => {
+  if (scenario === "shutdown") {
+    setTimeout(() => {
+      fs.writeFileSync("shutdown.done", "yes");
+      process.exit(0);
+    }, 300);
+    return;
+  }
+  process.exit(0);
+});

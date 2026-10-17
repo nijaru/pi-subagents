@@ -33,6 +33,8 @@ export interface ChildTask {
   readonly resume?: string;
   /** Trust project-local resources in the child. Off by default. */
   readonly trustProject?: boolean;
+  /** Tools that must remain unreachable through nested/codemode calls. */
+  readonly excludeTools?: readonly string[];
   /** Per-task execution deadline, starting when Pi accepts the prompt. */
   readonly executionTimeoutMs?: number;
   /** Per-task startup deadline for the RPC process and get_state. */
@@ -89,6 +91,9 @@ const COMMAND_TIMEOUT_MS = 30_000;
 const TERMINAL_EXIT_GRACE_MS = 3_000;
 const KILL_GRACE_MS = 3_000;
 const FORCE_SETTLE_MS = 16_000;
+const TASK_ENVELOPE = "Task:\n\n";
+const STEER_ENVELOPE = "Steering instruction:\n\n";
+const AGENT_END_PREFIX = '{"type":"agent_end"';
 
 export function findOnPath(name: string): string | undefined {
   const pathValue = process.env.PATH ?? "";
@@ -163,6 +168,7 @@ export function getRpcInvocation(task: ChildTask): Invocation {
   args.push("--name", task.id);
   if (task.tools.length) args.push("--tools", task.tools.join(","));
   else args.push("--no-tools");
+  if (task.excludeTools?.length) args.push("--exclude-tools", task.excludeTools.join(","));
   if (task.model) args.push("--model", task.model);
   if (task.thinking) args.push("--thinking", task.thinking);
   if (task.trustProject) args.push("--approve");
@@ -238,6 +244,11 @@ function classify(
   };
 }
 
+/** Remaining command budget, never below one second to avoid a zero timer. */
+export function startupRemainingMs(startedAt: number, budgetMs: number, now = Date.now()): number {
+  return Math.max(1_000, budgetMs - Math.max(0, now - startedAt));
+}
+
 function onceExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
   return new Promise((resolve) => {
@@ -252,6 +263,9 @@ function onceExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
     const onExit = () => finish(true);
     const timer = setTimeout(() => finish(false), timeoutMs);
     child.once("exit", onExit);
+    // Close the check/listener race: an exit can happen between the initial
+    // exitCode check and attaching the listener.
+    if (child.exitCode !== null || child.signalCode !== null) finish(true);
   });
 }
 
@@ -261,6 +275,7 @@ function onceExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
  */
 export class RpcChildSupervisor implements ChildSupervisor {
   async run({ task, signal, onUpdate, onControl }: ChildRunRequest): Promise<ChildExecutionResult> {
+    const startupBudgetMs = task.startupTimeoutMs ?? startupTimeoutMs();
     const data: ChildExecutionData = {
       phase: "starting", startedAt: Date.now(), stderr: "", usage: emptyUsage(),
     };
@@ -304,7 +319,7 @@ export class RpcChildSupervisor implements ChildSupervisor {
       let timedOut = false;
       let aborted = false;
       let timeoutPhase: "startup" | "execution" = "startup";
-      let deadlineMs = task.startupTimeoutMs ?? startupTimeoutMs();
+      let deadlineMs = startupBudgetMs;
       let executionStartedAt: number | undefined;
       let taskFinishedAt: number | undefined;
       let processFailure: string | undefined;
@@ -312,6 +327,9 @@ export class RpcChildSupervisor implements ChildSupervisor {
       let trailing = "";
       let lastAssistant: any;
       let streamingText = "";
+      let currentAssistantOpen = false;
+      let discarding = false;
+      let previewing = true;
       let forceTimer: ReturnType<typeof setTimeout> | undefined;
       let startupTimer: ReturnType<typeof setTimeout> | undefined;
       let executionTimer: ReturnType<typeof setTimeout> | undefined;
@@ -382,8 +400,10 @@ export class RpcChildSupervisor implements ChildSupervisor {
       };
 
       const resultFor = (wasTerminated: boolean): ChildExecutionResult => {
-        const output = lastAssistant ? truncateOutput(textFromMessage(lastAssistant), MAX_OUTPUT_BYTES) : truncateOutput(streamingText, MAX_OUTPUT_BYTES);
-        const original = lastAssistant ? textFromMessage(lastAssistant) : streamingText;
+        const settledText = lastAssistant ? textFromMessage(lastAssistant) : "";
+        const currentText = currentAssistantOpen ? streamingText : "";
+        const original = currentText || settledText || streamingText;
+        const output = truncateOutput(original, MAX_OUTPUT_BYTES);
         const outputTruncation = output !== original ? {
           truncated: true,
           originalBytes: Buffer.byteLength(original, "utf8"),
@@ -408,11 +428,28 @@ export class RpcChildSupervisor implements ChildSupervisor {
         if (finishing) return;
         finishing = true;
         clearTimers();
-        watchdog?.stdin?.end();
-        try { child?.stdin?.end(); } catch { /* already closed */ }
-        const exited = await onceExit(child, TERMINAL_EXIT_GRACE_MS);
-        if (!exited) {
+        if (!child) {
+          settle(resultFor(true));
+          return;
+        }
+        const orderly = terminal && !timedOut && !aborted && !processFailure;
+        if (orderly) {
+          // EOF is Pi's orderly shutdown path. Keep the parent-death watchdog
+          // armed until the leader has exited so async session_shutdown hooks
+          // are not interrupted by an early SIGTERM.
+          try { child.stdin?.end(); } catch { /* already closed */ }
+          const exited = await onceExit(child, TERMINAL_EXIT_GRACE_MS);
+          if (!exited) {
+            terminateProcessTree(child, "SIGTERM");
+            if (!(await onceExit(child, KILL_GRACE_MS))) {
+              terminateProcessTree(child, "SIGKILL");
+              await onceExit(child, 1_000);
+            }
+          }
+        } else {
+          // Timeout, cancellation, or a failed child: stop the tree promptly.
           terminateProcessTree(child, "SIGTERM");
+          try { child.stdin?.end(); } catch { /* already closed */ }
           if (!(await onceExit(child, KILL_GRACE_MS))) {
             terminateProcessTree(child, "SIGKILL");
             await onceExit(child, 1_000);
@@ -420,9 +457,16 @@ export class RpcChildSupervisor implements ChildSupervisor {
         }
         // A completed leader can leave shell descendants in its detached group.
         // Sweep them before releasing the admission slot; the sweep has its own
-        // bounded SIGTERM/SIGKILL escalation.
+        // bounded SIGTERM/SIGKILL escalation. The watchdog remains armed until
+        // this point, so a parent crash during cleanup still kills the group.
         await sweepRootProcessGroup(child);
-        settle(resultFor(true));
+        watchdog?.stdin?.end();
+        try {
+          settle(resultFor(true));
+        } catch {
+          settle({ ...snapshot(), outcome: "failed", exitCode: 1, stopReason: "error", errorKind: "protocol",
+            errorMessage: "Subagent cleanup could not produce a result." });
+        }
       };
 
       const finish = () => {
@@ -431,7 +475,10 @@ export class RpcChildSupervisor implements ChildSupervisor {
         // Bound cleanup even when a descendant keeps inherited stdio open.
         forceTimer = setTimeout(() => {
           try { terminateProcessTree(child, "SIGKILL"); } catch { /* already gone */ }
-          settle(resultFor(terminal));
+          try { settle(resultFor(terminal)); } catch {
+            settle({ ...snapshot(), outcome: "failed", exitCode: 1, stopReason: "error", errorKind: "protocol",
+              errorMessage: "Subagent cleanup could not produce a result." });
+          }
         }, FORCE_SETTLE_MS);
         forceTimer.unref?.();
         void cleanup();
@@ -470,15 +517,21 @@ export class RpcChildSupervisor implements ChildSupervisor {
           return;
         }
         if (event.type === "extension_error") {
-          processFailure = `Child extension error (${event.event ?? "unknown"}): ${event.error ?? "unknown"}`;
-          finish();
+          // Pi reports handler failures as non-fatal extension errors and can
+          // continue the run. Keep the diagnostic, but do not abort a task
+          // merely because an unrelated extension hook threw.
+          const detail = `Child extension error (${event.event ?? "unknown"}): ${event.error ?? "unknown"}`;
+          stderr += `${stderr ? "\n" : ""}${detail}`;
+          if (stderr.length > MAX_STDERR_BYTES * 2) stderr = stderr.slice(-MAX_STDERR_BYTES * 2);
           return;
         }
         if (event.type === "message_start" && event.message?.role === "assistant") {
           streamingText = "";
+          currentAssistantOpen = true;
           return;
         }
         if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
+          currentAssistantOpen = true;
           streamingText = truncateOutput(streamingText + (event.assistantMessageEvent.delta ?? ""), MAX_OUTPUT_BYTES * 2);
           const now = Date.now();
           if (now - lastPublish >= 500) {
@@ -491,6 +544,7 @@ export class RpcChildSupervisor implements ChildSupervisor {
         if (event.type === "message_end") {
           const message = event.message;
           if (message?.role === "assistant") {
+            currentAssistantOpen = false;
             lastAssistant = message;
             streamingText = textFromMessage(message);
             data.output = truncateOutput(streamingText, MAX_OUTPUT_BYTES);
@@ -549,24 +603,48 @@ export class RpcChildSupervisor implements ChildSupervisor {
         let cursor = 0;
         while (cursor < text.length && !finishing) {
           const newline = text.indexOf("\n", cursor);
+          const end = newline < 0 ? text.length : newline;
+          const segment = text.slice(cursor, end);
+          cursor = newline < 0 ? text.length : newline + 1;
+          if (discarding) {
+            if (newline >= 0) { discarding = false; previewing = true; }
+            continue;
+          }
+          trailing += segment;
+          if (previewing) {
+            if (trailing.length >= AGENT_END_PREFIX.length) {
+              if (trailing.startsWith(AGENT_END_PREFIX)) {
+                // agent_end repeats the whole run history and is not used by
+                // the host. Discard it without imposing the per-record cap.
+                if (newline < 0) {
+                  discarding = true;
+                  trailing = "";
+                  return;
+                }
+                trailing = "";
+                previewing = true;
+                continue;
+              }
+              previewing = false;
+            } else if (newline < 0) {
+              return;
+            }
+          }
           if (newline < 0) {
-            const segment = text.slice(cursor);
-            if (Buffer.byteLength(trailing) + Buffer.byteLength(segment) > MAX_PROTOCOL_LINE_BYTES) {
+            if (Buffer.byteLength(trailing) > MAX_PROTOCOL_LINE_BYTES) {
               fail("Child RPC emitted an oversized protocol record.");
               trailing = "";
-            } else {
-              trailing += segment;
             }
             return;
           }
-          const segment = text.slice(cursor, newline);
-          if (Buffer.byteLength(trailing) + Buffer.byteLength(segment) > MAX_PROTOCOL_LINE_BYTES) {
+          if (Buffer.byteLength(trailing) > MAX_PROTOCOL_LINE_BYTES) {
             fail("Child RPC emitted an oversized protocol record.");
+            trailing = "";
             return;
           }
-          handleLine(trailing + segment);
+          handleLine(trailing);
           trailing = "";
-          cursor = newline + 1;
+          previewing = true;
         }
       };
 
@@ -584,6 +662,7 @@ export class RpcChildSupervisor implements ChildSupervisor {
         if (invocation.probeFile) {
           childEnv.PI_SUBAGENT_PROBE_FILE = invocation.probeFile;
           childEnv.PI_SUBAGENT_PROBE_TOOLS = JSON.stringify(task.tools);
+          childEnv.PI_SUBAGENT_PROBE_TIMEOUT_MS = String(Math.max(1_000, Math.min(10_000, Math.floor(startupRemainingMs(data.startedAt ?? Date.now(), startupBudgetMs) * 0.6))));
         }
         child = spawn(invocation.command, invocation.args, {
           cwd: task.cwd,
@@ -606,7 +685,7 @@ export class RpcChildSupervisor implements ChildSupervisor {
         timedOut = true;
         taskFinishedAt ??= Date.now();
         finish();
-      }, deadlineMs);
+      }, Math.max(1, deadlineMs - (Date.now() - (data.startedAt ?? Date.now()))));
       startupTimer.unref?.();
 
       child.once("exit", (code, exitSignal) => {
@@ -646,7 +725,7 @@ export class RpcChildSupervisor implements ChildSupervisor {
         await watchdogSetup;
         if (finishing || signal.aborted) return;
         try {
-          const stateResponse = await send({ type: "get_state" }, Math.max(1_000, (task.startupTimeoutMs ?? 30_000)));
+          const stateResponse = await send({ type: "get_state" }, startupRemainingMs(data.startedAt ?? Date.now(), startupBudgetMs));
           if (!stateResponse.success) throw new Error(stateResponse.error || "Child get_state failed.");
           const state = stateResponse.data ?? {};
           if (!state.model) throw new Error("Child has no selected model.");
@@ -658,7 +737,7 @@ export class RpcChildSupervisor implements ChildSupervisor {
             throw new Error(`Child thinking ${state.thinkingLevel} does not match requested ${task.thinking}.`);
           }
           if (invocation.probeFile) {
-            const deadline = Date.now() + Math.max(1_000, (task.startupTimeoutMs ?? startupTimeoutMs()));
+            const deadline = (data.startedAt ?? Date.now()) + startupBudgetMs;
             while (!fs.existsSync(invocation.probeFile) && Date.now() < deadline && !aborted && !timedOut) {
               await new Promise((resolve) => setTimeout(resolve, 25));
             }
@@ -679,14 +758,14 @@ export class RpcChildSupervisor implements ChildSupervisor {
           // after an arbitrary first model response.
           startExecutionClock();
 
-          const promptResponse = await send({ type: "prompt", message: task.prompt });
+          const promptResponse = await send({ type: "prompt", message: TASK_ENVELOPE + task.prompt });
           if (!promptResponse.success) throw new Error(promptResponse.error || "Child rejected the prompt.");
           const disposition = promptResponse.data?.disposition;
           if (disposition === "handled") throw new Error("Child handled the prompt without starting a task.");
           onControl?.({
             async steer(message: string) {
               if (finishing || terminal) throw new Error("Child is no longer running.");
-              const response = await send({ type: "steer", message });
+              const response = await send({ type: "steer", message: STEER_ENVELOPE + message });
               if (!response.success) throw new Error(response.error || "Child rejected steering.");
               if (response.data?.disposition === "handled") throw new Error("Child handled steering without queuing it.");
             },

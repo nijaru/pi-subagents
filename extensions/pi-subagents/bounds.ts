@@ -106,11 +106,14 @@ export function jsonBytes(value: unknown): number {
 }
 
 function truncationFor(result: ChildResult, output: string) {
-  return result.outputTruncation ? {
+  const original = result.output ?? "";
+  if (!result.outputTruncation && output === original) return undefined;
+  return {
     ...result.outputTruncation,
-    truncated: result.outputTruncation.truncated || output !== (result.output ?? ""),
+    truncated: result.outputTruncation?.truncated || output !== original,
+    originalBytes: result.outputTruncation?.originalBytes ?? Buffer.byteLength(original),
     retainedBytes: Buffer.byteLength(output),
-  } : undefined;
+  };
 }
 
 export function minimalChildResult(result: ChildResult): ChildResult {

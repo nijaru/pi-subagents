@@ -39,6 +39,8 @@ Every child gets a short session-scoped handle (`sa-<n>`). `wait`, `status`, `st
 
 `run` is the synchronous convenience: it starts and joins. `spawn` is the background form. A `run` whose join expires returns a running handle; it does not stop the child. Cancelling a `run` call cancels its child; cancelling a `wait` leaves children running.
 
+Task prompts are wrapped in a `Task:` envelope and steering messages in a `Steering instruction:` envelope before they reach RPC. This prevents RPC from interpreting a leading `/command`, `/skill:...`, or `/template` as a child command. The task content itself is otherwise unchanged.
+
 ## Completion delivery
 
 `notify` controls how a finished child reaches the parent:
@@ -62,11 +64,11 @@ At expiry the child is stopped and its result retains partial assistant output. 
 ## Child execution
 
 - **Public RPC boundary.** The child is spawned as `pi --mode rpc`; the parent speaks only the documented JSONL protocol. No `jiti`, no SDK bootstrap, and no private Pi module imports.
-- **Exact startup checks.** The parent verifies the child's effective model and thinking level with `get_state`, and a packaged probe extension reports the active tool set before the prompt is submitted. A missing requested tool fails startup instead of silently running with fewer capabilities.
+- **Exact startup checks.** The parent verifies the child's effective model and thinking level with `get_state`, and a packaged probe extension reports the active tool set before the prompt is submitted and blocks calls outside the allowlist. A missing requested tool fails startup instead of silently running with fewer capabilities.
 - **Full Pi configuration.** The child loads its own settings, extensions, skills, MCP servers, and project instructions. A fresh conversation does not mean an empty system prompt.
-- **Isolation.** Each child runs in its own detached process group. A detached watchdog terminates the group if the parent dies without running shutdown hooks. Normal completion, cancellation, and timeouts sweep the group before releasing the concurrency slot.
+- **Isolation.** Each child runs in its own detached process group. A detached watchdog terminates the group if the parent dies without running shutdown hooks. Normal completion closes child stdin and waits for orderly Pi shutdown before ending the watchdog and sweeping descendants; cancellation and timeouts stop the tree promptly. The concurrency slot is held until cleanup finishes.
 - **Steering.** Steering messages use the RPC `steer` command and are delivered after the current assistant turn's tool calls. Steering is only available while the child is running.
-- **Persistence.** `persist: true` stores the child session under the agent directory (`~/.pi/agent/subagents/sessions/<id>.jsonl` by default) and returns `sessionFile`. `resume: "<path>"` continues an existing child session instead of starting fresh. The parent may reuse the returned session later with `run` or `spawn`; do not resume a session while another child is still using it.
+- **Persistence.** `persist: true` stores the child session under the agent directory (`~/.pi/agent/subagents/sessions/<id>.jsonl` by default) and returns `sessionFile`. `resume: "<path>"` continues an existing child session instead of starting fresh. The path appears in the model-facing `run`/`spawn`/`wait`/`status` text as well as details, so the parent can resume it later with `run` or `spawn`; do not resume a session while another child is still using it.
 - **Trust.** RPC mode cannot show Pi's project-trust prompt. Project-local resources are skipped unless a saved decision applies or the call sets `trustProject: true`, which passes `--approve` to the child. Parent permission state is not inherited.
 
 The child is a full Pi process, so a child with shell access can produce effects outside the managed process group. Tool allowlists and subprocesses are **not sandboxes**.
@@ -75,7 +77,7 @@ The child is a full Pi process, so a child with shell access can produce effects
 
 Defaults are the parent's active tools among `read`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `web_research`, `resolve-library-id`, and `query-docs`. Mutation tools (`bash`, `edit`, `write`) must be requested explicitly. `tools: []` is reasoning-only.
 
-Explicit tools must be active or callable in the parent and are passed to the child as an exact allowlist. The child probe must report the same active set before the task starts. Children are leaves: the `subagent` tool cannot be passed to a child, and nested calls are rejected.
+Explicit tools must be active or callable in the parent and are passed to the child as an exact allowlist. All unselected tools are also passed through `--exclude-tools`, so nested/codemode calls cannot reach them. The child probe must report the same active set before the task starts and blocks tool calls outside the allowlist, including nested `executeTool()` calls. Children are leaves: the `subagent` tool cannot be passed to a child, and nested calls are rejected.
 
 `model` is an exact `provider/model-id`; otherwise the parent's model is inherited. `thinking` selects a reasoning effort supported by that model. An explicit unsupported level fails before prompting. A different model uses its own Pi defaults when `thinking` is omitted.
 
@@ -120,7 +122,7 @@ Pi loads the TypeScript extension directly; there is no build step. Checks use a
 
 `0.0.x` is pre-release: tool schema and result shape are not promised across patch releases.
 
-- **0.0.13**: replace the custom SDK child bootstrap with Pi's public RPC protocol. Add `steer`, persisted/resumable child sessions (`persist`, `resume`), and opt-in `trustProject`. Remove `jiti`, private Pi imports, and the custom fd-3 child protocol. Add an active-tool probe so missing tools fail before prompting.
+- **0.0.13**: replace the custom SDK child bootstrap with Pi's public RPC protocol. Add `steer`, persisted/resumable child sessions (`persist`, `resume`), and opt-in `trustProject`. Remove `jiti`, private Pi imports, and the custom fd-3 child protocol. Add an active-tool probe so missing tools fail before prompting. Wrap prompts and steering to prevent RPC command expansion, exclude all unselected tools from nested calls, preserve orderly child shutdown hooks, ignore oversized `agent_end` history, retain the latest partial report, and expose persisted session paths in model-facing text.
 
 ## Migrating from the SDK child
 

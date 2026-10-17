@@ -106,8 +106,10 @@ export function isStopReason(value: unknown): value is StopReason {
 }
 
 export function textFromMessage(message: Message): string {
-  if (typeof message.content === "string") return message.content;
-  return message.content
+  const content = (message as { content?: unknown }).content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
     .filter((part): part is { type: "text"; text: string } => isContentPart(part) && part.type === "text" && typeof part.text === "string")
     .map((part) => part.text)
     .join("\n");

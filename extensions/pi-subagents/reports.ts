@@ -81,8 +81,9 @@ export function childSummary(result: ChildResult, includePrompt = true): string 
   const status = result.state.status === "running" ? (result.phase ?? "running") : result.state.outcome;
   const duration = runtimeLabel(result);
   const model = result.model ? `\nmodel: ${truncateOutput(result.model, 512)}${result.thinking ? ` · thinking: ${result.thinking}` : ""}` : "";
+  const session = result.sessionFile ? `\nsession: ${truncateOutput(result.sessionFile, 1024)}` : "";
   const handle = result.handle ?? result.id;
-  const head = `${handle} [${status}]${duration ? ` · ${duration}` : ""}${model}`;
+  const head = `${handle} [${status}]${duration ? ` · ${duration}` : ""}${model}${session}`;
   return includePrompt ? `${head}\n${truncateOutput(result.prompt, 256)}` : head;
 }
 

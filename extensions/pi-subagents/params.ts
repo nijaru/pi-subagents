@@ -43,6 +43,33 @@ const DEFAULT_TOOLS = [
   "web_search", "web_fetch", "web_research", "resolve-library-id", "query-docs",
 ];
 
+// Pi's nested-call allowlist keeps MCP resource tools reachable unless they are
+// explicitly excluded. Keep this list aligned with Pi's built-in MCP extension.
+export const MCP_RESOURCE_TOOLS = ["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"] as const;
+export function isMcpTool(name: string): boolean {
+  return name.startsWith("mcp__") || (MCP_RESOURCE_TOOLS as readonly string[]).includes(name);
+}
+
+/**
+ * CLI `--tools` controls the active model-facing set, but `executeTool()` and
+ * codemode can reach registered tools. Compute the denylist needed to make the
+ * requested set an actual boundary.
+ */
+export function excludedChildTools(selected: readonly string[], available: readonly string[]): string[] {
+  const chosen = new Set(selected);
+  const excluded = new Set<string>();
+  if (!selected.some(isMcpTool)) excluded.add("mcp__*");
+  // `executeTool()` can reach registered tools that are not active. Exclude
+  // every unselected tool, not only the ones currently exposed to the model.
+  for (const name of new Set(available)) {
+    if (!chosen.has(name)) excluded.add(name);
+  }
+  for (const name of MCP_RESOURCE_TOOLS) {
+    if (!chosen.has(name)) excluded.add(name);
+  }
+  return [...excluded];
+}
+
 export function selectTools(requested: string[] | undefined, active: string[], callable: readonly string[]): string[] {
   const tools = requested ?? DEFAULT_TOOLS.filter((name) => active.includes(name));
   if (requested === undefined && tools.length === 0) throw new Error("No default child tools are active. Specify tools: [] for a reasoning-only task.");

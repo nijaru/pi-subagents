@@ -20,7 +20,7 @@ test("real Pi parent delegates through a real RPC child", async () => {
       if (isParent && !returned) {
         delta = { tool_calls: [{ index: 0, id: "parent_subagent", type: "function", function: {
           name: "subagent",
-          arguments: JSON.stringify({ command: "run", prompt: "CHILD_SENTINEL: read fixture.txt and report it.", tools: ["read"] }),
+          arguments: JSON.stringify({ command: "run", prompt: "/capture CHILD_SENTINEL: read fixture.txt and report it.", tools: ["read"] }),
         } }] };
       } else if (isParent) {
         delta = { content: "PARENT_OK" };
@@ -45,6 +45,9 @@ test("real Pi parent delegates through a real RPC child", async () => {
   const saved = { ...process.env };
   try {
     fs.writeFileSync(path.join(dir, "fixture.txt"), "FILE_SENTINEL");
+    fs.writeFileSync(path.join(dir, "capture.ts"), `import { writeFileSync } from "node:fs";
+export default (pi: any) => pi.registerCommand("capture", { handler: async () => { writeFileSync("command-ran", "yes"); } });`);
+    fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ extensions: [path.join(dir, "capture.ts")] }));
     fs.writeFileSync(path.join(dir, "models.json"), JSON.stringify({ providers: { fixture: {
       baseUrl: `http://127.0.0.1:${server.port}/v1`, api: "openai-completions", apiKey: "test-only",
       models: [{ id: "model", contextWindow: 128000, maxTokens: 1024 }],
@@ -85,6 +88,8 @@ test("real Pi parent delegates through a real RPC child", async () => {
     expect(childRequests[0].tools.map((tool: any) => tool.function.name)).toEqual(["read"]);
     expect(JSON.stringify(childRequests[0].messages)).not.toContain("PARENT_SENTINEL");
     expect(JSON.stringify(childRequests[1].messages)).toContain("FILE_SENTINEL");
+    expect(fs.existsSync(path.join(dir, "command-ran"))).toBe(false);
+    expect(JSON.stringify(childRequests[0].messages)).toContain("/capture CHILD_SENTINEL");
   } finally {
     proc?.kill();
     server.stop(true);
