@@ -66,6 +66,12 @@ describe("compact child rendering", () => {
       "subagent wait 900c096e", "✓ completed · 8s",
     ]);
   });
+  test("a handle-targeted row does not repeat the handle", () => {
+    const handled = { ...child, handle: "sa-42" };
+    expect(lines("status", { command: "status", id: "sa-42" }, false, [handled])).toEqual([
+      "subagent status sa-42", "✓ completed · 8s · Read the package version.",
+    ]);
+  });
   test("status lists identify every child and task on one line each", () => {
     const second = { ...child, id: "abcd1234-0000", prompt: "Second task" };
     expect(lines("status", { command: "status" }, false, [child, second])).toEqual([

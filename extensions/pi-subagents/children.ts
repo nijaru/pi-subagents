@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomInt, randomUUID } from "node:crypto";
 import type { ModelThinkingLevel, Usage } from "@earendil-works/pi-ai";
 import type { ChildResult } from "./types.ts";
 import { addUsage, copyResult, emptyUsage } from "./types.ts";
@@ -47,7 +47,9 @@ export class SessionChildren {
   private readonly runs = new Map<string, ChildRun>();
   private closed = false;
   private pendingUsage: Usage | undefined;
-  private nextHandle = 1;
+  // Start at a random point so a resumed session cannot immediately reuse a
+  // handle still visible in the restored transcript.
+  private nextHandle = randomInt(1, 1_000_000);
 
   constructor(private readonly supervisor: ChildSupervisor, private readonly available: (result: ChildResult) => void) {}
 
@@ -91,7 +93,7 @@ export class SessionChildren {
       try { emit(this.snapshot(run), progress); } catch { emit = undefined; }
     };
     try {
-      const { outcome, exitCode, stopReason, errorKind, ...data } = await this.supervisor.run({
+      const { outcome, exitCode, stopReason, errorKind, timeoutPhase, ...data } = await this.supervisor.run({
         task, signal: run.controller.signal,
         onUpdate: (data, progress) => {
           run.result = copyResult({ ...run.result, ...data });
@@ -102,6 +104,7 @@ export class SessionChildren {
         ...run.result, ...data,
         state: { status: "terminal", outcome, exitCode, stopReason, finishedAt: Date.now() },
         ...(errorKind === undefined ? {} : { errorKind }),
+        ...(timeoutPhase === undefined ? {} : { timeoutPhase }),
       });
       delete run.result.phase;
     } catch (error) {
@@ -161,10 +164,13 @@ export class SessionChildren {
     return [...this.runs.values()].some((run) => run.delivery === "published");
   }
 
-  acknowledgeCompletions(ids: ReadonlySet<string>): void {
+  acknowledgeCompletions(ids: ReadonlySet<string>, protectedKeys: ReadonlySet<string> = new Set()): void {
     for (const id of ids) {
-      const run = this.runs.get(id);
-      if (run?.delivery === "published") run.delivery = "delivered";
+      const run = this.runs.get(id) ?? [...this.runs.values()].find((candidate) => candidate.handle === id);
+      if (!run || run.delivery !== "published") continue;
+      // A tool call may reference the same child by handle or UUID.
+      if (protectedKeys.has(id) || protectedKeys.has(run.handle)) continue;
+      run.delivery = "delivered";
     }
   }
 

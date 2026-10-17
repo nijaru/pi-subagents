@@ -25,17 +25,17 @@ For independent work while the parent continues:
 ```json
 {"command":"spawn","prompt":"Implement the parser regression test in tests/parser.test.ts. Own only that file, run its tests, and report changes and results.","cwd":"../parser-worktree","executionTimeoutMs":900000}
 {"command":"status"}
-{"command":"wait","ids":["sa-1"]}
-{"command":"stop","id":"sa-1"}
+{"command":"wait","ids":["sa-4821"]}
+{"command":"stop","id":"sa-4821"}
 ```
 
-Every child gets a short session-scoped handle (`sa-1`, `sa-2`, …) that `wait`, `status`, and `stop` accept in place of the full UUID. Handles are never reused while retained. Up to 32 handles are retained; the oldest completed, read handle is evicted to admit new work. Unread results are never evicted.
+Every child gets a short session-scoped handle (`sa-<n>`, for example `sa-4821`) that `wait`, `status`, and `stop` accept in place of the full UUID. The number starts at a fresh random point each session, so a resumed transcript cannot immediately collide with a new child. Handles are never reused while retained. Up to 32 handles are retained; the oldest completed, read handle is evicted to admit new work. Unread results are never evicted.
 
 ### Completion delivery
 
 `notify` controls how a finished child reaches the parent:
 
-- **`inbox`** (default): the child does not spend a parent turn. The next tool result advertises unread handles, the footer shows the count, and `wait` retrieves the reports. `/subagents` lists retained children and unread state. An idle parent is never woken.
+- **`inbox`** (default): the child does not spend a parent turn. The next top-level non-subagent tool result advertises unread handles, the footer shows the count, and `wait` retrieves the reports. `/subagents` lists retained children and unread state. An idle parent is never woken.
 - **`turn`**: Pi offers one continuation turn at an active boundary when the child finishes, as in earlier releases. Unread results are batched into one notice. Aborts, provider errors, and dropped notices leave the report unread for an explicit `wait`.
 
 Inbox delivery makes background work visible without adding a model turn and avoids the retraction/acknowledgment races of pushed notices. Turn delivery is opt-in when the child must resume the parent immediately.
@@ -59,11 +59,11 @@ Four independent budgets avoid conflating readiness, work, joining, and cleanup:
 
 Handles belong to the current parent session. All children stop on quit, reload, or session replacement. Background work requires a live parent process; a one-shot print invocation is not a persistent worker host.
 
-The TUI hides agent-facing text — delegated prompts and child reports — behind expansion. Each child is one status line: live work and status listings carry a handle, phase, and one-line task label; finished children show outcome and duration, with the error message added for failures. Expand for the full prompt and report, diagnostics, working directory, tools, and usage. Completion notices occupy one line, with results available on expansion.
+The TUI hides agent-facing text — delegated prompts and child reports — behind expansion. Each child is one status line: live work and status listings carry a handle, phase, and one-line task label; finished children show outcome and duration, with the error message added for failures. Expand for the full prompt and report, diagnostics, working directory, tools, and usage. Turn-mode notices occupy one line; inbox results are advertised in the next top-level non-subagent tool result.
 
 ### Programmatic results
 
-Codemode calls receive `{ command, results, waitExpired? }`, not report text. Each child carries its id, short handle, lifecycle `state`, live `phase`, structured `errorKind`, bounded report and diagnostics, truncation metadata, and usage. The same bounded envelope is returned as tool `details`; the model still receives a text summary. Child reports do not have to be JSON. When launch context cannot fit, `omittedFields` identifies removed `prompt`, `cwd`, or `tools` fields; their empty placeholders are not execution values.
+Codemode calls receive `{ command, results, waitExpired? }`, not report text. Each child carries its id, short handle, lifecycle `state`, live `phase` (running only), structured `errorKind`, `timeoutPhase` for deadline failures, bounded report and diagnostics, truncation metadata, and usage. The same bounded envelope is returned as tool `details`; the model still receives a text summary. Child reports do not have to be JSON. When launch context cannot fit, `omittedFields` identifies removed `prompt`, `cwd`, or `tools` fields; their empty placeholders are not execution values.
 
 ```javascript
 const result = await tools.subagent({
@@ -135,7 +135,7 @@ Environment variables are allowlisted, with standard model credentials, `$VAR` r
 
 `0.0.x` is pre-release: the tool schema, behavior, and exported `ChildResult` shape are not promised across patch releases. Read this file, not the version number, for what changed.
 
-- **0.0.10**: redesign the parent-facing lifecycle. Inbox completion delivery is the default; `notify: "turn"` preserves pushed notices. Children get short `sa-N` handles. Startup and execution deadlines are separate, `executionTimeoutMs` starts at the ready frame, and `run` accepts `joinTimeoutMs`. Default tools are read/search/web; mutation tools must be requested. Results gain `phase` and structured `errorKind`, and `/subagents` lists retained children. See the 0.0.10 migration notes below.
+- **0.0.10**: redesign the parent-facing lifecycle. Inbox completion delivery is the default; `notify: "turn"` preserves pushed notices. Children get short `sa-<n>` handles from a fresh session range. Startup and execution deadlines are separate, `executionTimeoutMs` starts at the ready frame, and `run` accepts `joinTimeoutMs`. Default tools are read/search/web; mutation tools must be requested. Results gain `phase` and structured `errorKind`, and `/subagents` lists retained children. See the 0.0.10 migration notes below.
 - **0.0.9**: settle timed-out and cancelled runs even when an escaped descendant keeps stdio open; stop the execution deadline at leader exit so cleanup cannot fabricate a timeout; report terminating signals, credential hints, and terminal failure causes in `status`; retain partial output from interrupted real children; do not evict a child referenced by the response's own tool calls.
 - **0.0.8**: add per-task `executionTimeoutMs` for `run`/`spawn`, separate from wait budgets. Timeout reports retain partial output and name elapsed runtime and the applied deadline. Validate SDK children and packed artifacts against Pi 1.2.0.
 - **0.0.7**: preserve unread reports when parent cancellation prevents completion delivery. Committed notices suppress duplicates without making unseen reports evictable; a subsequent successful assistant response or explicit join acknowledges them. Resume without duplicate notices, and reclaim acknowledged handles before tools need admission.
@@ -148,10 +148,10 @@ Environment variables are allowlisted, with standard model credentials, `$VAR` r
 ## Migration to 0.0.10
 
 - **Default tool set is read-only**: `read`, `grep`, `find`, `ls`, and the research tools. Pass `tools` explicitly with `bash`, `edit`, or `write` for mutating work.
-- **Completion defaults to the inbox**: background results no longer force a parent turn. The next tool result advertises unread handles, `/subagents` lists them, and `wait` reads them. Pass `notify: "turn"` to keep the old pushed-notice behavior.
-- **Handles are short and reusable in calls**: `wait`, `status`, and `stop` accept `sa-N` as well as the full UUID. The UUID remains in details.
+- **Completion defaults to the inbox**: background results no longer force a parent turn. The next top-level non-subagent tool result advertises unread handles, `/subagents` lists them, and `wait` reads them. Pass `notify: "turn"` to keep the old pushed-notice behavior.
+- **Handles are short and reusable in calls**: `wait`, `status`, and `stop` accept `sa-<n>` as well as the full UUID. The UUID remains in details; the numeric range is fresh per session.
 - **`executionTimeoutMs` starts at ready**, not at spawn. Add `startupTimeoutMs` for readiness; the default is 30 seconds. `run` also accepts `joinTimeoutMs`, and `PI_SUBAGENT_FOREGROUND_MS` remains the default join budget.
-- **Results add `handle`, `phase`, `errorKind`, and `notify`**. `phase` is present only while running; `errorKind` distinguishes startup, provider, protocol, deadline, cancelled, tool, and unknown failures.
+- **Results add `handle`, `phase`, `errorKind`, `timeoutPhase`, and `notify`**. `phase` is present only while running; `timeoutPhase` names the expired deadline; `errorKind` distinguishes startup, provider, protocol, deadline, cancelled, and unknown failures.
 - **`/subagents`** reports retained children and unread results. It is human-facing; it does not consume reports.
 - `spawn` rejects `joinTimeoutMs`. `run`/`spawn` reject `timeoutMs`; that field belongs to `wait`.
 
@@ -159,7 +159,7 @@ Environment variables are allowlisted, with standard model credentials, `$VAR` r
 
 - Pi 1.0.4 is now the minimum supported host. Earlier SDK versions are no longer supported.
 - Children load the selected installation's CLI built-ins, respecting disabled or replacement extensions. You no longer need a separate extension to supply codemode or MCP to SDK children.
-- `tools` remains an exact list, not Pi CLI wildcard patterns. Include every tool the child may call, including through codemode; omitted MCP tools are no longer implicitly callable. Explicit selections may now name parent-callable tools that are not active; defaults still use active coding/research tools only.
+- `tools` remains an exact list, not Pi CLI wildcard patterns. Include every tool the child may call, including through codemode; omitted MCP tools are no longer implicitly callable. Explicit selections may now name parent-callable tools that are not active; defaults use active read/search/web tools only.
 - Codemode callers now receive the structured `{ command, results, waitExpired? }` envelope instead of text. Inspect child states and output fields directly; do not parse the prose summary. Native `isError` results retain this data, so a failed child does not reject the script call.
 - Direct callers of the extension's `execute()` receive `{ isError: true, content, details }` for failed child reports rather than a rejected promise. Invalid requests and cancelled waits still throw. Pi presents both as native tool errors.
 
@@ -176,7 +176,7 @@ Environment variables are allowlisted, with standard model credentials, `$VAR` r
 - Children now require Node and an installed Pi SDK; launching another Pi CLI through `PI_SUBAGENT_BIN` or `PI_BIN` is no longer supported. Unset these overrides. `PI_SUBAGENT_RUNNER` is a developer-only override for a compatible protocol runner, not a CLI path.
 - Use exact `provider/model-id` values. Missing child tools/models fail before the task rather than falling back or silently disappearing.
 - `ChildResult` adds optional `stdout` and `outputTruncation` fields. Handle the new terminal outcome `incomplete` for model output limits; its partial report remains available.
-- Completion delivery in `notify: "turn"` mode is batched, read-aware, and limited to active-turn boundaries; inbox delivery advertises unread results on the next tool result. Idle parents are never woken automatically. Use `wait` when a child blocks finishing your task. There is no redundant follow-up for a result already returned by `run`, `wait`, or `stop`.
+- Completion delivery in `notify: "turn"` mode is batched, read-aware, and limited to active-turn boundaries; inbox delivery advertises unread results on the next top-level non-subagent tool result. Idle parents are never woken automatically. Use `wait` when a child blocks finishing your task. There is no redundant follow-up for a result already returned by `run`, `wait`, or `stop`.
 
 ## Migration from the profile/workflow API
 

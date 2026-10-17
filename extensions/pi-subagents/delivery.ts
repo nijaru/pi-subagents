@@ -96,7 +96,7 @@ export class CompletionDelivery {
     // A response's tools have not run yet. Do not evict a handle that its own
     // wait/status/stop call still references; the next response acknowledges it.
     const protectedIds = referencedChildIds(event.message);
-    this.children.acknowledgeCompletions(new Set([...ids].filter((id) => !protectedIds.has(id))));
+    this.children.acknowledgeCompletions(ids, protectedIds);
     this.refreshStatus();
   }
 

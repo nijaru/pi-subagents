@@ -71,6 +71,8 @@ export interface ProcessResult {
   stopReason?: StopReason;
   outcome: AgentOutcome;
   errorMessage?: string;
+  /** Which deadline expired; only set for timed_out. */
+  timeoutPhase?: "startup" | "execution";
   stderr: string;
   stdout?: string;
 }
@@ -126,7 +128,7 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
     // Cancellation and deadline remain authoritative even after a completed
     // report; cleanup must never turn a finished task into a timeout.
     const termination = (): Partial<ProcessResult> => timedOut
-      ? { outcome: "timed_out", exitCode: 1, stopReason: "error", errorMessage: timeoutSummary((finishedAt ?? Date.now()) - startedAt, deadlineMs, timeoutPhase) }
+      ? { outcome: "timed_out", exitCode: 1, stopReason: "error", errorMessage: timeoutSummary((finishedAt ?? Date.now()) - startedAt, deadlineMs, timeoutPhase), timeoutPhase }
       : aborted || signal?.aborted
         ? { outcome: "cancelled", exitCode: 1, stopReason: "aborted", errorMessage: "Subagent aborted." }
         : processFailure
@@ -240,9 +242,20 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
       forceTimer = setTimeout(forceSettle, FORCE_SETTLE_MS);
       forceTimer.unref?.();
     };
-    const stopForAbort = () => { if (!settled) { aborted = true; finishedAt ??= Date.now(); stopTree(); } };
+    const stopForAbort = () => {
+      if (settled || aborted || timedOut || finishing) return;
+      aborted = true;
+      finishedAt ??= Date.now();
+      // The first terminal cause wins. A deadline firing during abort cleanup
+      // must not relabel a cancellation as a timeout.
+      if (processTimer) clearTimeout(processTimer);
+      if (startupTimer) clearTimeout(startupTimer);
+      processTimer = undefined;
+      startupTimer = undefined;
+      stopTree();
+    };
     const stopForTimeout = (phase: "startup" | "execution") => {
-      if (settled) return;
+      if (settled || timedOut || aborted || signal?.aborted || finishing) return;
       timedOut = true;
       timeoutPhase = phase;
       deadlineMs = phase === "startup" ? startupTimeoutMs : timeoutMs;
@@ -271,7 +284,7 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
           }
         }
         onEvent(event);
-        if (event.kind === "ready" && processTimer === undefined) {
+        if (event.kind === "ready" && processTimer === undefined && !timedOut && !aborted && !finishing) {
           if (startupTimer) clearTimeout(startupTimer);
           startupTimer = undefined;
           processTimer = setTimeout(() => stopForTimeout("execution"), timeoutMs);

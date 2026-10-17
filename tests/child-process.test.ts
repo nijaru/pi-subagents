@@ -205,6 +205,32 @@ test("auth-shaped protocol errors carry the credential hint", async () => {
   });
 });
 
+test("a cancellation that races a deadline stays cancelled", async () => {
+  await fixture(`process.on('SIGTERM',()=>{}); setInterval(()=>{},1000);`, async (task, supervisor) => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 150);
+    const outcome = await supervisor.run({ task: { ...task, executionTimeoutMs: 300 }, signal: controller.signal });
+    expect(outcome.outcome).toBe("cancelled");
+    expect(outcome.errorKind).toBe("cancelled");
+    expect(outcome.timeoutPhase).toBeUndefined();
+  });
+}, 20000);
+
+test("a late ready frame cannot relabel a startup timeout", async () => {
+  await fixture(`await new Promise(resolve => setTimeout(resolve, 250));
+    send({kind:'ready',model:request.model,thinking:'off',tools:request.tools});
+    process.on('SIGTERM',()=>{}); setInterval(()=>{},1000);`, async (task, supervisor) => {
+    const outcome = await supervisor.run({
+      task: { ...task, startupTimeoutMs: 200, executionTimeoutMs: 100 },
+      signal: new AbortController().signal,
+    });
+    expect(outcome.outcome).toBe("timed_out");
+    expect(outcome.timeoutPhase).toBe("startup");
+    expect(outcome.errorMessage).toContain("during startup");
+    expect(outcome.errorMessage).toContain("startup deadline 200ms");
+  }, { ready: false });
+}, 20000);
+
 test("a startup deadline is distinct from execution and keeps the child from starting", async () => {
   await fixture(`setInterval(()=>{},1000);`, async (task, supervisor) => {
     const outcome = await supervisor.run({

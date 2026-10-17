@@ -64,7 +64,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_result", (event): ToolResultEventResult | undefined => {
     runtime.delivery.refreshStatus();
     const usage = runtime.children.takePendingUsage();
-    const inbox = event.toolName === "subagent" ? [] : runtime.children.pendingInbox();
+    // Nested/codemode results only reach the calling tool, never the model.
+    const inbox = event.parentToolCallId !== undefined || event.toolName === "subagent" ? [] : runtime.children.pendingInbox();
     if (!usage && inbox.length === 0) return;
     const result: ToolResultEventResult = {};
     if (usage) {

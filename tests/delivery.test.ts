@@ -251,11 +251,11 @@ describe("parent completion delivery", () => {
       await run.promise;
     }
     c.commit(c.boundary());
-    const protectedId = runs[0]!.result.id;
-    c.responded("toolUse", [{ type: "toolCall", id: "call", name: "subagent", arguments: { command: "wait", ids: [protectedId] } }]);
-    expect(c.children.get(protectedId).delivery).toBe("published");
+    const protectedRun = runs[0]!;
+    c.responded("toolUse", [{ type: "toolCall", id: "call", name: "subagent", arguments: { command: "wait", ids: [protectedRun.handle] } }]);
+    expect(c.children.get(protectedRun.handle).delivery).toBe("published");
     expect(c.start()).toBeDefined();
-    expect(c.children.get(protectedId).result.id).toBe(protectedId);
+    expect(c.children.get(protectedRun.result.id)).toBe(protectedRun);
     await c.close();
   });
 

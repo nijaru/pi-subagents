@@ -39,7 +39,8 @@ export interface ChildExecutionOutcome {
   exitCode: number;
   stopReason?: StopReason;
   errorMessage?: string;
-  errorKind?: "startup" | "provider" | "protocol" | "deadline" | "cancelled" | "tool" | "unknown";
+  errorKind?: "startup" | "provider" | "protocol" | "deadline" | "cancelled" | "unknown";
+  timeoutPhase?: "startup" | "execution";
 }
 export interface ChildExecutionResult extends ChildExecutionData, ChildExecutionOutcome {}
 
@@ -116,7 +117,8 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
     } catch (error) {
       const cancelled = signal.aborted;
       return { ...snapshot(), outcome: cancelled ? "cancelled" : "failed", exitCode: 1, stopReason: cancelled ? "aborted" : "error",
-        errorMessage: boundedDiagnostic(error instanceof Error ? error.message : String(error)) ?? "Child failed." };
+        errorMessage: boundedDiagnostic(error instanceof Error ? error.message : String(error)) ?? "Child failed.",
+        errorKind: cancelled ? "cancelled" : "unknown" };
     }
   }
 }
@@ -126,14 +128,18 @@ export function classifyExecution(process: ProcessResult, report?: ChildReport, 
   if (process.outcome === "timed_out" || process.outcome === "cancelled") return {
     outcome: process.outcome, exitCode: process.exitCode, stopReason: process.stopReason,
     errorMessage: boundedDiagnostic(process.errorMessage), errorKind: process.outcome === "timed_out" ? "deadline" : "cancelled",
+    ...(process.timeoutPhase === undefined ? {} : { timeoutPhase: process.timeoutPhase }),
   };
   if (protocolFailure !== undefined) return {
     outcome: "failed", exitCode: process.exitCode || 1, stopReason: "error",
-    errorMessage: withCredentialHint(boundedDiagnostic(protocolFailure) || "Child failed."), errorKind: "protocol",
+    errorMessage: withCredentialHint(boundedDiagnostic(protocolFailure) || "Child failed."), errorKind: ready ? "protocol" : "startup",
   };
   if (process.outcome !== "completed") return {
     outcome: "failed", exitCode: process.exitCode || 1, stopReason: "error",
     errorMessage: withCredentialHint(boundedDiagnostic(process.errorMessage) || "Child failed."), errorKind: ready ? "protocol" : "startup",
+  };
+  if (report?.stopReason === "error") return {
+    outcome: "failed", exitCode: 0, stopReason: "error", errorMessage: boundedDiagnostic(report.errorMessage) ?? "Provider error.", errorKind: "provider",
   };
   if (report?.stopReason === "length") return {
     outcome: "incomplete", exitCode: 0, stopReason: "length", errorMessage: "Child reached the model output limit; response is incomplete.", errorKind: "provider",

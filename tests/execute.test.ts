@@ -219,6 +219,8 @@ describe("background lifecycle", () => {
     await Bun.sleep(300);
     h.boundary();
     expect(h.notices).toHaveLength(0);
+    const nested = h.toolResult({ toolName: "read", parentToolCallId: "parent/1", content: [{ type: "text", text: "nested" }] });
+    expect(nested?.content).toBeUndefined();
     const event = { toolName: "read", content: [{ type: "text", text: "file" }], structuredContent: { ok: true } };
     const injected = h.toolResult(event);
     expect(injected.content.at(-1).text).toContain(handle);
@@ -233,6 +235,7 @@ describe("background lifecycle", () => {
     expect(handle).toMatch(/^sa-\d+$/);
     expect(first(await h.execute({ command: "status", id: handle })).handle).toBe(handle);
     expect(first(await h.execute({ command: "wait", ids: [handle] })).output).toBe("handle report");
+    expect(first(await h.execute({ command: "stop", id: handle })).state).toMatchObject({ status: "terminal", outcome: "completed" });
   });
   test("a delivering wait claims the result and suppresses the notice", async () => {
     const h = host();

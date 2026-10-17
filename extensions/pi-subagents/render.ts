@@ -139,7 +139,8 @@ function renderChildren(details: unknown, expanded: boolean, theme: Theme, targe
   let remaining = MAX_OUTPUT_BYTES;
   for (const child of results) {
     const active = child.state.status === "running";
-    const heading = childHeading(child, theme, { expanded, showId: notification || child.id !== targetId, notification, command: data?.command });
+    const targeted = targetId !== undefined && (child.id === targetId || child.handle === targetId);
+    const heading = childHeading(child, theme, { expanded, showId: notification || !targeted, notification, command: data?.command });
     if (expanded) {
       container.addChild(new Text(heading, 0, 0));
     } else {

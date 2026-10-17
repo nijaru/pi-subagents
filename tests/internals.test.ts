@@ -47,6 +47,21 @@ describe("compact child protocol", () => {
     expect(report.outputTruncation.retainedBytes).toBeLessThanOrEqual(50 * 1024);
     expect(report.output).not.toContain("�");
   });
+  test("output frames carry partial reports", () => {
+    const report = { output: "partial", outputTruncation: { truncated: false, originalBytes: 7, retainedBytes: 7 } };
+    expect(parseChildEvent(JSON.stringify({ version: 2, kind: "output", report }))).toMatchObject({ kind: "output", report });
+  });
+  test("errorKind distinguishes startup, protocol, provider, and deadline failures", () => {
+    const failed = { outcome: "failed" as const, exitCode: 1, stderr: "" };
+    expect(classifyExecution(failed, undefined, "Requested child tools are unavailable", false).errorKind).toBe("startup");
+    expect(classifyExecution(failed, undefined, "malformed frame", true).errorKind).toBe("protocol");
+    const providerError = assistantReport({ ...assistant, stopReason: "error", errorMessage: "overloaded" });
+    expect(classifyExecution({ ...failed, outcome: "completed" }, providerError).errorKind).toBe("provider");
+    expect(classifyExecution({ ...failed, outcome: "timed_out", errorMessage: "late", timeoutPhase: "startup" })).toMatchObject({
+      errorKind: "deadline", timeoutPhase: "startup",
+    });
+  });
+
   test("timeouts and cancellation outrank assistant and protocol errors", () => {
     for (const outcome of ["timed_out", "cancelled"] as const) {
       for (const report of [assistantReport({ ...assistant, stopReason: "error", errorMessage: "earlier" }), assistantReport(assistant)]) {
