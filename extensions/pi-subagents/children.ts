@@ -8,6 +8,12 @@ import { truncateOutput } from "./bounds.ts";
 
 export interface ChildRun {
   result: ChildResult;
+  /** Short session-scoped handle, assigned once and never reused. */
+  handle: string;
+  /** How a completed result is surfaced to the parent. */
+  notify: "inbox" | "turn";
+  /** Inbox notifications are emitted at most once per child. */
+  inboxNotified: boolean;
   /** Result delivery is independent of process completion and waiter lifetime. */
   delivery: "unread" | "offered" | "published" | "delivered";
   controller: AbortController;
@@ -29,6 +35,10 @@ export interface StartChild {
   strictThinking?: boolean;
   /** Per-task execution deadline; omitted uses the global child deadline. */
   executionTimeoutMs?: number;
+  /** Startup deadline for watchdog/SDK/MCP readiness. */
+  startupTimeoutMs?: number;
+  /** Inbox (default) or a forced parent turn. */
+  notify?: "inbox" | "turn";
   emit?: (result: ChildResult, progress: string) => void;
 }
 
@@ -37,6 +47,7 @@ export class SessionChildren {
   private readonly runs = new Map<string, ChildRun>();
   private closed = false;
   private pendingUsage: Usage | undefined;
+  private nextHandle = 1;
 
   constructor(private readonly supervisor: ChildSupervisor, private readonly available: (result: ChildResult) => void) {}
 
@@ -51,19 +62,22 @@ export class SessionChildren {
       if (!oldest) throw new Error("Retained child results are unread or still running. Read completed results with wait before starting more children.");
       this.runs.delete(oldest.result.id);
     }
+    const handle = `sa-${this.nextHandle++}`;
+    const notify = options.notify ?? "inbox";
     const result: ChildResult = {
-      id: randomUUID(), prompt: options.prompt, cwd: options.cwd, tools: [...options.tools],
-      model: options.model, state: { status: "running" }, stderr: "", usage: emptyUsage(),
+      id: randomUUID(), handle, prompt: options.prompt, cwd: options.cwd, tools: [...options.tools],
+      phase: "starting", notify, model: options.model, state: { status: "running" }, stderr: "", usage: emptyUsage(),
     };
     const completion = Promise.withResolvers<void>();
     const run: ChildRun = {
-      result, delivery: "unread", controller: new AbortController(), settled: false,
+      result, handle, notify, inboxNotified: false, delivery: "unread", controller: new AbortController(), settled: false,
       promise: completion.promise, waiters: new Set(), activeWaits: 0,
     };
     const task: ChildTask = Object.freeze({
       id: result.id, prompt: options.prompt, cwd: options.cwd, tools: Object.freeze([...options.tools]),
       model: options.model, thinking: options.thinking, strictThinking: options.strictThinking,
       executionTimeoutMs: options.executionTimeoutMs,
+      startupTimeoutMs: options.startupTimeoutMs,
     });
     // Register before execution can emit, await, or invoke extension callbacks.
     this.runs.set(result.id, run);
@@ -77,7 +91,7 @@ export class SessionChildren {
       try { emit(this.snapshot(run), progress); } catch { emit = undefined; }
     };
     try {
-      const { outcome, exitCode, stopReason, ...data } = await this.supervisor.run({
+      const { outcome, exitCode, stopReason, errorKind, ...data } = await this.supervisor.run({
         task, signal: run.controller.signal,
         onUpdate: (data, progress) => {
           run.result = copyResult({ ...run.result, ...data });
@@ -87,10 +101,14 @@ export class SessionChildren {
       run.result = copyResult({
         ...run.result, ...data,
         state: { status: "terminal", outcome, exitCode, stopReason, finishedAt: Date.now() },
+        ...(errorKind === undefined ? {} : { errorKind }),
       });
+      delete run.result.phase;
     } catch (error) {
       const cancelled = run.controller.signal.aborted;
       run.result.errorMessage = truncateOutput(error instanceof Error ? error.message : String(error), MAX_DIAGNOSTIC_BYTES);
+      run.result.errorKind = cancelled ? "cancelled" : "unknown";
+      delete run.result.phase;
       run.result.state = {
         status: "terminal", outcome: cancelled ? "cancelled" : "failed", exitCode: 1,
         stopReason: cancelled ? "aborted" : "error", finishedAt: Date.now(),
@@ -120,8 +138,17 @@ export class SessionChildren {
   pendingCompletions(): ChildResult[] {
     if (this.closed) return [];
     return [...this.runs.values()]
-      .filter((run) => run.settled && run.delivery === "unread" && run.activeWaits === 0)
+      .filter((run) => run.notify === "turn" && run.settled && run.delivery === "unread" && run.activeWaits === 0)
       .map((run) => this.snapshot(run));
+  }
+
+  /** Terminal inbox results not yet advertised in a tool result. */
+  pendingInbox(): ChildResult[] {
+    if (this.closed) return [];
+    const pending = [...this.runs.values()]
+      .filter((run) => run.notify === "inbox" && run.settled && run.delivery === "unread" && run.activeWaits === 0 && !run.inboxNotified);
+    for (const run of pending) run.inboxNotified = true;
+    return pending.map((run) => this.snapshot(run));
   }
 
   /** Published notices suppress duplicates but are not yet acknowledged. */
@@ -172,9 +199,9 @@ export class SessionChildren {
     return usage;
   }
 
-  get(id: string): ChildRun {
-    const run = this.runs.get(id);
-    if (!run) throw new Error(`Unknown child id: ${id}. Handles are session-scoped; oldest completed handles are evicted after ${MAX_RETAINED_RUNS}.`);
+  get(idOrHandle: string): ChildRun {
+    const run = this.runs.get(idOrHandle) ?? [...this.runs.values()].find((candidate) => candidate.handle === idOrHandle);
+    if (!run) throw new Error(`Unknown child: ${idOrHandle}. Handles are session-scoped; oldest completed handles are evicted after ${MAX_RETAINED_RUNS}.`);
     return run;
   }
 

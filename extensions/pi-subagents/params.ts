@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
-import { MAX_PROCESS_TIMEOUT_MS, MAX_RETAINED_RUNS, MAX_TASK_BYTES, MAX_WAIT_MS } from "./limits.ts";
+import { MAX_PROCESS_TIMEOUT_MS, MAX_RETAINED_RUNS, MAX_STARTUP_TIMEOUT_MS, MAX_TASK_BYTES, MAX_WAIT_MS } from "./limits.ts";
 import { THINKING_LEVELS } from "./types.ts";
 
 export const SubagentParamsSchema = Type.Object({
@@ -24,13 +24,18 @@ export const SubagentParamsSchema = Type.Object({
     minItems: 1, maxItems: MAX_RETAINED_RUNS, uniqueItems: true,
   })),
   timeoutMs: Type.Optional(Type.Integer({ description: "wait only: shared wait budget, not a child deadline. Default 5 minutes, maximum 10; wakes early on completion. Cancelling wait leaves children running. It never sets or changes execution deadlines.", minimum: 1, maximum: MAX_WAIT_MS })),
-  executionTimeoutMs: Type.Optional(Type.Integer({ description: "run/spawn only: per-task execution deadline that stops the child at expiry. Positive integer milliseconds, at most 2 hours; defaults to PI_SUBAGENT_TIMEOUT_MS (30 minutes). Distinct from wait's timeoutMs. A timed-out result keeps partial output and reports elapsed runtime and the deadline.", minimum: 1, maximum: MAX_PROCESS_TIMEOUT_MS })),
+  executionTimeoutMs: Type.Optional(Type.Integer({ description: "run/spawn only: model/tool execution deadline, starting once the child is ready. Positive integer milliseconds, at most 2 hours; defaults to PI_SUBAGENT_TIMEOUT_MS (30 minutes). Separate from startup, join, and wait budgets. A timed-out result keeps partial output and reports elapsed runtime and the deadline.", minimum: 1, maximum: MAX_PROCESS_TIMEOUT_MS })),
+  startupTimeoutMs: Type.Optional(Type.Integer({ description: "run/spawn only: deadline for process, watchdog, SDK, extension, and MCP readiness before the task starts. Positive integer milliseconds, at most 5 minutes; defaults to PI_SUBAGENT_STARTUP_TIMEOUT_MS (30 seconds).", minimum: 1, maximum: MAX_STARTUP_TIMEOUT_MS })),
+  joinTimeoutMs: Type.Optional(Type.Integer({ description: "run only: how long this call waits before returning the running child for background delivery. Does not change the execution deadline. Defaults to PI_SUBAGENT_FOREGROUND_MS (60 seconds).", minimum: 1, maximum: MAX_WAIT_MS })),
+  notify: Type.Optional(StringEnum(["inbox", "turn"] as const, { description: "Completion delivery: inbox (default) advertises unread results on the next tool result; turn requests one continuation turn when the child finishes." })),
 }, { additionalProperties: false });
 
 export type SubagentParams = Static<typeof SubagentParamsSchema>;
 
+// Least privilege: a delegated task can read, search, and browse by default.
+// Mutation tools (bash/edit/write) must be requested explicitly.
 const DEFAULT_TOOLS = [
-  "read", "bash", "edit", "write", "grep", "find", "ls",
+  "read", "grep", "find", "ls",
   "web_search", "web_fetch", "web_research", "resolve-library-id", "query-docs",
 ];
 
@@ -49,11 +54,12 @@ export function validateCommand(params: SubagentParams): void {
   if (start) {
     if (!params.prompt?.trim()) throw new Error(`${params.command} requires a non-blank prompt.`);
     if (Buffer.byteLength(params.prompt, "utf8") > MAX_TASK_BYTES) throw new Error(`Prompt must be at most ${MAX_TASK_BYTES} bytes.`);
-    if (params.id !== undefined || params.ids !== undefined || params.timeoutMs !== undefined) throw new Error(`${params.command} accepts only prompt, tools, model, thinking, cwd and executionTimeoutMs.`);
+    if (params.id !== undefined || params.ids !== undefined || params.timeoutMs !== undefined) throw new Error(`${params.command} accepts only prompt, tools, model, thinking, cwd, notify, startupTimeoutMs and executionTimeoutMs.`);
+    if (params.command === "spawn" && params.joinTimeoutMs !== undefined) throw new Error("spawn does not join; joinTimeoutMs is only accepted by run.");
     if (params.model !== undefined && !params.model.trim()) throw new Error("Model must not be blank.");
     if (params.cwd !== undefined && !params.cwd.trim()) throw new Error("Working directory must not be blank.");
   } else {
-    if (params.prompt !== undefined || params.tools !== undefined || params.model !== undefined || params.thinking !== undefined || params.cwd !== undefined || params.executionTimeoutMs !== undefined) throw new Error(`${params.command} does not accept child creation options.`);
+    if (params.prompt !== undefined || params.tools !== undefined || params.model !== undefined || params.thinking !== undefined || params.cwd !== undefined || params.executionTimeoutMs !== undefined || params.startupTimeoutMs !== undefined || params.joinTimeoutMs !== undefined || params.notify !== undefined) throw new Error(`${params.command} does not accept child creation or join options.`);
     if (params.command === "wait") {
       if (params.id !== undefined || !params.ids?.length) throw new Error('wait requires ids: ["<child-id>", ...], not id.');
       if (params.ids.some((id) => !id.trim())) throw new Error("Child ids must not be blank.");

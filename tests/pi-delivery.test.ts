@@ -30,7 +30,7 @@ test.each(["wait", "unread", "batch", "abort-before", "abort-after"])("real Pi d
         parentRequests++;
         requests.push(body);
         if (parentRequests === 1) {
-          delta = { tool_calls: Array.from({ length: expectedChildren }, (_, i) => call(`spawn_${i}`, "subagent", { command: "spawn", prompt: `Independent child ${i}`, tools: [] }, i)) };
+          delta = { tool_calls: Array.from({ length: expectedChildren }, (_, i) => call(`spawn_${i}`, "subagent", { command: "spawn", prompt: `Independent child ${i}`, tools: [], notify: "turn" }, i)) };
           finish = "tool_calls";
         } else if (parentRequests === 2) {
           releaseChild.resolve();

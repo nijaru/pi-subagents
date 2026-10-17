@@ -32,7 +32,7 @@ function controlled() {
   };
   delivery = new CompletionDelivery(children);
   delivery.bind(ctx);
-  const start = () => children.start({ prompt: "inspect", tools: [], cwd: process.cwd() });
+  const start = (options: { notify?: "inbox" | "turn" } = {}) => children.start({ prompt: "inspect", tools: [], cwd: process.cwd(), notify: "turn", ...options });
   const responded = (stopReason = "stop", content?: unknown[]) => delivery.responded({ type: "message_end", message: { role: "assistant", stopReason, ...(content ? { content } : {}) } } as any, ctx);
   const boundary = (outcome = "completed", drafts: any[] = []) => {
     responded(outcome === "completed" ? "stop" : outcome);

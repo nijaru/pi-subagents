@@ -79,14 +79,16 @@ export interface PiProcessRequest {
   bootstrap: ChildBootstrap;
   cwd: string;
   childRunId: string;
-  /** Execution deadline; the process timer below is its only owner. */
+  /** Startup deadline: process, watchdog, SDK, extensions, and MCP readiness. */
+  startupTimeoutMs: number;
+  /** Execution deadline: starts at the child's ready frame. */
   timeoutMs: number;
   signal?: AbortSignal;
   onEvent: (event: ChildEvent) => void;
 }
 
 export async function runPiProcess(request: PiProcessRequest): Promise<ProcessResult> {
-  const { bootstrap, cwd, childRunId, timeoutMs, signal, onEvent } = request;
+  const { bootstrap, cwd, childRunId, startupTimeoutMs, timeoutMs, signal, onEvent } = request;
   if (signal?.aborted) return { exitCode: 1, stopReason: "aborted", outcome: "cancelled", errorMessage: "Subagent aborted.", stderr: "" };
 
   const startedAt = Date.now();
@@ -101,9 +103,12 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
     let trailing = "";
     let killTimer: ReturnType<typeof setTimeout> | undefined;
     let processTimer: ReturnType<typeof setTimeout> | undefined;
+    let startupTimer: ReturnType<typeof setTimeout> | undefined;
     let forceTimer: ReturnType<typeof setTimeout> | undefined;
     let terminalTimer: ReturnType<typeof setTimeout> | undefined;
     let timedOut = false;
+    let timeoutPhase: "startup" | "execution" = "execution";
+    let deadlineMs = timeoutMs;
     let terminalSeen = false;
     let processFailure: string | undefined;
     let finishedAt: number | undefined;
@@ -121,7 +126,7 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
     // Cancellation and deadline remain authoritative even after a completed
     // report; cleanup must never turn a finished task into a timeout.
     const termination = (): Partial<ProcessResult> => timedOut
-      ? { outcome: "timed_out", exitCode: 1, stopReason: "error", errorMessage: timeoutSummary((finishedAt ?? Date.now()) - startedAt, timeoutMs) }
+      ? { outcome: "timed_out", exitCode: 1, stopReason: "error", errorMessage: timeoutSummary((finishedAt ?? Date.now()) - startedAt, deadlineMs, timeoutPhase) }
       : aborted || signal?.aborted
         ? { outcome: "cancelled", exitCode: 1, stopReason: "aborted", errorMessage: "Subagent aborted." }
         : processFailure
@@ -136,6 +141,7 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
       watchdog?.stdin?.end();
       if (killTimer) clearTimeout(killTimer);
       if (processTimer) clearTimeout(processTimer);
+      if (startupTimer) clearTimeout(startupTimer);
       if (forceTimer) clearTimeout(forceTimer);
       if (terminalTimer) clearTimeout(terminalTimer);
       if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
@@ -209,7 +215,9 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
       child.once("exit", () => {
         finishedAt ??= Date.now();
         if (processTimer) clearTimeout(processTimer);
+        if (startupTimer) clearTimeout(startupTimer);
         processTimer = undefined;
+        startupTimer = undefined;
         sweepRoot();
       });
       child.once("close", sweepRoot);
@@ -233,8 +241,18 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
       forceTimer.unref?.();
     };
     const stopForAbort = () => { if (!settled) { aborted = true; finishedAt ??= Date.now(); stopTree(); } };
-    const stopForTimeout = () => { if (!settled) { timedOut = true; finishedAt ??= Date.now(); stopTree(); } };
-    processTimer = setTimeout(stopForTimeout, timeoutMs);
+    const stopForTimeout = (phase: "startup" | "execution") => {
+      if (settled) return;
+      timedOut = true;
+      timeoutPhase = phase;
+      deadlineMs = phase === "startup" ? startupTimeoutMs : timeoutMs;
+      finishedAt ??= Date.now();
+      stopTree();
+    };
+    // The task lifecycle has two clocks: readiness must not consume the model
+    // execution budget, and a timeout must name the phase it actually hit.
+    startupTimer = setTimeout(() => stopForTimeout("startup"), startupTimeoutMs);
+    startupTimer.unref?.();
     const deliverLine = (line: string, oversized = false) => {
       if (settled || processFailure) return;
       try {
@@ -253,6 +271,12 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
           }
         }
         onEvent(event);
+        if (event.kind === "ready" && processTimer === undefined) {
+          if (startupTimer) clearTimeout(startupTimer);
+          startupTimer = undefined;
+          processTimer = setTimeout(() => stopForTimeout("execution"), timeoutMs);
+          processTimer.unref?.();
+        }
       } catch (error) {
         processFailure = `Subagent event handling failed: ${error instanceof Error ? error.message : String(error)}`;
         stopTree();

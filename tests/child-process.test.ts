@@ -7,7 +7,7 @@ import { SubprocessChildSupervisor, type ChildTask } from "../extensions/pi-suba
 import { emptyUsage } from "../extensions/pi-subagents/types.ts";
 import { getChildInvocation } from "../extensions/pi-subagents/subprocess.ts";
 
-async function fixture(script: string, callback: (task: ChildTask, supervisor: SubprocessChildSupervisor) => Promise<void>) {
+async function fixture(script: string, callback: (task: ChildTask, supervisor: SubprocessChildSupervisor) => Promise<void>, options: { ready?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "child-protocol-process-"));
   const oldRunner = process.env.PI_SUBAGENT_RUNNER;
   const oldTimeout = process.env.PI_SUBAGENT_TIMEOUT_MS;
@@ -17,7 +17,7 @@ async function fixture(script: string, callback: (task: ChildTask, supervisor: S
     let input=''; for await (const chunk of process.stdin) input += chunk;
     const request=JSON.parse(input);
     const send = value => writeSync(3, JSON.stringify({version:2,...value})+'\\n');
-    send({kind:'ready',model:request.model,thinking:'off',tools:request.tools});
+    ${options.ready === false ? "" : "send({kind:'ready',model:request.model,thinking:'off',tools:request.tools});"}
     ${script}`);
   process.env.PI_SUBAGENT_RUNNER = file;
   process.env.PI_SUBAGENT_TIMEOUT_MS = "10000";
@@ -129,7 +129,7 @@ test("process timeout outranks earlier protocol error", async () => {
     process.env.PI_SUBAGENT_TIMEOUT_MS = "200";
     const outcome = await supervisor.run({ task, signal: new AbortController().signal });
     expect(outcome.outcome).toBe("timed_out");
-    expect(outcome.errorMessage).toMatch(/^Subagent timed out\. Elapsed \d+(ms|s|m \d+s|h \d+m \d+s); execution deadline 200ms\.$/);
+    expect(outcome.errorMessage).toMatch(/^Subagent timed out during execution\. Elapsed \d+(ms|s|m \d+s|h \d+m \d+s); execution deadline 200ms\.$/);
   });
 });
 test("a per-task execution deadline overrides the global default in both directions", async () => {
@@ -144,6 +144,7 @@ test("a per-task execution deadline overrides the global default in both directi
     process.env.PI_SUBAGENT_TIMEOUT_MS = "10000";
     const outcome = await supervisor.run({ task: { ...task, executionTimeoutMs: 200 }, signal: new AbortController().signal });
     expect(outcome.outcome).toBe("timed_out");
+    expect(outcome.errorMessage).toContain("during execution");
     expect(outcome.errorMessage).toContain("execution deadline 200ms");
   });
 });
@@ -202,6 +203,19 @@ test("auth-shaped protocol errors carry the credential hint", async () => {
     expect(outcome.outcome).toBe("failed");
     expect(outcome.errorMessage).toContain("PI_SUBAGENT_PASSTHROUGH_ENV");
   });
+});
+
+test("a startup deadline is distinct from execution and keeps the child from starting", async () => {
+  await fixture(`setInterval(()=>{},1000);`, async (task, supervisor) => {
+    const outcome = await supervisor.run({
+      task: { ...task, startupTimeoutMs: 200, executionTimeoutMs: 10000 },
+      signal: new AbortController().signal,
+    });
+    expect(outcome.outcome).toBe("timed_out");
+    expect(outcome.errorKind).toBe("deadline");
+    expect(outcome.errorMessage).toContain("during startup");
+    expect(outcome.errorMessage).toContain("startup deadline 200ms");
+  }, { ready: false });
 });
 
 test("a deadline keeps the last streamed output as partial output", async () => {

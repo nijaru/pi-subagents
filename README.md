@@ -18,43 +18,59 @@ Ask Pi to delegate a specific task, or use these tool-call shapes:
 {"command":"run","prompt":"Review the parser changes. Report concrete regressions with file/line and evidence. Do not edit files.","tools":["read"]}
 ```
 
-`run` joins the child within a foreground budget (60 seconds by default) and returns its final result. If the budget expires first, the child keeps working in the background and reports completion like `spawn`. For independent work while the parent continues:
+`run` starts a child and joins it for up to `joinTimeoutMs` (60 seconds by default, or `PI_SUBAGENT_FOREGROUND_MS`). If the join expires, the child keeps working and the call returns a running handle. `joinTimeoutMs` is a join budget, never an execution deadline. Cancelling the call cancels the child.
+
+For independent work while the parent continues:
 
 ```json
 {"command":"spawn","prompt":"Implement the parser regression test in tests/parser.test.ts. Own only that file, run its tests, and report changes and results.","cwd":"../parser-worktree","executionTimeoutMs":900000}
 {"command":"status"}
-{"command":"wait","ids":["<child-id>"]}
-{"command":"stop","id":"<child-id>"}
+{"command":"wait","ids":["sa-1"]}
+{"command":"stop","id":"sa-1"}
 ```
 
-Unread background results arrive at the next successful active-turn boundary. Results ready together share one completion message and continuation. **Completions never wake an idle parent.** Results finishing after the last boundary, or during parent errors or cancellation, remain unread until another natural turn or an explicit `wait`. This avoids undoing a late idle abort that Pi does not expose to extensions.
+Every child gets a short session-scoped handle (`sa-1`, `sa-2`, …) that `wait`, `status`, and `stop` accept in place of the full UUID. Handles are never reused while retained. Up to 32 handles are retained; the oldest completed, read handle is evicted to admit new work. Unread results are never evicted.
 
-A committed notice suppresses duplicates, but remains unread until a successful subsequent assistant response with the notice still in Pi's projected history, or an explicit join. Cancellation before that response preserves the report. If compaction or a context edit removes the notice first, use `wait` to retrieve and acknowledge it. The TUI status indicator shows the unread count.
+### Completion delivery
 
-Spawn independent tasks before waiting. Calls can execute in parallel when Pi's tool scheduling permits it; one foreground child no longer forces sibling tool calls to run sequentially.
+`notify` controls how a finished child reaches the parent:
 
-Use `wait` before finishing a task that depends on child results. Pass one or more `ids`: the call wakes when **any** selected child finishes, returns all ready reports, and identifies those still running. It waits up to five minutes by default, or up to ten minutes with `timeoutMs`. A longer budget does not delay early completion. Wait again only on remaining ids when their results block progress, rather than polling. `wait_expired: true` means the wait budget expired without a completed child; it is not a child execution timeout.
+- **`inbox`** (default): the child does not spend a parent turn. The next tool result advertises unread handles, the footer shows the count, and `wait` retrieves the reports. `/subagents` lists retained children and unread state. An idle parent is never woken.
+- **`turn`**: Pi offers one continuation turn at an active boundary when the child finishes, as in earlier releases. Unread results are batched into one notice. Aborts, provider errors, and dropped notices leave the report unread for an explicit `wait`.
 
-`run` and `spawn` take an optional `executionTimeoutMs`: a positive per-task execution deadline in milliseconds, at most two hours, defaulting to 30 minutes or to `PI_SUBAGENT_TIMEOUT_MS` when set. It is separate from `wait`'s `timeoutMs`, which only bounds one join; `status`, `wait`, and `stop` never change a child's deadline. The deadline covers the whole child lifetime, including watchdog readiness, SDK/extension loading, and MCP tool registration, not only model turns. At expiry the child is stopped and its result keeps any partial output, with the cause naming the elapsed runtime and the applied deadline.
+Inbox delivery makes background work visible without adding a model turn and avoids the retraction/acknowledgment races of pushed notices. Turn delivery is opt-in when the child must resume the parent immediately.
 
-Cancelling a wait does **not** cancel its children; `stop` cancels one child and waits for cleanup. Cancelling `run` cancels its child.
+Use `wait` before finishing a task that depends on child results. Pass one or more ids or handles: the call wakes when **any** selected child finishes, returns all ready reports, and identifies those still running. It waits up to five minutes by default, or up to ten minutes with `timeoutMs`. A longer budget does not delay early completion. Wait again only on remaining ids when their results block progress, rather than polling. `wait_expired: true` means the wait budget expired without a completed child; it is not an execution timeout.
 
-`run`, `wait`, and `stop` mark completed reports they return as read, suppressing their pending automatic notices even if children finished before the call. A multi-child wait does not consume unfinished reports. `status` only inspects state; it does not consume a report. Completion notices carry results inline and point at `wait` only when an excerpt was truncated. Once a report has entered the parent's transcript, explicitly reading it again still returns the retained copy but does not generate another notice.
+`status` inspects one child or lists retained children. `stop` cancels one child and joins cleanup; it is safe to repeat. `run`, `wait`, and `stop` mark the completed reports they return as read. `status` does not consume a report.
+
+### Time budgets
+
+Four independent budgets avoid conflating readiness, work, joining, and cleanup:
+
+| Budget | Default | Scope |
+| --- | --- | --- |
+| `startupTimeoutMs` | 30 seconds (`PI_SUBAGENT_STARTUP_TIMEOUT_MS`) | Process, watchdog, SDK, extensions, and MCP readiness before the task starts |
+| `executionTimeoutMs` | 30 minutes (`PI_SUBAGENT_TIMEOUT_MS`) | Model/tool work, starting when the child reports ready |
+| `joinTimeoutMs` | 60 seconds (`PI_SUBAGENT_FOREGROUND_MS`) | How long a `run` call blocks before returning a running handle |
+| `timeoutMs` | 5 minutes | How long one `wait` call joins; never changes a child deadline |
+
+`startupTimeoutMs` and `executionTimeoutMs` are run/spawn options within 5 minutes and 2 hours respectively. `joinTimeoutMs` applies only to `run`. At expiry the child is stopped and its result keeps partial output, with the cause naming the phase, elapsed runtime, and applied deadline. Cancel a wait without stopping its children; use `stop` for that. Cancelling `run` cancels its child.
 
 Handles belong to the current parent session. All children stop on quit, reload, or session replacement. Background work requires a live parent process; a one-shot print invocation is not a persistent worker host.
 
-The TUI hides agent-facing text — delegated prompts and child reports — behind expansion. Each child is one status line: live work and status listings carry a one-line task label, finished children show only outcome and duration, with the error message added for failures. Expand for the full prompt and report, full IDs, diagnostics, working directory, tools, and usage. Short IDs are display-only; tool calls still require the full ID. Completion notices occupy one line, with results available on expansion.
+The TUI hides agent-facing text — delegated prompts and child reports — behind expansion. Each child is one status line: live work and status listings carry a handle, phase, and one-line task label; finished children show outcome and duration, with the error message added for failures. Expand for the full prompt and report, diagnostics, working directory, tools, and usage. Completion notices occupy one line, with results available on expansion.
 
 ### Programmatic results
 
-Codemode calls receive `{ command, results, waitExpired? }`, not report text. Each child carries its id, lifecycle `state`, bounded report and diagnostics, truncation metadata, and usage. The same bounded envelope is returned as tool `details`; the model still receives a text summary. Child reports do not have to be JSON. When launch context cannot fit, `omittedFields` identifies removed `prompt`, `cwd`, or `tools` fields; their empty placeholders are not execution values.
+Codemode calls receive `{ command, results, waitExpired? }`, not report text. Each child carries its id, short handle, lifecycle `state`, live `phase`, structured `errorKind`, bounded report and diagnostics, truncation metadata, and usage. The same bounded envelope is returned as tool `details`; the model still receives a text summary. Child reports do not have to be JSON. When launch context cannot fit, `omittedFields` identifies removed `prompt`, `cwd`, or `tools` fields; their empty placeholders are not execution values.
 
 ```javascript
 const result = await tools.subagent({
   command: "run", prompt: "Review src/parser.ts. Return concrete findings; do not edit.", tools: ["read"],
 });
 for (const child of result.results) {
-  text({ id: child.id, state: child.state, report: child.output, error: child.errorMessage });
+  text({ handle: child.handle, state: child.state, report: child.output, error: child.errorMessage });
 }
 ```
 
@@ -68,7 +84,7 @@ Pi cannot attach usage to a custom completion message. Background costs therefor
 
 ### Tools and context
 
-- Defaults are the parent's active tools among `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `web_research`, `resolve-library-id`, and `query-docs`. Research tools require their extensions; they are not supplied by this package.
+- Defaults are the parent's active tools among `read`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `web_research`, `resolve-library-id`, and `query-docs`. Mutation tools (`bash`, `edit`, `write`) must be requested explicitly. Research tools require their extensions; they are not supplied by this package.
 - `tools` selects an explicit allowlist from tools active **or callable** in the parent, including codemode/deferred tools that are not declared to the model. Merely registered or hidden tools are not eligible. Selecting a tool does not activate it in the parent. `tools: []` is reasoning-only. An empty default selection is rejected rather than silently launching an unusable coding child.
 - Children are leaves. The `subagent` tool cannot be passed to them, and nested calls are rejected.
 - `model` optionally selects an exact `provider/model-id`; otherwise the parent's model is inherited. Fuzzy CLI model patterns are not accepted.
@@ -91,8 +107,9 @@ Children are separate processes that share your working tree. The extension coun
 | Resource | Limit |
 |---|---|
 | Active children | 4 per parent session; excess starts are rejected |
-| Retained handles | 32; oldest completed, delivered handles are evicted first; unread results block admission rather than disappearing |
-| Foreground `run` | 60 seconds by default; `PI_SUBAGENT_FOREGROUND_MS` changes it, and expiry hands the child to background work |
+| Retained handles | 32; oldest completed, read handles are evicted first; unread results block admission rather than disappearing |
+| Startup | 30 seconds by default (`PI_SUBAGENT_STARTUP_TIMEOUT_MS`, up to 5 minutes); covers process, watchdog, SDK, extensions, and MCP readiness |
+| Foreground `run` | 60 seconds by default; `PI_SUBAGENT_FOREGROUND_MS` or `joinTimeoutMs` changes it, and expiry returns a running handle |
 | Child execution | 30 minutes by default (`PI_SUBAGENT_TIMEOUT_MS`, up to 2 hours); `executionTimeoutMs` bounds one task within the same limit |
 | One wait call | 5 minutes by default, at most 10 minutes, shared across selected ids; wakes on any completion and never sets or extends child deadlines |
 | Task prompt | 100 KiB |
@@ -118,14 +135,25 @@ Environment variables are allowlisted, with standard model credentials, `$VAR` r
 
 `0.0.x` is pre-release: the tool schema, behavior, and exported `ChildResult` shape are not promised across patch releases. Read this file, not the version number, for what changed.
 
+- **0.0.10**: redesign the parent-facing lifecycle. Inbox completion delivery is the default; `notify: "turn"` preserves pushed notices. Children get short `sa-N` handles. Startup and execution deadlines are separate, `executionTimeoutMs` starts at the ready frame, and `run` accepts `joinTimeoutMs`. Default tools are read/search/web; mutation tools must be requested. Results gain `phase` and structured `errorKind`, and `/subagents` lists retained children. See the 0.0.10 migration notes below.
+- **0.0.9**: settle timed-out and cancelled runs even when an escaped descendant keeps stdio open; stop the execution deadline at leader exit so cleanup cannot fabricate a timeout; report terminating signals, credential hints, and terminal failure causes in `status`; retain partial output from interrupted real children; do not evict a child referenced by the response's own tool calls.
 - **0.0.8**: add per-task `executionTimeoutMs` for `run`/`spawn`, separate from wait budgets. Timeout reports retain partial output and name elapsed runtime and the applied deadline. Validate SDK children and packed artifacts against Pi 1.2.0.
 - **0.0.7**: preserve unread reports when parent cancellation prevents completion delivery. Committed notices suppress duplicates without making unseen reports evictable; a subsequent successful assistant response or explicit join acknowledges them. Resume without duplicate notices, and reclaim acknowledged handles before tools need admission.
-- **0.0.9**: settle timed-out and cancelled runs even when an escaped descendant keeps stdio open; stop the execution deadline at leader exit so cleanup cannot fabricate a timeout; report terminating signals, credential hints, and terminal failure causes in `status`; retain partial output from interrupted real children; do not evict a child referenced by the response's own tool calls.
 - **0.0.6**: count completed compaction usage; preserve UTF-8 diagnostics and failure causes under batch budgets; identify omitted launch context with `omittedFields`. Isolate execution snapshots from session state and tighten foreground progress and watchdog cleanup. Pi 1.0.4 remains supported.
 - **0.0.5**: require Pi 1.0.4; return structured codemode results, including failed child reports; allow explicit selection of parent-callable tools; preserve reasoning-token usage. Children load Pi's canonical CLI built-ins with exact nested tool allowlists. POSIX children wait for a ready parent-death watchdog before starting tasks. See the Pi 1.0.4 migration section below.
 - **0.0.4**: wait for several children at once and set per-child thinking effort. Children now use Pi's SDK and project-trust policy instead of the CLI runner; completion notices arrive only at active parent-turn boundaries, and child usage is added to parent totals on the next tool result. See the migration sections below for changed arguments and runtime requirements.
 - **0.0.2**: `run` joins within a foreground budget and then continues as background work; `ChildResult` carries `state` instead of `exitCode`/`termination`; prompts travel on stdin instead of a temporary file; a blocking join claims the result it delivers; a crashed or killed parent now stops its children; stderr keeps both ends.
 - **0.0.1**: task-first child lifecycle.
+
+## Migration to 0.0.10
+
+- **Default tool set is read-only**: `read`, `grep`, `find`, `ls`, and the research tools. Pass `tools` explicitly with `bash`, `edit`, or `write` for mutating work.
+- **Completion defaults to the inbox**: background results no longer force a parent turn. The next tool result advertises unread handles, `/subagents` lists them, and `wait` reads them. Pass `notify: "turn"` to keep the old pushed-notice behavior.
+- **Handles are short and reusable in calls**: `wait`, `status`, and `stop` accept `sa-N` as well as the full UUID. The UUID remains in details.
+- **`executionTimeoutMs` starts at ready**, not at spawn. Add `startupTimeoutMs` for readiness; the default is 30 seconds. `run` also accepts `joinTimeoutMs`, and `PI_SUBAGENT_FOREGROUND_MS` remains the default join budget.
+- **Results add `handle`, `phase`, `errorKind`, and `notify`**. `phase` is present only while running; `errorKind` distinguishes startup, provider, protocol, deadline, cancelled, tool, and unknown failures.
+- **`/subagents`** reports retained children and unread results. It is human-facing; it does not consume reports.
+- `spawn` rejects `joinTimeoutMs`. `run`/`spawn` reject `timeoutMs`; that field belongs to `wait`.
 
 ## Migration to Pi 1.0.4
 
@@ -148,7 +176,7 @@ Environment variables are allowlisted, with standard model credentials, `$VAR` r
 - Children now require Node and an installed Pi SDK; launching another Pi CLI through `PI_SUBAGENT_BIN` or `PI_BIN` is no longer supported. Unset these overrides. `PI_SUBAGENT_RUNNER` is a developer-only override for a compatible protocol runner, not a CLI path.
 - Use exact `provider/model-id` values. Missing child tools/models fail before the task rather than falling back or silently disappearing.
 - `ChildResult` adds optional `stdout` and `outputTruncation` fields. Handle the new terminal outcome `incomplete` for model output limits; its partial report remains available.
-- Completion delivery is batched, read-aware, and limited to active-turn boundaries. Idle parents are no longer woken automatically. Use `wait` when a child blocks finishing your task. There is no redundant follow-up for a result already returned by `run`, `wait`, or `stop`.
+- Completion delivery in `notify: "turn"` mode is batched, read-aware, and limited to active-turn boundaries; inbox delivery advertises unread results on the next tool result. Idle parents are never woken automatically. Use `wait` when a child blocks finishing your task. There is no redundant follow-up for a result already returned by `run`, `wait`, or `stop`.
 
 ## Migration from the profile/workflow API
 

@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { selectTools, validateCommand, SubagentParamsSchema } from "../extensions/pi-subagents/params.ts";
 import { Check } from "typebox/value";
 import { childEnvironment } from "../extensions/pi-subagents/env.ts";
-import { isChildProcess, processTimeoutMs, DEFAULT_PROCESS_TIMEOUT_MS, MAX_PROCESS_TIMEOUT_MS } from "../extensions/pi-subagents/limits.ts";
+import { isChildProcess, processTimeoutMs, DEFAULT_PROCESS_TIMEOUT_MS, STARTUP_TIMEOUT_ENV, startupTimeoutMs, MAX_PROCESS_TIMEOUT_MS, MAX_STARTUP_TIMEOUT_MS } from "../extensions/pi-subagents/limits.ts";
 
 let env: NodeJS.ProcessEnv;
 const dirs: string[] = [];
@@ -18,7 +18,7 @@ afterEach(() => {
 
 describe("tool selection", () => {
   test("has usable defaults without enabling control tools", () => {
-    expect(selectTools(undefined, ["read", "bash", "edit", "write", "subagent", "intercom", "web_search"], ["mcp__server__lookup"])).toEqual(["read", "bash", "edit", "write", "web_search"]);
+    expect(selectTools(undefined, ["read", "bash", "edit", "write", "subagent", "intercom", "web_search"], ["mcp__server__lookup"])).toEqual(["read", "web_search"]);
     expect(selectTools(undefined, ["read"], ["web_search"])).toEqual(["read"]);
     expect(() => selectTools(undefined, [], ["mcp__server__lookup"])).toThrow("tools: []");
     expect(selectTools([], [], [])).toEqual([]);
@@ -56,9 +56,22 @@ describe("tool selection", () => {
     expect(() => validateCommand({ command: "run", prompt: "x", executionTimeoutMs: 1000 })).not.toThrow();
     expect(() => validateCommand({ command: "spawn", prompt: "x", executionTimeoutMs: 1000 })).not.toThrow();
     expect(() => validateCommand({ command: "run", prompt: "x", timeoutMs: 1000 })).toThrow("executionTimeoutMs");
-    expect(() => validateCommand({ command: "wait", ids: ["x"], executionTimeoutMs: 1000 })).toThrow("does not accept child creation options");
-    expect(() => validateCommand({ command: "status", executionTimeoutMs: 1000 })).toThrow("does not accept child creation options");
-    expect(() => validateCommand({ command: "stop", id: "x", executionTimeoutMs: 1000 })).toThrow("does not accept child creation options");
+    expect(() => validateCommand({ command: "wait", ids: ["x"], executionTimeoutMs: 1000 })).toThrow("does not accept child creation or join options");
+    expect(() => validateCommand({ command: "status", executionTimeoutMs: 1000 })).toThrow("does not accept child creation or join options");
+    expect(() => validateCommand({ command: "stop", id: "x", executionTimeoutMs: 1000 })).toThrow("does not accept child creation or join options");
+  });
+  test("startup, join, and notify options are scoped to their commands", () => {
+    for (const value of [1, 1000, MAX_STARTUP_TIMEOUT_MS]) {
+      expect(Check(SubagentParamsSchema, { command: "run", prompt: "x", startupTimeoutMs: value })).toBe(true);
+    }
+    for (const value of [0, -1, 1.5, MAX_STARTUP_TIMEOUT_MS + 1]) {
+      expect(Check(SubagentParamsSchema, { command: "spawn", prompt: "x", startupTimeoutMs: value })).toBe(false);
+    }
+    expect(Check(SubagentParamsSchema, { command: "run", prompt: "x", joinTimeoutMs: 1000, notify: "turn" })).toBe(true);
+    expect(() => validateCommand({ command: "spawn", prompt: "x", joinTimeoutMs: 1000 })).toThrow("spawn does not join");
+    expect(() => validateCommand({ command: "wait", ids: ["x"], notify: "inbox" })).toThrow("does not accept child creation or join options");
+    process.env[STARTUP_TIMEOUT_ENV] = "1234";
+    expect(startupTimeoutMs()).toBe(1234);
   });
 });
 

@@ -9,6 +9,8 @@ export const MAX_PROTOCOL_LINE_BYTES = 1024 * 1024;
 export const MAX_TASK_BYTES = 100 * 1024;
 export const DEFAULT_PROCESS_TIMEOUT_MS = 30 * 60 * 1000;
 export const MAX_PROCESS_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+export const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
+export const MAX_STARTUP_TIMEOUT_MS = 5 * 60 * 1000;
 export const DEFAULT_WAIT_MS = 300_000;
 export const MAX_WAIT_MS = 600_000;
 /** How long a foreground `run` blocks the parent turn before handing off to background work. */
@@ -18,6 +20,7 @@ export const RUNNING_PROGRESS_TEXT = "Working...";
 export const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
 export const RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
 export const TIMEOUT_ENV = "PI_SUBAGENT_TIMEOUT_MS";
+export const STARTUP_TIMEOUT_ENV = "PI_SUBAGENT_STARTUP_TIMEOUT_MS";
 export const FOREGROUND_ENV = "PI_SUBAGENT_FOREGROUND_MS";
 export const PASSTHROUGH_ENV = "PI_SUBAGENT_PASSTHROUGH_ENV";
 
@@ -25,6 +28,13 @@ export function processTimeoutMs(): number {
   const configured = Number(process.env[TIMEOUT_ENV]);
   return Number.isSafeInteger(configured) && configured > 0 && configured <= MAX_PROCESS_TIMEOUT_MS
     ? configured : DEFAULT_PROCESS_TIMEOUT_MS;
+}
+
+/** Deadline for process/watchdog/SDK/MCP readiness, before the task starts. */
+export function startupTimeoutMs(): number {
+  const configured = Number(process.env[STARTUP_TIMEOUT_ENV]);
+  return Number.isSafeInteger(configured) && configured > 0 && configured <= MAX_STARTUP_TIMEOUT_MS
+    ? configured : DEFAULT_STARTUP_TIMEOUT_MS;
 }
 
 /**

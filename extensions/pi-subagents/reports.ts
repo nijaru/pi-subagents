@@ -24,8 +24,8 @@ export function formatDuration(startedAt?: number, finishedAt?: number): string 
  * Deadline expiry names elapsed runtime and the applied execution deadline in
  * human units. Environment values, paths, and child diagnostics stay out of it.
  */
-export function timeoutSummary(elapsedMs: number, deadlineMs: number): string {
-  return `Subagent timed out. Elapsed ${formatElapsed(elapsedMs)}; execution deadline ${formatElapsed(deadlineMs)}.`;
+export function timeoutSummary(elapsedMs: number, deadlineMs: number, phase: "startup" | "execution" = "execution"): string {
+  return `Subagent timed out during ${phase}. Elapsed ${formatElapsed(elapsedMs)}; ${phase} deadline ${formatElapsed(deadlineMs)}.`;
 }
 
 const AUTH_HINT = "Hint: Child env passes model refs and *_API_KEY/*_TOKEN credentials automatically. For non-credential variables, set PI_SUBAGENT_PASSTHROUGH_ENV with an exact name or glob and restart Pi. Auth in ~/.pi/agent/auth.json via /login needs no passthrough.";
@@ -37,7 +37,7 @@ export function withCredentialHint(message: string): string {
 
 /** The built-in timeout cause; anything else is a real diagnostic worth showing. */
 export function isTimeoutSummary(message: string | undefined): boolean {
-  return message !== undefined && message.startsWith("Subagent timed out.");
+  return message !== undefined && message.startsWith("Subagent timed out");
 }
 
 export function runtimeLabel(result: ChildResult): string {
@@ -75,7 +75,9 @@ export function childSummary(result: ChildResult, includePrompt = true): string 
   const status = result.state.status === "running" ? "running" : result.state.outcome;
   const duration = runtimeLabel(result);
   const model = result.model ? `\nmodel: ${truncateOutput(result.model, 512)}${result.thinking ? ` · thinking: ${result.thinking}` : ""}` : "";
-  const head = `${result.id} [${status}]${duration ? ` · ${duration}` : ""}${model}`;
+  const handle = result.handle ?? result.id;
+  const phase = result.state.status === "running" && result.phase ? ` · ${result.phase}` : "";
+  const head = `${handle} [${status}${phase}]${duration ? ` · ${duration}` : ""}${model}`;
   return includePrompt ? `${head}\n${truncateOutput(result.prompt, 256)}` : head;
 }
 

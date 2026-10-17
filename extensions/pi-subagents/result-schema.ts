@@ -38,6 +38,9 @@ export const OutputTruncationSchema = Type.Object({
 
 export const ChildResultSchema = Type.Object({
   id: Type.String(),
+  handle: Type.Optional(Type.String({ description: "Short session-scoped handle; preferred in wait/status/stop calls." })),
+  phase: Type.Optional(StringEnum(["starting", "running"] as const, { description: "Live execution phase; absent once terminal." })),
+  errorKind: Type.Optional(StringEnum(["startup", "provider", "protocol", "deadline", "cancelled", "tool", "unknown"] as const)),
   prompt: Type.String(),
   cwd: Type.String(),
   tools: Type.Array(Type.String()),
@@ -54,6 +57,7 @@ export const ChildResultSchema = Type.Object({
   usage: UsageSchema,
   model: Type.Optional(Type.String()),
   thinking: Type.Optional(StringEnum(THINKING_LEVELS, { description: "Effective effort verified at child startup." })),
+  notify: Type.Optional(StringEnum(["inbox", "turn"] as const, { description: "How completion is surfaced: inbox (next tool result) or turn (parent continuation)." })),
 }, { additionalProperties: false });
 
 /** One bounded envelope for tool details, structured results, and completion notices. */

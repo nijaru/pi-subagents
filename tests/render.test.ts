@@ -157,7 +157,7 @@ describe("compact child rendering", () => {
     expect(renderChildCompletion(message, { expanded: false, outputPad: 1 }, theme)!.render(120).map((line) => line.trim()))
       .toEqual(["✗ subagent 900c096e timed out · 30m 0s"]);
     const expanded = renderChildCompletion(message, { expanded: true, outputPad: 1 }, theme)!.render(120).join("\n");
-    expect(expanded).toContain("Subagent timed out.");
+    expect(expanded).toContain("Subagent timed out during execution.");
     expect(expanded).toContain("execution deadline 30m 0s");
   });
   test("old or malformed transcript details fall back to text; oversized output stays bounded", () => {

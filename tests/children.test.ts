@@ -22,7 +22,7 @@ function controlled() {
   };
   const notices: string[] = [];
   const children = new SessionChildren(supervisor, (result) => notices.push(result.id));
-  const start = () => children.start({ prompt: "bounded task", tools: ["read"], cwd: process.cwd() });
+  const start = (options: { notify?: "inbox" | "turn" } = {}) => children.start({ prompt: "bounded task", tools: ["read"], cwd: process.cwd(), notify: "turn", ...options });
   return { children, start, requests, executions, gates, notices };
 }
 

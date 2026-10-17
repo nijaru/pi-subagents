@@ -58,8 +58,8 @@ describe("compact child protocol", () => {
     }
   });
   test("timeout summaries name elapsed runtime and the deadline, nothing else", () => {
-    expect(timeoutSummary(250, 200)).toBe("Subagent timed out. Elapsed 250ms; execution deadline 200ms.");
-    expect(timeoutSummary(1_800_000, 3_600_000)).toBe("Subagent timed out. Elapsed 30m 0s; execution deadline 1h 0m 0s.");
+    expect(timeoutSummary(250, 200)).toBe("Subagent timed out during execution. Elapsed 250ms; execution deadline 200ms.");
+    expect(timeoutSummary(1_800_000, 3_600_000)).toBe("Subagent timed out during execution. Elapsed 30m 0s; execution deadline 1h 0m 0s.");
     expect(isTimeoutSummary(timeoutSummary(0, 0))).toBe(true);
     expect(isTimeoutSummary("assistant failed")).toBe(false);
     expect(isTimeoutSummary(undefined)).toBe(false);

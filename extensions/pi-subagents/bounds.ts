@@ -118,6 +118,10 @@ export function minimalChildResult(result: ChildResult): ChildResult {
     result[key].length > 0 || result.omittedFields?.includes(key));
   return {
     id: result.id,
+    ...(result.handle === undefined ? {} : { handle: result.handle }),
+    ...(result.phase === undefined ? {} : { phase: result.phase }),
+    ...(result.errorKind === undefined ? {} : { errorKind: result.errorKind }),
+    ...(result.notify === undefined ? {} : { notify: result.notify }),
     prompt: "",
     cwd: "",
     tools: [],

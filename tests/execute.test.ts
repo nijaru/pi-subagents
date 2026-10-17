@@ -109,7 +109,7 @@ afterEach(async () => {
 describe("task-first tool", () => {
   test("exposes the lifecycle schema and allows parallel scheduling", () => {
     const tool = host().tool;
-    expect(Object.keys(tool.parameters.properties).sort()).toEqual(["command", "prompt", "tools", "model", "thinking", "cwd", "id", "ids", "timeoutMs", "executionTimeoutMs"].sort());
+    expect(Object.keys(tool.parameters.properties).sort()).toEqual(["command", "prompt", "tools", "model", "thinking", "cwd", "id", "ids", "timeoutMs", "executionTimeoutMs", "startupTimeoutMs", "joinTimeoutMs", "notify"].sort());
     expect(tool.executionMode).toBe("parallel");
   });
   test("runs without profiles, inherits model/thinking, and delivers the prompt on stdin", async () => {
@@ -126,7 +126,7 @@ describe("task-first tool", () => {
     expect(first(value).thinking).toBe("high");
     expect(value.content[0].text).toContain("thinking: high");
     expect(capture.args).not.toContain(capture.prompt);
-    expect(capture.tools).toEqual(["read", "bash", "edit", "write", "web_search", "web_fetch", "web_research", "query-docs"]);
+    expect(capture.tools).toEqual(["read", "web_search", "web_fetch", "web_research", "query-docs"]);
     expect(first(value).output).toBe("done");
     expect(first(value).usage.cost.total).toBe(1);
     expect(h.notices).toHaveLength(0);
@@ -196,7 +196,7 @@ describe("background lifecycle", () => {
   test("re-arms the notice after a wait expires, then delivers once without a waiter", async () => {
     const h = host();
     const file = fakePi('await delay(150); final("finished later");');
-    const id = await spawn(h);
+    const id = await spawn(h, { notify: "turn" });
     const interim = await h.execute({ command: "wait", ids: [id], timeoutMs: 1 });
     expect(interim.details.waitExpired).toBe(true);
     expect(first(interim).state.status).toBe("running");
@@ -206,11 +206,33 @@ describe("background lifecycle", () => {
     expect(h.notices).toHaveLength(0);
     h.boundary();
     expect(h.notices).toHaveLength(1);
-    expect(h.notices[0].message.content).toContain(id);
+    expect(h.notices[0].message.content).toContain(first(interim).handle);
     expect(h.notices[0].message.content).toContain("finished later");
     expect(h.notices[0].message.content).not.toContain("use subagent wait");
     expect(first(await h.execute({ command: "wait", ids: [id] })).output).toBe("finished later");
     expect(h.notices).toHaveLength(1);
+  });
+  test("inbox completion is advertised once on the next tool result", async () => {
+    const h = host();
+    fakePi('await delay(50); final("inbox report");');
+    const handle = first(await h.execute({ command: "spawn", prompt: "inspect", tools: [] })).handle;
+    await Bun.sleep(300);
+    h.boundary();
+    expect(h.notices).toHaveLength(0);
+    const event = { toolName: "read", content: [{ type: "text", text: "file" }], structuredContent: { ok: true } };
+    const injected = h.toolResult(event);
+    expect(injected.content.at(-1).text).toContain(handle);
+    expect(injected.structuredContent).toEqual({ ok: true });
+    expect(h.toolResult(event)).toBeUndefined();
+    expect(first(await h.execute({ command: "wait", ids: [handle] })).output).toBe("inbox report");
+  });
+  test("short handles resolve in status, wait, and stop", async () => {
+    const h = host();
+    fakePi('await delay(50); final("handle report");');
+    const handle = first(await h.execute({ command: "spawn", prompt: "inspect", tools: [] })).handle;
+    expect(handle).toMatch(/^sa-\d+$/);
+    expect(first(await h.execute({ command: "status", id: handle })).handle).toBe(handle);
+    expect(first(await h.execute({ command: "wait", ids: [handle] })).output).toBe("handle report");
   });
   test("a delivering wait claims the result and suppresses the notice", async () => {
     const h = host();
@@ -249,7 +271,7 @@ describe("background lifecycle", () => {
   test("points at the retained result only when the notice excerpt was truncated", async () => {
     const h = host();
     fakePi('await delay(50); final("y".repeat(20000));');
-    await spawn(h);
+    await spawn(h, { notify: "turn" });
     await Bun.sleep(300);
     h.boundary();
     expect(h.notices).toHaveLength(1);
@@ -261,7 +283,7 @@ describe("background lifecycle", () => {
     process.env.PI_SUBAGENT_FOREGROUND_MS = "50";
     fakePi('await delay(250); final("late result");');
     let updates = 0;
-    const value = await h.execute({ command: "run", prompt: "x" }, undefined, () => { updates++; });
+    const value = await h.execute({ command: "run", prompt: "x", notify: "turn" }, undefined, () => { updates++; });
     expect(first(value).state.status).toBe("running");
     expect(value.content[0].text).toContain("Still running after");
     const foregroundUpdates = updates;
@@ -428,7 +450,7 @@ describe("subprocess regressions", () => {
     process.env.PI_SUBAGENT_TIMEOUT_MS = "100";
     const result = await h.execute({ command: "run", prompt: "x" });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("Subagent timed out.");
+    expect(result.content[0].text).toContain("Subagent timed out during execution.");
     expect(first(await h.execute({ command: "status" })).state).toMatchObject({ outcome: "timed_out" });
   });
   test.each([
@@ -519,8 +541,8 @@ describe("per-task execution deadlines", () => {
     expect(first(result).state).toMatchObject({ outcome: "timed_out" });
     // The cause reports elapsed runtime and the applied deadline as durations;
     // the strict shape proves no environment values or paths leak into it.
-    expect(first(result).errorMessage).toMatch(/^Subagent timed out\. Elapsed \d+(ms|s|m \d+s|h \d+m \d+s); execution deadline 1s\.$/);
-    expect(result.content[0].text).toContain("Subagent timed out.");
+    expect(first(result).errorMessage).toMatch(/^Subagent timed out during execution\. Elapsed \d+(ms|s|m \d+s|h \d+m \d+s); execution deadline 1s\.$/);
+    expect(result.content[0].text).toContain("Subagent timed out during execution.");
   });
   test("a task deadline replaces the global one without changing it for other children", async () => {
     const h = host();

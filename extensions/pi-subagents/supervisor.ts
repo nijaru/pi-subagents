@@ -1,6 +1,6 @@
 import type { AgentOutcome, ChildResult } from "./types.ts";
 import type { ModelThinkingLevel, StopReason } from "@earendil-works/pi-ai";
-import { RUNNING_PROGRESS_TEXT, processTimeoutMs } from "./limits.ts";
+import { RUNNING_PROGRESS_TEXT, processTimeoutMs, startupTimeoutMs } from "./limits.ts";
 import { boundedDiagnostic } from "./bounds.ts";
 import { withCredentialHint } from "./reports.ts";
 import { copyUsage, emptyUsage } from "./types.ts";
@@ -15,13 +15,15 @@ export interface ChildTask {
   readonly model?: string;
   readonly thinking?: ModelThinkingLevel;
   readonly strictThinking?: boolean;
-  /** Per-task execution deadline; omitted falls back to PI_SUBAGENT_TIMEOUT_MS. */
+  /** Per-task execution deadline, starting at ready; omitted falls back to PI_SUBAGENT_TIMEOUT_MS. */
   readonly executionTimeoutMs?: number;
+  /** Per-task startup deadline; omitted falls back to PI_SUBAGENT_STARTUP_TIMEOUT_MS. */
+  readonly startupTimeoutMs?: number;
 }
 
 /** Execution data never includes session identity, lifecycle, or delivery state. */
 export type ChildExecutionData = Pick<ChildResult,
-  "startedAt" | "model" | "thinking" | "usage" | "output" | "outputTruncation" | "stdout" | "stderr" | "errorMessage"
+  "startedAt" | "phase" | "model" | "thinking" | "usage" | "output" | "outputTruncation" | "stdout" | "stderr" | "errorMessage"
 >;
 
 export interface ChildRunRequest {
@@ -37,6 +39,7 @@ export interface ChildExecutionOutcome {
   exitCode: number;
   stopReason?: StopReason;
   errorMessage?: string;
+  errorKind?: "startup" | "provider" | "protocol" | "deadline" | "cancelled" | "tool" | "unknown";
 }
 export interface ChildExecutionResult extends ChildExecutionData, ChildExecutionOutcome {}
 
@@ -47,7 +50,7 @@ export interface ChildSupervisor {
 
 export class SubprocessChildSupervisor implements ChildSupervisor {
   async run({ task, signal, onUpdate }: ChildRunRequest): Promise<ChildExecutionResult> {
-    const data: ChildExecutionData = { model: task.model, stderr: "", usage: emptyUsage() };
+    const data: ChildExecutionData = { phase: "starting", model: task.model, stderr: "", usage: emptyUsage() };
     const snapshot = (): ChildExecutionData => ({
       ...data, usage: copyUsage(data.usage),
       outputTruncation: data.outputTruncation ? { ...data.outputTruncation } : undefined,
@@ -63,7 +66,9 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
       const processResult = await runPiProcess({
         bootstrap: { version: CHILD_PROTOCOL_VERSION, prompt: task.prompt, tools: [...task.tools], model: task.model,
           thinking: task.thinking, strictThinking: task.strictThinking },
-        cwd: task.cwd, childRunId: task.id, timeoutMs: task.executionTimeoutMs ?? processTimeoutMs(), signal,
+        cwd: task.cwd, childRunId: task.id,
+        startupTimeoutMs: task.startupTimeoutMs ?? startupTimeoutMs(),
+        timeoutMs: task.executionTimeoutMs ?? processTimeoutMs(), signal,
         onEvent: (event) => {
           if (terminal || protocolFailure !== undefined) throw new Error("Child sent a frame after its terminal result.");
           if (event.kind === "error") {
@@ -74,6 +79,7 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
               throw new Error("Child bootstrap did not match requested model/thinking/tools.");
             }
             ready = true;
+            data.phase = "running";
             data.model = event.model;
             data.thinking = event.thinking;
             publish();
@@ -103,7 +109,7 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
       });
       data.stderr = processResult.stderr;
       data.stdout = processResult.stdout;
-      const outcome = classifyExecution(processResult, terminal, protocolFailure);
+      const outcome = classifyExecution(processResult, terminal, protocolFailure, ready);
       data.errorMessage = outcome.errorMessage;
       publish(data.output || outcome.errorMessage || "(no output)");
       return { ...snapshot(), ...outcome };
@@ -115,21 +121,25 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
   }
 }
 
-export function classifyExecution(process: ProcessResult, report?: ChildReport, protocolFailure?: string): ChildExecutionOutcome {
+export function classifyExecution(process: ProcessResult, report?: ChildReport, protocolFailure?: string, ready = true): ChildExecutionOutcome {
   // External termination remains authoritative even if an earlier assistant failed.
   if (process.outcome === "timed_out" || process.outcome === "cancelled") return {
     outcome: process.outcome, exitCode: process.exitCode, stopReason: process.stopReason,
-    errorMessage: boundedDiagnostic(process.errorMessage),
+    errorMessage: boundedDiagnostic(process.errorMessage), errorKind: process.outcome === "timed_out" ? "deadline" : "cancelled",
   };
-  if (protocolFailure !== undefined || process.outcome !== "completed") return {
+  if (protocolFailure !== undefined) return {
     outcome: "failed", exitCode: process.exitCode || 1, stopReason: "error",
-    errorMessage: withCredentialHint(boundedDiagnostic(protocolFailure ?? process.errorMessage) || "Child failed."),
+    errorMessage: withCredentialHint(boundedDiagnostic(protocolFailure) || "Child failed."), errorKind: "protocol",
+  };
+  if (process.outcome !== "completed") return {
+    outcome: "failed", exitCode: process.exitCode || 1, stopReason: "error",
+    errorMessage: withCredentialHint(boundedDiagnostic(process.errorMessage) || "Child failed."), errorKind: ready ? "protocol" : "startup",
   };
   if (report?.stopReason === "length") return {
-    outcome: "incomplete", exitCode: 0, stopReason: "length", errorMessage: "Child reached the model output limit; response is incomplete.",
+    outcome: "incomplete", exitCode: 0, stopReason: "length", errorMessage: "Child reached the model output limit; response is incomplete.", errorKind: "provider",
   };
   if (report?.stopReason === "stop" && report.output) return { outcome: "completed", exitCode: 0, stopReason: "stop" };
-  if (report?.stopReason === "aborted") return { outcome: "cancelled", exitCode: 1, stopReason: "aborted", errorMessage: report.errorMessage ?? "Child aborted." };
+  if (report?.stopReason === "aborted") return { outcome: "cancelled", exitCode: 1, stopReason: "aborted", errorMessage: report.errorMessage ?? "Child aborted.", errorKind: "cancelled" };
   return { outcome: "failed", exitCode: 1, stopReason: "error", errorMessage: boundedDiagnostic(report?.errorMessage)
-    ?? "Child produced no terminal assistant output; a final response is required." };
+    ?? "Child produced no terminal assistant output; a final response is required.", errorKind: "protocol" };
 }

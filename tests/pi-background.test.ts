@@ -41,7 +41,7 @@ test.each([
         delta = { content: "PARENT_IDLE" };
       } else {
         delta = { tool_calls: [{ index: 0, id: "spawn_call", type: "function", function: {
-          name: "subagent", arguments: JSON.stringify({ command: "spawn", prompt: "Complete this independent background task.", tools: [] }),
+          name: "subagent", arguments: JSON.stringify({ command: "spawn", prompt: "Complete this independent background task.", tools: [], notify: "turn" }),
         } }] };
         finish = "tool_calls";
       }

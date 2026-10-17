@@ -122,10 +122,10 @@ function childHeading(child: ChildResult, theme: Theme, options: { expanded: boo
   const { expanded, showId, notification, command } = options;
   const active = child.state.status === "running";
   const outcome = child.state.status === "terminal" ? child.state.outcome : undefined;
-  const status = active ? command === "spawn" ? "started" : "running" : outcome!.replaceAll("_", " ");
+  const status = active ? `${command === "spawn" ? "started" : "running"}${child.phase ? ` · ${child.phase}` : ""}` : outcome!.replaceAll("_", " ");
   const color = active ? "muted" : outcome === "cancelled" || outcome === "incomplete" ? "warning" : failed(child) ? "error" : "success";
   const icon = active ? "○" : outcome === "cancelled" ? "−" : outcome === "incomplete" ? "!" : failed(child) ? "✗" : "✓";
-  const id = showId ? `${theme.fg("accent", displayId(child.id, expanded))} ` : "";
+  const id = showId ? `${theme.fg("accent", displayId(child.handle ?? child.id, expanded))} ` : "";
   // Spawn/status/wait are snapshots, not live activity indicators.
   const duration = active && command !== "run" ? "" : runtimeLabel(child);
   return `${theme.fg(color, icon)} ${notification ? "subagent " : ""}${id}${theme.fg(color, status)}${duration ? theme.fg("dim", ` · ${duration}`) : ""}`;
