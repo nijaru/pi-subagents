@@ -123,6 +123,19 @@ describe("session ownership", () => {
     await run.promise;
     expect(c.notices).toEqual([]);
   });
+  test("inbox notices are re-advertised once per turn and read handles can be pruned", async () => {
+    const c = controlled();
+    const run = c.start({ notify: "inbox" });
+    c.gates[0]!.resolve();
+    await run.promise;
+    expect(c.children.pendingInbox().map((result) => result.handle)).toEqual([run.handle]);
+    expect(c.children.pendingInbox()).toEqual([]);
+    c.children.resetInboxNotices();
+    expect(c.children.pendingInbox()).toHaveLength(1);
+    expect((await c.children.wait([run.handle], 1))[0]!.output).toBe("done");
+    expect(c.children.pruneDelivered()).toBe(1);
+    expect(() => c.children.get(run.handle)).toThrow("Unknown child");
+  });
   test("a join that expires while the child is live re-arms the completion notice", async () => {
     const c = controlled();
     const run = c.start();

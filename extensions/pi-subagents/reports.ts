@@ -3,8 +3,9 @@ import { MAX_OUTPUT_BYTES } from "./limits.ts";
 import { failed, isFiniteNumber, isRunning, type ChildResult } from "./types.ts";
 
 /** Human units; sub-second values keep millisecond precision. */
-function formatElapsed(elapsedMs: number): string {
+export function formatElapsed(elapsedMs: number): string {
   if (elapsedMs < 1000) return `${Math.round(elapsedMs)}ms`;
+  if (elapsedMs < 10_000) return `${(elapsedMs / 1000).toFixed(1).replace(/\.0$/, "")}s`;
   const totalSeconds = Math.floor(elapsedMs / 1000);
   if (totalSeconds < 60) return `${totalSeconds}s`;
   const minutes = Math.floor(totalSeconds / 60);
@@ -41,7 +42,12 @@ export function isTimeoutSummary(message: string | undefined): boolean {
 }
 
 export function runtimeLabel(result: ChildResult): string {
-  const duration = formatDuration(result.startedAt, result.state.status === "terminal" ? result.state.finishedAt : undefined);
+  // Terminal timestamps include process-tree cleanup; report task runtime, not
+  // the time the parent spent sweeping descendants.
+  const finishedAt = result.state.status === "terminal"
+    ? result.state.finishedAt - (result.cleanupMs ?? 0)
+    : undefined;
+  const duration = formatDuration(result.startedAt, finishedAt);
   return duration ? `${duration}${isRunning(result) ? " elapsed" : ""}` : "";
 }
 

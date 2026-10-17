@@ -3,7 +3,7 @@ import { getMarkdownTheme, keyText } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Markdown, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { truncateHeadTail, truncateOutput } from "./bounds.ts";
 import { MAX_OUTPUT_BYTES, MAX_RETAINED_RUNS } from "./limits.ts";
-import { isTimeoutSummary, resultText, runtimeLabel } from "./reports.ts";
+import { formatElapsed, isTimeoutSummary, resultText, runtimeLabel } from "./reports.ts";
 import type { SubagentDetails } from "./types.ts";
 import { Check } from "typebox/value";
 import { ChildResultSchema } from "./result-schema.ts";
@@ -176,7 +176,10 @@ function renderChildren(details: unknown, expanded: boolean, theme: Theme, targe
       const cwd = child.omittedFields?.includes("cwd") ? "not retained (response budget)" : clean(child.cwd, 1024);
       const tools = child.omittedFields?.includes("tools") ? "not retained (response budget)" : clean(child.tools.join(", "), 1024) || "none";
       container.addChild(new Text(theme.fg("dim", `cwd: ${cwd}\ntools: ${tools}`), 0, 0));
-      if (!active) container.addChild(new Text(theme.fg("dim", formatUsage(child.usage, child.model ? clean(child.model, 256) : undefined) + (child.thinking ? ` · thinking: ${child.thinking}` : "")), 0, 0));
+      if (!active) {
+        const cleanup = child.cleanupMs ? ` · cleanup ${formatElapsed(child.cleanupMs)}` : "";
+        container.addChild(new Text(theme.fg("dim", formatUsage(child.usage, child.model ? clean(child.model, 256) : undefined) + (child.thinking ? ` · thinking: ${child.thinking}` : "") + cleanup), 0, 0));
+      }
     }
   }
   return container;

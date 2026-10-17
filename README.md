@@ -35,7 +35,7 @@ Every child gets a short session-scoped handle (`sa-<n>`, for example `sa-4821`)
 
 `notify` controls how a finished child reaches the parent:
 
-- **`inbox`** (default): the child does not spend a parent turn. The next top-level non-subagent tool result advertises unread handles, the footer shows the count, and `wait` retrieves the reports. `/subagents` lists retained children and unread state. An idle parent is never woken.
+- **`inbox`** (default): the child does not spend a parent turn. Once per parent turn, the next top-level non-subagent tool result advertises unread handles, the footer shows the count, and `wait` retrieves the reports. `/subagents` lists retained children and unread state; `/subagents clear` drops completed read handles. An idle parent is never woken.
 - **`turn`**: Pi offers one continuation turn at an active boundary when the child finishes, as in earlier releases. Unread results are batched into one notice. Aborts, provider errors, and dropped notices leave the report unread for an explicit `wait`.
 
 Inbox delivery makes background work visible without adding a model turn and avoids the retraction/acknowledgment races of pushed notices. Turn delivery is opt-in when the child must resume the parent immediately.
@@ -55,15 +55,15 @@ Four independent budgets avoid conflating readiness, work, joining, and cleanup:
 | `joinTimeoutMs` | 60 seconds (`PI_SUBAGENT_FOREGROUND_MS`) | How long a `run` call blocks before returning a running handle |
 | `timeoutMs` | 5 minutes | How long one `wait` call joins; never changes a child deadline |
 
-`startupTimeoutMs` and `executionTimeoutMs` are run/spawn options within 5 minutes and 2 hours respectively. `joinTimeoutMs` applies only to `run`. At expiry the child is stopped and its result keeps partial output, with the cause naming the phase, elapsed runtime, and applied deadline. Cancel a wait without stopping its children; use `stop` for that. Cancelling `run` cancels its child.
+`startupTimeoutMs` and `executionTimeoutMs` are run/spawn options within 5 minutes and 2 hours respectively. `joinTimeoutMs` applies only to `run`. At expiry the child is stopped and its result keeps partial output, with the cause naming the phase, elapsed runtime, and applied deadline. Reported runtime excludes process-tree cleanup; `cleanupMs` records the excluded portion. Cancel a wait without stopping its children; use `stop` for that. Cancelling `run` cancels its child.
 
 Handles belong to the current parent session. All children stop on quit, reload, or session replacement. Background work requires a live parent process; a one-shot print invocation is not a persistent worker host.
 
-The TUI hides agent-facing text — delegated prompts and child reports — behind expansion. Each child is one status line: live work and status listings carry a handle, phase, and one-line task label; finished children show outcome and duration, with the error message added for failures. Expand for the full prompt and report, diagnostics, working directory, tools, and usage. Turn-mode notices occupy one line; inbox results are advertised in the next top-level non-subagent tool result.
+The TUI hides agent-facing text — delegated prompts and child reports — behind expansion. Each child is one status line: live work and status listings carry a handle, phase, and one-line task label; finished children show outcome and duration, with the error message added for failures. Expand for the full prompt and report, diagnostics, working directory, tools, usage, and cleanup time. Turn-mode notices occupy one line; inbox results are advertised in the next top-level non-subagent tool result.
 
 ### Programmatic results
 
-Codemode calls receive `{ command, results, waitExpired? }`, not report text. Each child carries its id, short handle, lifecycle `state`, live `phase` (running only), structured `errorKind`, `timeoutPhase` for deadline failures, bounded report and diagnostics, truncation metadata, and usage. The same bounded envelope is returned as tool `details`; the model still receives a text summary. Child reports do not have to be JSON. When launch context cannot fit, `omittedFields` identifies removed `prompt`, `cwd`, or `tools` fields; their empty placeholders are not execution values.
+Codemode calls receive `{ command, results, waitExpired? }`, not report text. Each child carries its id, short handle, lifecycle `state`, live `phase` (running only), structured `errorKind`, `timeoutPhase` for deadline failures, `cleanupMs` excluding cleanup from runtime, bounded report and diagnostics, truncation metadata, and usage. The same bounded envelope is returned as tool `details`; the model still receives a text summary. Child reports do not have to be JSON. When launch context cannot fit, `omittedFields` identifies removed `prompt`, `cwd`, or `tools` fields; their empty placeholders are not execution values.
 
 ```javascript
 const result = await tools.subagent({
@@ -135,6 +135,7 @@ Environment variables are allowlisted, with standard model credentials, `$VAR` r
 
 `0.0.x` is pre-release: the tool schema, behavior, and exported `ChildResult` shape are not promised across patch releases. Read this file, not the version number, for what changed.
 
+- **0.0.12**: keep inbox notices re-advertisable once per parent turn; report task runtime separately from process-tree cleanup (`cleanupMs`); use sub-second elapsed precision; order `/subagents` active-first and add `/subagents clear`.
 - **0.0.11**: keep structured `timeoutPhase` through bounded result envelopes; measure execution-timeout elapsed from the ready frame instead of process spawn; render a running child’s phase once. Found in live 0.0.10 testing.
 - **0.0.10**: redesign the parent-facing lifecycle. Inbox completion delivery is the default; `notify: "turn"` preserves pushed notices. Children get short `sa-<n>` handles from a fresh session range. Startup and execution deadlines are separate, `executionTimeoutMs` starts at the ready frame, and `run` accepts `joinTimeoutMs`. Default tools are read/search/web; mutation tools must be requested. Results gain `phase` and structured `errorKind`, and `/subagents` lists retained children. See the 0.0.10 migration notes below.
 - **0.0.9**: settle timed-out and cancelled runs even when an escaped descendant keeps stdio open; stop the execution deadline at leader exit so cleanup cannot fabricate a timeout; report terminating signals, credential hints, and terminal failure causes in `status`; retain partial output from interrupted real children; do not evict a child referenced by the response's own tool calls.

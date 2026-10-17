@@ -11,7 +11,7 @@ import { executable, getChildInvocation } from "../extensions/pi-subagents/subpr
 import { spawnDeathWatchdog } from "../extensions/pi-subagents/process-tree.ts";
 import { assistantReport, parseChildEvent } from "../extensions/pi-subagents/child-protocol.ts";
 import { classifyExecution } from "../extensions/pi-subagents/supervisor.ts";
-import { isTimeoutSummary, timeoutSummary } from "../extensions/pi-subagents/reports.ts";
+import { formatElapsed, isTimeoutSummary, runtimeLabel, timeoutSummary } from "../extensions/pi-subagents/reports.ts";
 
 const assistant: AssistantMessage = {
   role: "assistant", content: [{ type: "text", text: "hello" }], usage: emptyUsage(),
@@ -72,6 +72,22 @@ describe("compact child protocol", () => {
       }
     }
   });
+  test("elapsed formatting keeps sub-second and sub-10s precision", () => {
+    expect(formatElapsed(250)).toBe("250ms");
+    expect(formatElapsed(1_500)).toBe("1.5s");
+    expect(timeoutSummary(1_500, 1_500)).toBe("Subagent timed out during execution. Elapsed 1.5s; execution deadline 1.5s.");
+  });
+  test("runtime labels exclude process cleanup", () => {
+    const result = {
+      ...assistantReport(assistant),
+      id: "child", prompt: "task", cwd: "/tmp", tools: [], startedAt: 1_000,
+      state: { status: "terminal" as const, outcome: "completed" as const, exitCode: 0, stopReason: "stop" as const, finishedAt: 11_000 },
+      cleanupMs: 3_000, stderr: "", usage: emptyUsage(),
+      outputTruncation: { truncated: false, originalBytes: 0, retainedBytes: 0 },
+    };
+    expect(runtimeLabel(result)).toBe("7s");
+  });
+
   test("timeout summaries name elapsed runtime and the deadline, nothing else", () => {
     expect(timeoutSummary(250, 200)).toBe("Subagent timed out during execution. Elapsed 250ms; execution deadline 200ms.");
     expect(timeoutSummary(1_800_000, 3_600_000)).toBe("Subagent timed out during execution. Elapsed 30m 0s; execution deadline 1h 0m 0s.");

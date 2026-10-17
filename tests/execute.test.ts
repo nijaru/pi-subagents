@@ -251,6 +251,10 @@ describe("background lifecycle", () => {
     const text = h.notifications.at(-1)!;
     expect(text).toContain("1 retained · 1 unread");
     expect(text).toContain(handle);
+    expect(text).toContain("inbox");
+    await h.execute({ command: "wait", ids: [handle] });
+    await h.commands.get("subagents").handler("clear", { ui: { notify: (message: string) => h.notifications.push(message) } });
+    expect(h.notifications.at(-1)).toContain("Cleared 1 read child handle");
   });
   test("a delivering wait claims the result and suppresses the notice", async () => {
     const h = host();

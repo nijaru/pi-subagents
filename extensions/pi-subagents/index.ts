@@ -10,7 +10,7 @@ import { SubagentDetailsSchema } from "./result-schema.ts";
 import type { ChildResult, SubagentDetails } from "./types.ts";
 import { renderChildCall, renderChildResult, renderChildCompletion } from "./render.ts";
 import { CompletionDelivery } from "./delivery.ts";
-import { childStatus as summary, childReports } from "./reports.ts";
+import { childStatus as summary, childReports, formatElapsed } from "./reports.ts";
 
 export { SubagentParamsSchema } from "./params.ts";
 export type { SubagentParams } from "./params.ts";
@@ -31,12 +31,16 @@ function inboxNotice(results: ChildResult[]): string {
 }
 
 function childListText(results: ChildResult[]): string {
-  return results.map((result) => {
+  const ordered = [...results].sort((left, right) => {
+    const running = Number(right.state.status === "running") - Number(left.state.status === "running");
+    return running || (left.startedAt ?? 0) - (right.startedAt ?? 0);
+  });
+  return ordered.map((result) => {
     const status = result.state.status === "running"
       ? `${result.phase ?? "starting"}${result.startedAt ? ` · ${Math.max(0, Math.round((Date.now() - result.startedAt) / 1000))}s` : ""}`
       : result.state.outcome;
     const handle = result.handle ?? result.id.slice(0, 8);
-    return `${handle} [${status}] · ${result.tools.length} tool${result.tools.length === 1 ? "" : "s"} · ${result.cwd}`;
+    return `${handle} [${status}] · ${result.notify ?? "inbox"} · ${result.tools.length} tool${result.tools.length === 1 ? "" : "s"} · ${result.cwd}`;
   }).join("\n");
 }
 
@@ -92,7 +96,7 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on("agent_start", (_event, ctx) => runtime.delivery.started(ctx));
   pi.on("agent_end", (event, ctx) => runtime.delivery.ended(event, ctx));
-  pi.on("turn_start", (_event, ctx) => { runtime.delivery.reconcile(ctx); });
+  pi.on("turn_start", (_event, ctx) => { runtime.children.resetInboxNotices(); runtime.delivery.reconcile(ctx); });
   pi.on("message_end", (event, ctx) => runtime.delivery.responded(event, ctx));
   pi.on("turn_end", (event, ctx) => runtime.delivery.boundary(event, ctx));
   pi.on("agent_before_settle", (event, ctx) => runtime.delivery.boundary(event, ctx));
@@ -174,7 +178,7 @@ export default function (pi: ExtensionAPI) {
         const budget = params.joinTimeoutMs ?? foregroundBudgetMs();
         const result = (await owner.wait([run.result.id], budget))[0]!;
         if (isRunning(result)) {
-          return answer("run", [result], `${summary(result)}\nStill running after ${Math.round(budget / 1000)}s; it continues as background work. ${run.notify === "turn" ? "Completion requests one active-boundary turn; idle parents are not woken." : "Completion is advertised in the inbox on the next tool result; idle parents are not woken."} Use wait when its result blocks finishing your task, or status/stop with this handle.`);
+          return answer("run", [result], `${summary(result)}\nStill running after ${formatElapsed(budget)}; it continues as background work. ${run.notify === "turn" ? "Completion requests one active-boundary turn; idle parents are not woken." : "Completion is advertised in the inbox on the next tool result; idle parents are not woken."} Use wait when its result blocks finishing your task, or status/stop with this handle.`);
         }
         return outcome("run", [result]);
       } finally {
@@ -188,8 +192,18 @@ export default function (pi: ExtensionAPI) {
   });
 
   if (typeof pi.registerCommand === "function") pi.registerCommand("subagents", {
-    description: "List retained child agents and unread results",
-    async handler(_args, ctx) {
+    description: "List retained child agents, or clear completed read handles",
+    async handler(args, ctx) {
+      const action = args.trim().toLowerCase();
+      if (action === "clear" || action === "prune") {
+        const removed = runtime.children.pruneDelivered();
+        ctx.ui.notify(`Cleared ${removed} read child handle${removed === 1 ? "" : "s"}.`, "info");
+        return;
+      }
+      if (action !== "" && action !== "status") {
+        ctx.ui.notify("Usage: /subagents [clear]", "info");
+        return;
+      }
       const results = runtime.children.list();
       const unread = runtime.children.unreadCompletionCount();
       const header = results.length === 0 ? "No retained child agents." : `${results.length} retained · ${unread} unread`;

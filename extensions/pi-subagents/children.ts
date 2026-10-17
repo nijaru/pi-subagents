@@ -12,7 +12,7 @@ export interface ChildRun {
   handle: string;
   /** How a completed result is surfaced to the parent. */
   notify: "inbox" | "turn";
-  /** Inbox notifications are emitted at most once per child. */
+  /** Inbox notifications are emitted at most once per parent turn. */
   inboxNotified: boolean;
   /** Result delivery is independent of process completion and waiter lifetime. */
   delivery: "unread" | "offered" | "published" | "delivered";
@@ -93,18 +93,20 @@ export class SessionChildren {
       try { emit(this.snapshot(run), progress); } catch { emit = undefined; }
     };
     try {
-      const { outcome, exitCode, stopReason, errorKind, timeoutPhase, ...data } = await this.supervisor.run({
+      const { outcome, exitCode, stopReason, errorKind, timeoutPhase, taskFinishedAt, ...data } = await this.supervisor.run({
         task, signal: run.controller.signal,
         onUpdate: (data, progress) => {
           run.result = copyResult({ ...run.result, ...data });
           if (progress !== undefined) present(progress);
         },
       });
+      const settledAt = Date.now();
       run.result = copyResult({
         ...run.result, ...data,
-        state: { status: "terminal", outcome, exitCode, stopReason, finishedAt: Date.now() },
+        state: { status: "terminal", outcome, exitCode, stopReason, finishedAt: settledAt },
         ...(errorKind === undefined ? {} : { errorKind }),
         ...(timeoutPhase === undefined ? {} : { timeoutPhase }),
+        ...(taskFinishedAt === undefined ? {} : { cleanupMs: Math.max(0, settledAt - taskFinishedAt) }),
       });
       delete run.result.phase;
     } catch (error) {
@@ -145,7 +147,21 @@ export class SessionChildren {
       .map((run) => this.snapshot(run));
   }
 
-  /** Terminal inbox results not yet advertised in a tool result. */
+  /** Allow unread inbox results to be advertised again in the next turn. */
+  resetInboxNotices(): void {
+    for (const run of this.runs.values()) run.inboxNotified = false;
+  }
+
+  /** Drop terminal, read handles without touching running or unread work. */
+  pruneDelivered(): number {
+    let removed = 0;
+    for (const [id, run] of this.runs) {
+      if (run.settled && run.delivery === "delivered") { this.runs.delete(id); removed++; }
+    }
+    return removed;
+  }
+
+  /** Terminal inbox results not yet advertised this turn. */
   pendingInbox(): ChildResult[] {
     if (this.closed) return [];
     const pending = [...this.runs.values()]

@@ -73,6 +73,8 @@ export interface ProcessResult {
   errorMessage?: string;
   /** Which deadline expired; only set for timed_out. */
   timeoutPhase?: "startup" | "execution";
+  /** When the leader exited or the deadline/abort fired, before cleanup. */
+  taskFinishedAt?: number;
   stderr: string;
   stdout?: string;
 }
@@ -158,6 +160,7 @@ export async function runPiProcess(request: PiProcessRequest): Promise<ProcessRe
       resolve({
         ...result,
         ...termination(),
+        ...(finishedAt === undefined ? {} : { taskFinishedAt: finishedAt }),
         stderr: truncateHeadTail(stderr, MAX_STDERR_BYTES),
         stdout: truncateHeadTail(stdout, MAX_STDERR_BYTES),
       });

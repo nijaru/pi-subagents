@@ -42,6 +42,8 @@ export const ChildResultSchema = Type.Object({
   phase: Type.Optional(StringEnum(["starting", "running"] as const, { description: "Live execution phase; absent once terminal." })),
   errorKind: Type.Optional(StringEnum(["startup", "provider", "protocol", "deadline", "cancelled", "unknown"] as const)),
   timeoutPhase: Type.Optional(StringEnum(["startup", "execution"] as const, { description: "Which deadline expired for a timed_out result." })),
+  cleanupMs: Type.Optional(Type.Integer({ minimum: 0, description: "Process-tree cleanup time excluded from the reported task runtime." })),
+  taskFinishedAt: Type.Optional(Type.Number({ minimum: 0, description: "Leader exit or terminal-cause time, before cleanup." })),
   prompt: Type.String(),
   cwd: Type.String(),
   tools: Type.Array(Type.String()),

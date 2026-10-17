@@ -23,7 +23,7 @@ export interface ChildTask {
 
 /** Execution data never includes session identity, lifecycle, or delivery state. */
 export type ChildExecutionData = Pick<ChildResult,
-  "startedAt" | "phase" | "model" | "thinking" | "usage" | "output" | "outputTruncation" | "stdout" | "stderr" | "errorMessage"
+  "startedAt" | "taskFinishedAt" | "phase" | "model" | "thinking" | "usage" | "output" | "outputTruncation" | "stdout" | "stderr" | "errorMessage"
 >;
 
 export interface ChildRunRequest {
@@ -110,6 +110,7 @@ export class SubprocessChildSupervisor implements ChildSupervisor {
       });
       data.stderr = processResult.stderr;
       data.stdout = processResult.stdout;
+      data.taskFinishedAt = processResult.taskFinishedAt;
       const outcome = classifyExecution(processResult, terminal, protocolFailure, ready);
       data.errorMessage = outcome.errorMessage;
       publish(data.output || outcome.errorMessage || "(no output)");
