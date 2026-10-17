@@ -102,6 +102,15 @@ input.on("line", (line) => {
     return;
   }
   if (command.type === "prompt") {
+    if (command.message.startsWith("/__pi_subagent_ready")) {
+      let requested = [];
+      try { requested = JSON.parse(process.env.PI_SUBAGENT_PROBE_TOOLS ?? "[]"); } catch { /* invalid */ }
+      const payload = { token: process.env.PI_SUBAGENT_PROBE_TOKEN ?? "", tools: requested, requested };
+      send({ type: "message_start", message: { role: "custom", customType: "subagent-probe", content: JSON.stringify(payload), display: false } });
+      send({ type: "message_end", message: { role: "custom", customType: "subagent-probe", content: JSON.stringify(payload), display: false } });
+      send({ id: command.id, type: "response", command: "prompt", success: true, data: { disposition: "handled" } });
+      return;
+    }
     scenario = /SCENARIO=([a-z-]+)/.exec(command.message)?.[1] ?? "ok";
     fs.writeFileSync(".fake-rpc-prompt", command.message);
     send({ id: command.id, type: "response", command: "prompt", success: true, data: { disposition: "started" } });

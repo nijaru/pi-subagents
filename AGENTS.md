@@ -21,8 +21,8 @@ Stay on `0.0.x` while this is pre-release and effectively single-user: bump only
 - `extensions/pi-subagents/index.ts`: registration, parent session lifecycle, command dispatch, completion notices, rendering.
 - `children.ts`: session-owned handles, admission, wait/stop/steer, completion ownership, usage accounting, retention, shutdown fencing.
 - `delivery.ts`: active-turn boundary batching; never wake idle parents. Boundary drafts remain provisional until confirmed; no busy-parent follow-up queue.
-- `supervisor.ts`: the single execution boundary. It spawns `pi --mode rpc`, speaks the public JSONL protocol, wraps prompts/steering to keep them literal, verifies model/thinking, runs the tool probe, applies all-unselected tool exclusions, streams events, ignores oversized `agent_end` history, applies deadlines, and returns after orderly shutdown or bounded process-group cleanup. No session registry here.
-- `probe-extension.ts`: loaded only in children. Reports the active tool set after a bounded startup window so a missing tool fails before the prompt, and blocks direct/nested calls outside the requested allowlist. Public extension API only; no tools or commands.
+- `supervisor.ts`: the single execution boundary. It spawns `pi --mode rpc`, speaks the public JSONL protocol, wraps prompts/steering to keep them literal, verifies model/thinking, runs the readiness command handshake, applies all-unselected tool exclusions, streams events, ignores oversized `agent_end` history, applies deadlines, and returns after orderly shutdown or bounded process-group cleanup. No session registry here.
+- `probe-extension.ts`, `probe-protocol.ts`: loaded only in children. A private readiness command sends one typed custom message after a bounded startup window, and a tool-call guard blocks direct/nested calls outside the requested allowlist. Public extension API only; no tools.
 - `process-tree.ts`: detached process-group cancellation, normal-exit sweep, and parent-death watchdog.
 - `env.ts`: bounded environment inheritance for configured providers and tools.
 - `params.ts`: command/tool policy, tool selection, resume/persist validation, and cwd resolution.

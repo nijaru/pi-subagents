@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -18,6 +19,7 @@ import {
 import { timeoutSummary, withCredentialHint } from "./reports.ts";
 import { spawnDeathWatchdog, sweepRootProcessGroup, terminateProcessTree } from "./process-tree.ts";
 import { addUsage, emptyUsage, textFromMessage, type ChildResult } from "./types.ts";
+import { PROBE_COMMAND, PROBE_CUSTOM_TYPE, PROBE_TIMEOUT_ENV, PROBE_TOKEN_ENV, PROBE_TOOLS_ENV, type ProbeReport } from "./probe-protocol.ts";
 
 export interface ChildTask {
   readonly id: string;
@@ -127,12 +129,6 @@ function getCliPath(): string {
   return cli;
 }
 
-function probePathFor(id: string): string {
-  const root = path.join(getAgentDir(), "subagents", "probes");
-  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-  return path.join(root, `${id}.json`);
-}
-
 function sessionPathFor(id: string): string {
   const root = process.env.PI_SUBAGENT_SESSION_DIR
     ? path.resolve(process.env.PI_SUBAGENT_SESSION_DIR)
@@ -145,7 +141,7 @@ interface Invocation {
   command: string;
   args: string[];
   sessionFile?: string;
-  probeFile?: string;
+  probe: boolean;
 }
 
 export function getRpcInvocation(task: ChildTask): Invocation {
@@ -172,7 +168,7 @@ export function getRpcInvocation(task: ChildTask): Invocation {
   if (task.model) args.push("--model", task.model);
   if (task.thinking) args.push("--thinking", task.thinking);
   if (task.trustProject) args.push("--approve");
-  return { command, args, sessionFile, probeFile: useProbe ? probePathFor(task.id) : undefined };
+  return { command, args, sessionFile, probe: useProbe };
 }
 
 function classify(
@@ -305,7 +301,7 @@ export class RpcChildSupervisor implements ChildSupervisor {
       };
     }
     data.sessionFile = invocation.sessionFile;
-    if (invocation.probeFile) { try { fs.rmSync(invocation.probeFile, { force: true }); } catch { /* best effort */ } }
+    const probeToken = randomUUID();
     publish(RUNNING_PROGRESS_TEXT);
 
     return await new Promise<ChildExecutionResult>((resolve) => {
@@ -338,6 +334,13 @@ export class RpcChildSupervisor implements ChildSupervisor {
       let watchdogSetup: Promise<ChildProcess | undefined> | undefined;
       const decoder = new StringDecoder("utf8");
       const pending = new Map<string, { resolve: (value: RpcResponse) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+      const probe = Promise.withResolvers<ProbeReport>();
+      let probeSettled = false;
+      const resolveProbe = (report: ProbeReport) => {
+        if (probeSettled) return;
+        probeSettled = true;
+        probe.resolve(report);
+      };
       let nextRequest = 0;
 
       const clearTimers = () => {
@@ -388,7 +391,10 @@ export class RpcChildSupervisor implements ChildSupervisor {
         settled = true;
         finishing = true;
         clearTimers();
-        if (invocation.probeFile) { try { fs.rmSync(invocation.probeFile, { force: true }); } catch { /* best effort */ } }
+        if (!probeSettled) {
+          probeSettled = true;
+          probe.resolve({ token: probeToken, tools: [], requested: [...task.tools], error: "Child execution ended." });
+        }
         watchdog?.stdin?.end();
         if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
         rejectPending(new Error("Child execution ended."));
@@ -541,6 +547,19 @@ export class RpcChildSupervisor implements ChildSupervisor {
           }
           return;
         }
+        if (event.type === "message_end" && event.message?.role === "custom" && event.message.customType === PROBE_CUSTOM_TYPE) {
+          let report: ProbeReport | undefined;
+          try {
+            const parsed = typeof event.message.content === "string" ? JSON.parse(event.message.content) : undefined;
+            if (parsed && typeof parsed === "object" && parsed.token === probeToken
+              && Array.isArray(parsed.tools) && Array.isArray(parsed.requested)) {
+              report = parsed as ProbeReport;
+            }
+          } catch { /* malformed probe report */ }
+          if (report) resolveProbe(report);
+          else resolveProbe({ token: probeToken, tools: [], requested: [...task.tools], error: "Child probe returned malformed readiness." });
+          return;
+        }
         if (event.type === "message_end") {
           const message = event.message;
           if (message?.role === "assistant") {
@@ -659,10 +678,10 @@ export class RpcChildSupervisor implements ChildSupervisor {
 
       try {
         const childEnv = childEnvironment(task.id, task.cwd);
-        if (invocation.probeFile) {
-          childEnv.PI_SUBAGENT_PROBE_FILE = invocation.probeFile;
-          childEnv.PI_SUBAGENT_PROBE_TOOLS = JSON.stringify(task.tools);
-          childEnv.PI_SUBAGENT_PROBE_TIMEOUT_MS = String(Math.max(1_000, Math.min(10_000, Math.floor(startupRemainingMs(data.startedAt ?? Date.now(), startupBudgetMs) * 0.6))));
+        if (invocation.probe) {
+          childEnv[PROBE_TOKEN_ENV] = probeToken;
+          childEnv[PROBE_TOOLS_ENV] = JSON.stringify(task.tools);
+          childEnv[PROBE_TIMEOUT_ENV] = String(Math.max(1_000, Math.min(10_000, Math.floor(startupRemainingMs(data.startedAt ?? Date.now(), startupBudgetMs) * 0.6))));
         }
         child = spawn(invocation.command, invocation.args, {
           cwd: task.cwd,
@@ -736,18 +755,25 @@ export class RpcChildSupervisor implements ChildSupervisor {
           if (task.strictThinking && state.thinkingLevel !== task.thinking) {
             throw new Error(`Child thinking ${state.thinkingLevel} does not match requested ${task.thinking}.`);
           }
-          if (invocation.probeFile) {
-            const deadline = (data.startedAt ?? Date.now()) + startupBudgetMs;
-            while (!fs.existsSync(invocation.probeFile) && Date.now() < deadline && !aborted && !timedOut) {
-              await new Promise((resolve) => setTimeout(resolve, 25));
+          if (invocation.probe) {
+            const remaining = startupRemainingMs(data.startedAt ?? Date.now(), startupBudgetMs);
+            const probeTimer = setTimeout(() => resolveProbe({
+              token: probeToken, tools: [], requested: [...task.tools], error: "Child probe timed out.",
+            }), remaining);
+            probeTimer.unref?.();
+            try {
+              const probeResponse = await send({ type: "prompt", message: `/${PROBE_COMMAND}` }, remaining);
+              if (!probeResponse.success) throw new Error(probeResponse.error || "Child probe command failed.");
+              if (probeResponse.data?.disposition !== "handled") throw new Error("Child probe command was not handled.");
+              const report = await probe.promise;
+              if (report.error) throw new Error(report.error);
+              const active = report.tools;
+              const missing = task.tools.filter((tool) => !active.includes(tool));
+              if (missing.length) throw new Error(`Requested child tools are unavailable: ${missing.join(", ")}`);
+              if (active.length !== task.tools.length) throw new Error("Child tool selection did not match request.");
+            } finally {
+              clearTimeout(probeTimer);
             }
-            if (!fs.existsSync(invocation.probeFile)) throw new Error("Child tool probe did not report readiness.");
-            const probe = JSON.parse(fs.readFileSync(invocation.probeFile, "utf8")) as { tools?: unknown };
-            const active = Array.isArray(probe.tools) ? probe.tools.filter((tool): tool is string => typeof tool === "string") : [];
-            const missing = task.tools.filter((tool) => !active.includes(tool));
-            if (missing.length) throw new Error(`Requested child tools are unavailable: ${missing.join(", ")}`);
-            if (active.length !== task.tools.length) throw new Error("Child tool selection did not match request.");
-            try { fs.rmSync(invocation.probeFile, { force: true }); } catch { /* best effort */ }
           }
           data.model = effectiveModel;
           data.thinking = state.thinkingLevel;

@@ -64,7 +64,7 @@ At expiry the child is stopped and its result retains partial assistant output. 
 ## Child execution
 
 - **Public RPC boundary.** The child is spawned as `pi --mode rpc`; the parent speaks only the documented JSONL protocol. No `jiti`, no SDK bootstrap, and no private Pi module imports.
-- **Exact startup checks.** The parent verifies the child's effective model and thinking level with `get_state`, and a packaged probe extension reports the active tool set before the prompt is submitted and blocks calls outside the allowlist. A missing requested tool fails startup instead of silently running with fewer capabilities.
+- **Exact startup checks.** The parent verifies the child's effective model and thinking level with `get_state`, then uses a private readiness command to receive the active tool set as a typed RPC custom message before the prompt is submitted. The child probe also blocks calls outside the allowlist. A missing requested tool fails startup instead of silently running with fewer capabilities.
 - **Full Pi configuration.** The child loads its own settings, extensions, skills, MCP servers, and project instructions. A fresh conversation does not mean an empty system prompt.
 - **Isolation.** Each child runs in its own detached process group. A detached watchdog terminates the group if the parent dies without running shutdown hooks. Normal completion closes child stdin and waits for orderly Pi shutdown before ending the watchdog and sweeping descendants; cancellation and timeouts stop the tree promptly. The concurrency slot is held until cleanup finishes.
 - **Steering.** Steering messages use the RPC `steer` command and are delivered after the current assistant turn's tool calls. Steering is only available while the child is running.
