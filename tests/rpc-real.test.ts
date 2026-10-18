@@ -63,7 +63,7 @@ test("real RPC child executes a tool and reports usage", async () => {
   }
 }, 30_000);
 
-test("real RPC child fails before prompting when a requested tool does not load", async () => {
+test("missing tools exhaust startup, never the execution budget", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rpc-real-missing-"));
   const saved = { ...process.env };
   try {
@@ -78,13 +78,13 @@ test("real RPC child fails before prompting when a requested tool does not load"
     const result = await new RpcChildSupervisor().run({
       task: {
         id: "missing-tool", prompt: "must not run", cwd: dir,
-        tools: ["definitely_missing"], model: "fixture/model", executionTimeoutMs: 5_000, startupTimeoutMs: 8_000,
+        tools: ["definitely_missing"], model: "fixture/model", executionTimeoutMs: 5_000, startupTimeoutMs: 1_000,
       },
       signal: new AbortController().signal,
     });
-    expect(result.outcome).toBe("failed");
-    expect(result.errorKind).toBe("startup");
-    expect(result.errorMessage).toContain("unavailable");
+    expect(result.outcome).toBe("timed_out");
+    expect(result.errorKind).toBe("deadline");
+    expect(result.timeoutPhase).toBe("startup");
   } finally {
     Object.assign(process.env, saved);
     for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
@@ -338,7 +338,7 @@ export default (pi: any) => {
   }
 }, 30_000);
 
-test("probe deadline starts when readiness is requested, not during slow startup", async () => {
+test("late tools can use the startup budget beyond the old ten-second ceiling", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rpc-slow-start-"));
   const server = Bun.serve({
     hostname: "127.0.0.1", port: 0,
@@ -362,8 +362,8 @@ test("probe deadline starts when readiness is requested, not during slow startup
     fs.writeFileSync(path.join(dir, "slow.ts"), `import { setTimeout as delay } from "node:timers/promises";
 export default (pi: any) => {
   pi.on("session_start", async () => {
-    await delay(3300);
-    setTimeout(() => pi.registerTool({ name: "slow_tool", label: "slow", description: "late", parameters: { type: "object", properties: {}, additionalProperties: false }, execute: async () => ({ content: [{ type: "text", text: "late" }] }) }), 200);
+    await delay(1500);
+    setTimeout(() => pi.registerTool({ name: "slow_tool", label: "slow", description: "late", parameters: { type: "object", properties: {}, additionalProperties: false }, execute: async () => ({ content: [{ type: "text", text: "late" }] }) }), 11000);
   });
 }`);
     fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ extensions: [path.join(dir, "slow.ts")] }));
@@ -372,7 +372,7 @@ export default (pi: any) => {
     process.env.PI_SKIP_VERSION_CHECK = "1";
     delete process.env.PI_SUBAGENT_CLI;
     const result = await new RpcChildSupervisor().run({
-      task: { id: "slow-start", prompt: "say OK", cwd: dir, tools: ["slow_tool"], model: "fixture/model", executionTimeoutMs: 10_000, startupTimeoutMs: 6_000 },
+      task: { id: "slow-start", prompt: "say OK", cwd: dir, tools: ["slow_tool"], model: "fixture/model", executionTimeoutMs: 10_000, startupTimeoutMs: 15_000 },
       signal: new AbortController().signal,
     });
     expect(result.outcome).toBe("completed");

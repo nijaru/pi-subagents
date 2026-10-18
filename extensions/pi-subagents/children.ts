@@ -14,8 +14,10 @@ export interface ChildRun {
   notify: "inbox" | "turn";
   /** Inbox notifications are emitted at most once per parent turn. */
   inboxNotified: boolean;
-  /** Result delivery is independent of process completion and waiter lifetime. */
-  delivery: "unread" | "offered" | "published" | "delivered";
+  /** Only an explicit join/stop consumes a report; notices never do. */
+  delivery: "unread" | "delivered";
+  /** At most one continuation attempt per child in a parent run. */
+  continuationOffered: boolean;
   controller: AbortController;
   /** Terminal output is not publishable until process-tree cleanup finishes. */
   settled: boolean;
@@ -24,8 +26,9 @@ export interface ChildRun {
   waiters: Set<() => void>;
   /** In-flight joins. A blocking waiter claims delivery, so it suppresses the notice. */
   activeWaits: number;
-  /** Available once the child has accepted the prompt and can receive steering. */
+  /** Set at prompt acceptance; startup failure wakes readiness joins too. */
   control?: ChildControl;
+  readinessWaiters: Set<() => void>;
 }
 
 export interface StartChild {
@@ -82,7 +85,8 @@ export class SessionChildren {
     };
     const completion = Promise.withResolvers<void>();
     const run: ChildRun = {
-      result, handle, notify, inboxNotified: false, delivery: "unread", controller: new AbortController(), settled: false,
+      result, handle, notify, inboxNotified: false, delivery: "unread", continuationOffered: false,
+      controller: new AbortController(), settled: false, readinessWaiters: new Set(),
       promise: completion.promise, waiters: new Set(), activeWaits: 0,
     };
     const task: ChildTask = Object.freeze({
@@ -113,7 +117,11 @@ export class SessionChildren {
           run.result = copyResult({ ...run.result, ...data });
           if (progress !== undefined) present(progress);
         },
-        onControl: (control) => { run.control = control; },
+        onControl: (control) => {
+          run.control = control;
+          for (const ready of run.readinessWaiters) ready();
+          run.readinessWaiters.clear();
+        },
       });
       const settledAt = Date.now();
       run.result = copyResult({
@@ -142,6 +150,8 @@ export class SessionChildren {
         addUsage(this.pendingUsage, run.result.usage);
       }
       run.settled = true;
+      for (const ready of run.readinessWaiters) ready();
+      run.readinessWaiters.clear();
       for (const complete of run.waiters) complete();
       run.waiters.clear();
     }
@@ -154,12 +164,24 @@ export class SessionChildren {
     }
   }
 
-  /** Peek without transferring ownership into a host queue. */
+  /** Peek at unread reports eligible for an active-boundary announcement. */
   pendingCompletions(): ChildResult[] {
     if (this.closed) return [];
     return [...this.runs.values()]
-      .filter((run) => run.notify === "turn" && run.settled && run.delivery === "unread" && run.activeWaits === 0)
+      .filter((run) => run.notify === "turn" && !run.continuationOffered && run.settled && run.delivery === "unread" && run.activeWaits === 0)
       .map((run) => this.snapshot(run));
+  }
+
+  /** A new parent run may attempt another readiness announcement, never consume it. */
+  resetContinuationNotices(): void {
+    for (const run of this.runs.values()) run.continuationOffered = false;
+  }
+
+  offerCompletions(ids: readonly string[]): void {
+    for (const id of ids) {
+      const run = this.runs.get(id);
+      if (run?.settled) run.continuationOffered = true;
+    }
   }
 
   /** Allow unread inbox results to be advertised again in the next turn. */
@@ -180,53 +202,15 @@ export class SessionChildren {
   pendingInbox(): ChildResult[] {
     if (this.closed) return [];
     const pending = [...this.runs.values()]
-      .filter((run) => run.notify === "inbox" && run.settled && run.delivery === "unread" && run.activeWaits === 0 && !run.inboxNotified);
+      .filter((run) => run.settled && run.delivery === "unread" && run.activeWaits === 0 && !run.inboxNotified);
     for (const run of pending) run.inboxNotified = true;
     return pending.map((run) => this.snapshot(run));
   }
 
-  /** Published notices suppress duplicates but are not yet acknowledged. */
+  /** Notifications do not transfer ownership of an unread report. */
   unreadCompletionCount(): number {
     if (this.closed) return 0;
     return [...this.runs.values()].filter((run) => run.settled && run.delivery !== "delivered" && run.activeWaits === 0).length;
-  }
-
-  hasPublishedCompletions(): boolean {
-    return [...this.runs.values()].some((run) => run.delivery === "published");
-  }
-
-  acknowledgeCompletions(ids: ReadonlySet<string>, protectedKeys: ReadonlySet<string> = new Set()): void {
-    for (const id of ids) {
-      const run = this.runs.get(id) ?? [...this.runs.values()].find((candidate) => candidate.handle === id);
-      if (!run || run.delivery !== "published") continue;
-      // A tool call may reference the same child by handle or UUID.
-      if (protectedKeys.has(id) || protectedKeys.has(run.handle)) continue;
-      run.delivery = "delivered";
-    }
-  }
-
-  /** Boundary drafts are provisional until Pi commits them to the transcript. */
-  offerCompletions(ids: string[]): void {
-    for (const id of ids) {
-      const run = this.runs.get(id);
-      if (run?.settled && run.delivery === "unread") run.delivery = "offered";
-    }
-  }
-
-  hasOfferedCompletions(): boolean {
-    return [...this.runs.values()].some((run) => run.delivery === "offered");
-  }
-
-  /** Return whether another boundary handler removed a proposed delivery. */
-  reconcileCompletions(committedIds: Set<string>): boolean {
-    let dropped = false;
-    for (const run of this.runs.values()) {
-      if (run.delivery !== "offered") continue;
-      const committed = committedIds.has(run.result.id);
-      run.delivery = committed ? "published" : "unread";
-      dropped ||= !committed;
-    }
-    return dropped;
   }
 
   /** Pi custom completion messages cannot carry usage; the next tool result does. */
@@ -254,16 +238,24 @@ export class SessionChildren {
   }
 
   /** Queue a steering message into a running child. */
-  async steer(id: string, message: string): Promise<ChildResult> {
+  async steer(id: string, message: string, signal?: AbortSignal): Promise<ChildResult> {
     const run = this.get(id);
-    // A launch returns before the RPC child has accepted the prompt. Give the
-    // control channel a short, bounded window instead of making the caller poll.
-    for (let attempt = 0; attempt < 100 && !run.control && !run.settled; attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-    if (run.settled) throw new Error(`Child ${run.handle} is no longer running.`);
-    if (!run.control) throw new Error(`Child ${run.handle} did not become steerable in time.`);
-    await run.control.steer(message);
+    // The child's startup deadline bounds readiness. Cancelling this join must
+    // not cancel the child, just as cancelling wait leaves it running.
+    const control = await new Promise<ChildControl | undefined>((resolve, reject) => {
+      const cleanup = () => {
+        run.readinessWaiters.delete(ready);
+        signal?.removeEventListener("abort", abort);
+      };
+      const ready = () => { cleanup(); resolve(run.control); };
+      const abort = () => { cleanup(); reject(new Error("Steering cancelled; child continues.")); };
+      if (signal?.aborted) { abort(); return; }
+      if (run.settled || run.control) { ready(); return; }
+      signal?.addEventListener("abort", abort, { once: true });
+      run.readinessWaiters.add(ready);
+    });
+    if (run.settled || !control) throw new Error(`Child ${run.handle} is no longer running.`);
+    await control.steer(message, signal);
     return this.snapshot(run);
   }
 

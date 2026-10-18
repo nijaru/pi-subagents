@@ -2,7 +2,6 @@
 export const MAX_CONCURRENCY = 4;
 export const MAX_RETAINED_RUNS = 32;
 export const MAX_OUTPUT_BYTES = 50 * 1024;
-export const MAX_COMPLETION_BYTES = 8 * 1024;
 export const MAX_DIAGNOSTIC_BYTES = 8 * 1024;
 export const MAX_STDERR_BYTES = 50 * 1024;
 export const MAX_PROTOCOL_LINE_BYTES = 16 * 1024 * 1024;
@@ -22,7 +21,6 @@ export const RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
 export const TIMEOUT_ENV = "PI_SUBAGENT_TIMEOUT_MS";
 export const STARTUP_TIMEOUT_ENV = "PI_SUBAGENT_STARTUP_TIMEOUT_MS";
 export const FOREGROUND_ENV = "PI_SUBAGENT_FOREGROUND_MS";
-export const PASSTHROUGH_ENV = "PI_SUBAGENT_PASSTHROUGH_ENV";
 
 export function processTimeoutMs(): number {
   const configured = Number(process.env[TIMEOUT_ENV]);

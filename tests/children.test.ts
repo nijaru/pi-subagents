@@ -101,6 +101,32 @@ describe("session ownership", () => {
     expect(c.children.takePendingUsage()).toMatchObject({ input: 5, cost: { total: 1 } });
     await c.children.close();
   });
+  test("cancelled steering detaches readiness joins without stopping the child", async () => {
+    const c = controlled();
+    const run = c.start();
+    const controller = new AbortController();
+    const steering = c.children.steer(run.handle, "focus", controller.signal);
+    expect(run.readinessWaiters.size).toBe(1);
+    controller.abort();
+    await expect(steering).rejects.toThrow("Steering cancelled");
+    expect(run.readinessWaiters.size).toBe(0);
+    expect(run.controller.signal.aborted).toBe(false);
+    let delivered = false;
+    c.requests[0]!.onControl?.({ steer: async () => { delivered = true; } });
+    expect(delivered).toBe(false);
+    await c.children.steer(run.handle, "replacement");
+    expect(delivered).toBe(true);
+    await c.children.close();
+  });
+  test("startup failure wakes steering joins and clears listeners", async () => {
+    const c = controlled();
+    const run = c.start();
+    const steering = c.children.steer(run.handle, "focus");
+    c.gates[0]!.resolve();
+    await expect(steering).rejects.toThrow("no longer running");
+    expect(run.readinessWaiters.size).toBe(0);
+    await c.children.close();
+  });
   test("expired and cancelled waits release their completion listeners", async () => {
     const c = controlled();
     const run = c.start();

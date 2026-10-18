@@ -27,10 +27,10 @@ function host() {
   const context = {
     cwd, hasUI: false, tools: [{ name: "read" }, { name: "bash" }],
     model: { provider: "parent", id: "model" }, thinkingLevel: "high",
-    sessionManager: { getBranch: () => [] }, ui: { notify: (message: string) => notifications.push(message) },
+    sessionManager: { getBranch: () => [], getSessionFile: (): string | undefined => undefined }, ui: { notify: (message: string) => notifications.push(message) },
   };
   const instance = {
-    tool, cwd, commands, notifications,
+    tool, cwd, commands, notifications, context,
     execute: (params: any, signal?: AbortSignal) => tool.execute("call", params, signal, undefined, context),
   };
   hosts.push(instance);
@@ -88,7 +88,7 @@ describe("RPC-backed subagent tool", () => {
     const sessionFile = path.join(tempDir(), "previous.jsonl");
     fs.writeFileSync(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "previous", cwd: h.cwd })}\n`);
     const value = await h.execute({ command: "run", prompt: "continue", tools: [], resume: sessionFile });
-    expect(value.details.results[0].sessionFile).toBe(sessionFile);
+    expect(value.details.results[0].sessionFile).toBe(fs.realpathSync.native(sessionFile));
     expect(fs.readFileSync(path.join(h.cwd, ".fake-rpc-capture.json"), "utf8")).toContain("--session");
   });
 
@@ -99,6 +99,30 @@ describe("RPC-backed subagent tool", () => {
     const value = await h.execute({ command: "run", prompt: "hello", tools: [], persist: true });
     expect(value.details.results[0].sessionFile).toContain("sessions");
     expect(value.content[0].text).toContain("session:");
+  });
+
+  test("steering joins the child's startup deadline instead of a separate polling window", async () => {
+    const h = host();
+    process.env.FAKE_RPC_STARTUP_DELAY = "2800";
+    const started = await h.execute({ command: "spawn", prompt: "SCENARIO=steer", tools: [], startupTimeoutMs: 5000 });
+    const handle = started.details.results[0].handle;
+    try {
+      await h.execute({ command: "steer", id: handle, message: "late readiness" });
+      const result = await h.execute({ command: "wait", ids: [handle], timeoutMs: 1000 });
+      expect(result.details.results[0].output).toContain("late readiness");
+    } finally { await h.execute({ command: "stop", id: handle }); }
+  });
+
+  test("relative resumes use the parent cwd and cannot target its active session", async () => {
+    const h = host();
+    const file = path.join(h.cwd, "parent.jsonl");
+    fs.writeFileSync(file, `${JSON.stringify({ type: "session", cwd: h.cwd })}\n`);
+    h.context.sessionManager.getSessionFile = () => file;
+    await expect(h.execute({ command: "run", prompt: "x", tools: [], resume: "parent.jsonl" })).rejects.toThrow("active parent session");
+    h.context.sessionManager.getSessionFile = () => undefined;
+    const resumed = await h.execute({ command: "run", prompt: "x", tools: [], resume: "parent.jsonl" });
+    expect(resumed.details.results[0].state.outcome).toBe("completed");
+    expect(resumed.details.results[0].sessionFile).toBe(fs.realpathSync.native(file));
   });
 
   test("rejects invalid steering and obsolete fields before launch", async () => {

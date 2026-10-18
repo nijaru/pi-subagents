@@ -39,8 +39,8 @@ export const OutputTruncationSchema = Type.Object({
 export const ChildResultSchema = Type.Object({
   id: Type.String(),
   handle: Type.Optional(Type.String({ description: "Short session-scoped handle; preferred in wait/status/stop calls." })),
-  phase: Type.Optional(StringEnum(["starting", "running"] as const, { description: "Live execution phase; absent once terminal." })),
-  errorKind: Type.Optional(StringEnum(["startup", "provider", "protocol", "deadline", "cancelled", "unknown"] as const)),
+  phase: Type.Optional(StringEnum(["starting", "running", "stopping"] as const, { description: "Live execution phase; absent once terminal." })),
+  errorKind: Type.Optional(StringEnum(["startup", "provider", "protocol", "deadline", "cancelled", "cleanup", "unknown"] as const)),
   timeoutPhase: Type.Optional(StringEnum(["startup", "execution"] as const, { description: "Which deadline expired for a timed_out result." })),
   cleanupMs: Type.Optional(Type.Integer({ minimum: 0, description: "Process-tree cleanup time excluded from the reported task runtime." })),
   taskFinishedAt: Type.Optional(Type.Number({ minimum: 0, description: "Leader exit or terminal-cause time, before cleanup." })),
@@ -64,7 +64,7 @@ export const ChildResultSchema = Type.Object({
   notify: Type.Optional(StringEnum(["inbox", "turn"] as const, { description: "How completion is surfaced: inbox (next tool result) or turn (parent continuation)." })),
 }, { additionalProperties: false });
 
-/** One bounded envelope for tool details, structured results, and completion notices. */
+/** One bounded envelope for tool details and structured results; notices carry handles only. */
 export const SubagentDetailsSchema = Type.Object({
   command: StringEnum(["run", "spawn", "status", "wait", "stop", "steer"] as const),
   results: Type.Array(ChildResultSchema),

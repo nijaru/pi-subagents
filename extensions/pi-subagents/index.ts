@@ -1,3 +1,5 @@
+import * as path from "node:path";
+import { canonicalSession } from "./launch.ts";
 import type { AgentToolResult, ExtensionAPI, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
 import { Check, Errors } from "typebox/value";
 import { SessionChildren } from "./children.ts";
@@ -8,7 +10,7 @@ import { boundDetails, truncateOutput } from "./bounds.ts";
 import { addUsage, failed, isRunning } from "./types.ts";
 import { SubagentDetailsSchema } from "./result-schema.ts";
 import type { ChildResult, SubagentDetails } from "./types.ts";
-import { renderChildCall, renderChildResult, renderChildCompletion } from "./render.ts";
+import { renderChildCall, renderChildResult, renderChildNotice } from "./render.ts";
 import { CompletionDelivery } from "./delivery.ts";
 import { childStatus as summary, childReports, formatElapsed } from "./reports.ts";
 
@@ -55,7 +57,7 @@ function outcome(command: "run" | "wait", results: ChildResult[]): AgentToolResu
 }
 
 export default function (pi: ExtensionAPI) {
-  pi.registerMessageRenderer("subagent-complete", renderChildCompletion);
+  pi.registerMessageRenderer("subagent-ready", renderChildNotice);
   const createRuntime = () => {
     let delivery: CompletionDelivery;
     const children = new SessionChildren(new RpcChildSupervisor(), () => delivery.refreshStatus());
@@ -96,8 +98,7 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on("agent_start", (_event, ctx) => runtime.delivery.started(ctx));
   pi.on("agent_end", (event, ctx) => runtime.delivery.ended(event, ctx));
-  pi.on("turn_start", (_event, ctx) => { runtime.children.resetInboxNotices(); runtime.delivery.reconcile(ctx); });
-  pi.on("message_end", (event, ctx) => runtime.delivery.responded(event, ctx));
+  pi.on("turn_start", () => runtime.children.resetInboxNotices());
   pi.on("turn_end", (event, ctx) => runtime.delivery.boundary(event, ctx));
   pi.on("agent_before_settle", (event, ctx) => runtime.delivery.boundary(event, ctx));
   pi.on("agent_settled", (_event, ctx) => runtime.delivery.settled(ctx));
@@ -113,7 +114,7 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Give subagent children relevant evidence, scope, constraints, expected output and checks. Their conversations start fresh without parent history.",
       "Children default to read/search/web tools. Request bash, edit, or write explicitly only when the task needs mutations, and give concurrent writers separate worktrees.",
-      "Completion defaults to an inbox: the next tool result advertises unread handles, and subagent wait reads the reports. Use notify: \"turn\" only when the child must resume the parent immediately. Short sa-N handles are valid in wait/status/stop calls.",
+      "Completion notices only announce handles; they never consume reports. Use wait to retrieve and acknowledge reports, including after a notify: \"turn\" announcement. Short sa-N handles are valid in wait/status/stop calls.",
       "Prefer direct work over subagent for routine or tightly coupled tasks. Do not duplicate delegated work; the parent owns integration and verification.",
       "Spawn independent subagent tasks before waiting. Inbox results are advertised on the next tool result and never wake an idle parent; notify: \"turn\" opts into an active-boundary continuation. Use subagent wait with ids when blocked; it wakes when any finishes. Do not poll or wait again on reports already received. Cancelling wait leaves children running; stop cancels them.",
       "subagent run joins within a join budget; if it expires the child keeps working and reports completion like spawn, so never relaunch it as a duplicate.",
@@ -139,7 +140,7 @@ export default function (pi: ExtensionAPI) {
         return answer("stop", [result], childReports([result]));
       }
       if (params.command === "steer") {
-        const result = await owner.steer(params.id!, params.message!);
+        const result = await owner.steer(params.id!, params.message!, signal);
         return answer("steer", [result], `Steering queued for ${result.handle ?? result.id}.`);
       }
       if (params.command === "wait") {
@@ -153,6 +154,11 @@ export default function (pi: ExtensionAPI) {
       const allToolNames = typeof pi.getAllTools === "function" ? pi.getAllTools().map((tool) => tool.name) : [];
       const excludeTools = excludedChildTools(tools, [...new Set([...activeTools, ...callableTools, ...allToolNames])]);
       const cwd = resolveCwd(ctx.cwd || process.cwd(), params.cwd);
+      const resume = params.resume === undefined ? undefined : path.resolve(ctx.cwd, params.resume);
+      const parentSession = ctx.sessionManager.getSessionFile();
+      if (resume && parentSession && canonicalSession(resume) === canonicalSession(parentSession)) {
+        throw new Error("Cannot resume the active parent session as a child.");
+      }
       const foreground = params.command === "run";
       let presenting = foreground;
       const present = (result: ChildResult, progress: string) => {
@@ -172,7 +178,7 @@ export default function (pi: ExtensionAPI) {
         executionTimeoutMs: params.executionTimeoutMs,
         startupTimeoutMs: params.startupTimeoutMs,
         persist: params.persist,
-        resume: params.resume,
+        resume,
         trustProject: params.trustProject,
         excludeTools,
         notify: params.notify,

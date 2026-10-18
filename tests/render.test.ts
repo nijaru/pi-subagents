@@ -5,7 +5,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import extension from "../extensions/pi-subagents/index.ts";
-import { renderChildCall, renderChildResult, renderChildCompletion, stripTerminalControls } from "../extensions/pi-subagents/render.ts";
+import { renderChildCall, renderChildResult, renderChildNotice, stripTerminalControls } from "../extensions/pi-subagents/render.ts";
 import { childStatus, timeoutSummary } from "../extensions/pi-subagents/reports.ts";
 import { emptyUsage, type ChildResult, type SubagentDetails } from "../extensions/pi-subagents/types.ts";
 
@@ -58,10 +58,10 @@ describe("compact child rendering", () => {
       "subagent run", "✓ 900c096e completed · 8s",
     ]);
   });
-  test("a running row shows its phase once", () => {
-    const running = { ...child, state: { status: "running" } as const, phase: "running" as const, startedAt: undefined };
+  test.each(["starting", "running", "stopping"] as const)("a live row shows its %s phase once", (phase) => {
+    const running = { ...child, state: { status: "running" } as const, phase, startedAt: undefined };
     expect(lines("run", { command: "run", prompt: child.prompt }, false, [running])).toEqual([
-      "subagent run", "○ 900c096e running · Read the package version.",
+      "subagent run", `○ 900c096e ${phase} · Read the package version.`,
     ]);
   });
   test("targeted status and wait show the ID only in the call header", () => {
@@ -159,16 +159,15 @@ describe("compact child rendering", () => {
     expect(rows.join("")).not.toContain("\x1b[31m");
     expect(() => renderChildCall({ command: {}, prompt: 123, id: [] }, theme).render(40)).not.toThrow();
   });
-  test("timeout notice shows the runtime without repeating the generic cause", () => {
+  test("timeout report shows runtime without repeating the generic cause", () => {
     const timedOut: ChildResult = { ...child, output: undefined,
       state: { status: "terminal", outcome: "timed_out", exitCode: 1, finishedAt: 1_800_000 },
       errorMessage: timeoutSummary(1_800_000, 1_800_000),
     };
-    const message = { role: "custom" as const, customType: "subagent-complete", content: "Full report", display: true,
-      timestamp: 0, details: result("wait", [timedOut]).details };
-    expect(renderChildCompletion(message, { expanded: false, outputPad: 1 }, theme)!.render(120).map((line) => line.trim()))
-      .toEqual(["✗ subagent 900c096e timed out · 30m 0s"]);
-    const expanded = renderChildCompletion(message, { expanded: true, outputPad: 1 }, theme)!.render(120).join("\n");
+    const value = result("wait", [timedOut]);
+    expect(renderChildResult(value, { expanded: false }, theme).render(120).map((line) => line.trim()))
+      .toEqual(["✗ 900c096e timed out · 30m 0s"]);
+    const expanded = renderChildResult(value, { expanded: true }, theme).render(120).join("\n");
     expect(expanded).toContain("Subagent timed out during execution.");
     expect(expanded).toContain("execution deadline 30m 0s");
   });
@@ -185,16 +184,12 @@ describe("compact child rendering", () => {
     const oversized = result("run", [{ ...child, output: "x".repeat(200000) }]);
     expect(renderChildResult(oversized, { expanded: true }, theme).render(80).join("\n").length).toBeLessThan(70000);
   });
-  test("completion is a one-line notice with details available on expansion", () => {
-    const message = { role: "custom" as const, customType: "subagent-complete", content: "Full model-facing message", display: true, timestamp: 0, details: result("wait").details };
-    const before = JSON.stringify(message);
-    const compact = renderChildCompletion(message, { expanded: false, outputPad: 1 }, theme)!;
-    expect(compact.render(80).map((line) => line.trim())).toEqual(["✓ subagent 900c096e completed · 8s"]);
-    expect(compact.render(20)).toHaveLength(1);
-    const full = renderChildCompletion(message, { expanded: true, outputPad: 1 }, theme)!.render(80).join("\n");
-    expect(full).toContain(child.id);
-    expect(full).toContain(child.output!);
-    expect(full).toContain(child.prompt);
-    expect(JSON.stringify(message)).toBe(before);
+  test("readiness notices render safe text, never hidden reports", () => {
+    const message = { role: "custom" as const, customType: "subagent-ready", content: "Ready: sa-1\u001b[31m. Use wait.", display: true, timestamp: 0, details: { handles: ["sa-1"] } };
+    for (const expanded of [false, true]) {
+      const text = renderChildNotice(message, { expanded, outputPad: 1 }, theme)!.render(80).join("\n");
+      expect(text).toContain("Ready: sa-1. Use wait.");
+      expect(text).not.toContain("\u001b[31m");
+    }
   });
 });

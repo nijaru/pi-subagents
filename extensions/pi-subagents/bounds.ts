@@ -61,8 +61,7 @@ export function truncateHeadTail(value: string, maxBytes = MAX_STDERR_BYTES): st
  * Truncate output by bytes with a stable, bounded marker. This is deliberately
  * head truncation: the beginning of a subagent report contains its useful context.
  */
-export function truncateOutput(value: string, maxBytes = MAX_OUTPUT_BYTES): string {
-  const totalBytes = Buffer.byteLength(value, "utf8");
+export function truncateOutput(value: string, maxBytes = MAX_OUTPUT_BYTES, totalBytes = Buffer.byteLength(value, "utf8")): string {
   if (totalBytes <= maxBytes) return value;
   if (maxBytes <= 0) return "";
 

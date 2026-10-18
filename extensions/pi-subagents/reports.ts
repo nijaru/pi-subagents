@@ -29,7 +29,7 @@ export function timeoutSummary(elapsedMs: number, deadlineMs: number, phase: "st
   return `Subagent timed out during ${phase}. Elapsed ${formatElapsed(elapsedMs)}; ${phase} deadline ${formatElapsed(deadlineMs)}.`;
 }
 
-const AUTH_HINT = "Hint: Child env passes model refs and *_API_KEY/*_TOKEN credentials automatically. For non-credential variables, set PI_SUBAGENT_PASSTHROUGH_ENV with an exact name or glob and restart Pi. Auth in ~/.pi/agent/auth.json via /login needs no passthrough.";
+const AUTH_HINT = "Hint: Children inherit the parent process environment and load their own Pi credentials/configuration. Parent runtime-only providers and permission state are not copied.";
 
 /** Attach the child-credential hint to every auth-shaped failure. */
 export function withCredentialHint(message: string): string {
@@ -44,9 +44,9 @@ export function isTimeoutSummary(message: string | undefined): boolean {
 export function runtimeLabel(result: ChildResult): string {
   // Terminal timestamps include process-tree cleanup; report task runtime, not
   // the time the parent spent sweeping descendants.
-  const finishedAt = result.state.status === "terminal"
+  const finishedAt = result.taskFinishedAt ?? (result.state.status === "terminal"
     ? result.state.finishedAt - (result.cleanupMs ?? 0)
-    : undefined;
+    : undefined);
   const duration = formatDuration(result.startedAt, finishedAt);
   return duration ? `${duration}${isRunning(result) ? " elapsed" : ""}` : "";
 }

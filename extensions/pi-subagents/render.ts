@@ -1,6 +1,6 @@
 import type { AgentToolResult, MessageRenderer, Theme } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme, keyText } from "@earendil-works/pi-coding-agent";
-import { Box, Container, Markdown, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
+import { Container, Markdown, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { truncateHeadTail, truncateOutput } from "./bounds.ts";
 import { MAX_OUTPUT_BYTES, MAX_RETAINED_RUNS } from "./limits.ts";
 import { formatElapsed, isTimeoutSummary, resultText, runtimeLabel } from "./reports.ts";
@@ -64,8 +64,8 @@ function oneLine(text: string): string {
  * or a status listing, otherwise only a failure diagnostic. Successful reports
  * are agent-facing content and stay behind expansion.
  */
-function collapsedPreview(child: ChildResult, command: SubagentDetails["command"] | undefined, notification: boolean): string {
-  const statusList = !notification && command === "status";
+function collapsedPreview(child: ChildResult, command: SubagentDetails["command"] | undefined): string {
+  const statusList = command === "status";
   if (child.state.status === "running" || statusList) return child.omittedFields?.includes("prompt") ? "task not retained" : oneLine(child.prompt);
   if (child.state.outcome === "completed") return "";
   // The timeout heading already says what happened and how long it ran; the
@@ -118,22 +118,22 @@ function renderOutput(text: string, expanded: boolean, theme: Theme): Component 
   };
 }
 
-function childHeading(child: ChildResult, theme: Theme, options: { expanded: boolean; showId: boolean; notification: boolean; command?: SubagentDetails["command"] }): string {
-  const { expanded, showId, notification, command } = options;
+function childHeading(child: ChildResult, theme: Theme, options: { expanded: boolean; showId: boolean; command?: SubagentDetails["command"] }): string {
+  const { expanded, showId, command } = options;
   const active = child.state.status === "running";
   const outcome = child.state.status === "terminal" ? child.state.outcome : undefined;
   const status = active
-    ? child.phase === "starting" ? "starting" : command === "spawn" ? "started" : "running"
+    ? child.phase === "starting" || child.phase === "stopping" ? child.phase : command === "spawn" ? "started" : "running"
     : outcome!.replaceAll("_", " ");
   const color = active ? "muted" : outcome === "cancelled" || outcome === "incomplete" ? "warning" : failed(child) ? "error" : "success";
   const icon = active ? "○" : outcome === "cancelled" ? "−" : outcome === "incomplete" ? "!" : failed(child) ? "✗" : "✓";
   const id = showId ? `${theme.fg("accent", displayId(child.handle ?? child.id, expanded))} ` : "";
   // Spawn/status/wait are snapshots, not live activity indicators.
   const duration = active && command !== "run" ? "" : runtimeLabel(child);
-  return `${theme.fg(color, icon)} ${notification ? "subagent " : ""}${id}${theme.fg(color, status)}${duration ? theme.fg("dim", ` · ${duration}`) : ""}`;
+  return `${theme.fg(color, icon)} ${id}${theme.fg(color, status)}${duration ? theme.fg("dim", ` · ${duration}`) : ""}`;
 }
 
-function renderChildren(details: unknown, expanded: boolean, theme: Theme, targetId?: string, notification = false): Component | undefined {
+function renderChildren(details: unknown, expanded: boolean, theme: Theme, targetId?: string): Component | undefined {
   const data = details as Partial<SubagentDetails> | undefined;
   const results = Array.isArray(data?.results) ? data.results.slice(0, MAX_RETAINED_RUNS) : [];
   if (!results.length || !results.every(isRenderableChildResult)) return undefined;
@@ -142,12 +142,12 @@ function renderChildren(details: unknown, expanded: boolean, theme: Theme, targe
   for (const child of results) {
     const active = child.state.status === "running";
     const targeted = targetId !== undefined && (child.id === targetId || child.handle === targetId);
-    const heading = childHeading(child, theme, { expanded, showId: notification || !targeted, notification, command: data?.command });
+    const heading = childHeading(child, theme, { expanded, showId: !targeted, command: data?.command });
     if (expanded) {
       container.addChild(new Text(heading, 0, 0));
     } else {
       // One status line per child: outcome, duration, and a single-line preview.
-      const preview = collapsedPreview(child, data?.command, notification);
+      const preview = collapsedPreview(child, data?.command);
       container.addChild(singleLine(preview ? `${heading} · ${theme.fg("dim", preview)}` : heading));
     }
     if (active && data?.command === "wait") {
@@ -193,10 +193,5 @@ export function renderChildResult(result: AgentToolResult<SubagentDetails>, { ex
   return renderOutput(text?.type === "text" && typeof text.text === "string" ? clean(text.text) : "(no output)", expanded, theme);
 }
 
-export const renderChildCompletion: MessageRenderer = (message, { expanded, outputPad }, theme) => {
-  const rendered = renderChildren(message.details, expanded, theme, undefined, true);
-  if (!rendered) return new Text(typeof message.content === "string" ? clean(message.content) : "Background child finished.", outputPad, 0);
-  const box = new Box(outputPad, 0, (text) => theme.bg("customMessageBg", text));
-  box.addChild(rendered);
-  return box;
-};
+export const renderChildNotice: MessageRenderer = (message, { outputPad }) =>
+  new Text(typeof message.content === "string" ? clean(message.content) : "Child results ready; use subagent wait.", outputPad, 0);

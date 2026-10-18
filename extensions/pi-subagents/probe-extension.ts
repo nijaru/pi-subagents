@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { PROBE_COMMAND, PROBE_CUSTOM_TYPE, PROBE_TIMEOUT_ENV, PROBE_TOKEN_ENV, PROBE_TOOLS_ENV, type ProbeReport } from "./probe-protocol.ts";
+import { PROBE_COMMAND, PROBE_CUSTOM_TYPE, PROBE_DEADLINE_ENV, PROBE_TOKEN_ENV, PROBE_TOOLS_ENV, type ProbeReport } from "./probe-protocol.ts";
 
 /**
  * Loaded only in RPC children. It reports the active tool set after startup so
@@ -10,20 +10,17 @@ export default function subagentProbe(pi: ExtensionAPI): void {
   let requested: string[] = [];
   try { requested = JSON.parse(process.env[PROBE_TOOLS_ENV] ?? "[]"); } catch { /* invalid request */ }
   const token = process.env[PROBE_TOKEN_ENV] ?? "";
-  const configured = Number(process.env[PROBE_TIMEOUT_ENV]);
-  const timeout = Number.isSafeInteger(configured) && configured > 0 ? Math.min(configured, 5 * 60_000) : 10_000;
-  let deadline: number | undefined;
+  const deadline = Number(process.env[PROBE_DEADLINE_ENV]);
   const allowed = new Set(requested);
   let sending = false;
 
   const report = () => {
     if (sending) return;
-    deadline ??= Date.now() + timeout;
     let active: string[] = [];
     try { active = pi.getActiveTools(); } catch { /* runtime not ready */ }
     const missing = requested.filter((name) => !active.includes(name));
     // Tool registration can be asynchronous (MCP, codemode, slow extensions).
-    if (missing.length && Date.now() < deadline) {
+    if (missing.length && Number.isSafeInteger(deadline) && Date.now() < deadline) {
       setTimeout(report, 50);
       return;
     }

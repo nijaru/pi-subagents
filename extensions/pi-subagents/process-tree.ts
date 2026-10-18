@@ -137,7 +137,7 @@ export async function spawnDeathWatchdog(child: ChildProcess, command: string): 
 }
 
 /** Sweep only the detached root group after its leader exits. */
-export async function sweepRootProcessGroup(child: ChildProcess): Promise<void> {
+export async function sweepRootProcessGroup(child: ChildProcess, signal?: AbortSignal): Promise<void> {
   if (!child.pid) return;
   if (process.platform === "win32") {
     await new Promise<void>((resolve) => {
@@ -165,15 +165,77 @@ export async function sweepRootProcessGroup(child: ChildProcess): Promise<void> 
   };
   const waitForGroupExit = async (timeoutMs: number): Promise<void> => {
     const deadline = Date.now() + timeoutMs;
-    while (groupExists() && Date.now() < deadline) await delay(25);
+    while (!signal?.aborted && groupExists() && Date.now() < deadline) await delay(25);
   };
   // Preserve the previous graceful-cleanup window before forcing the group.
   await waitForGroupExit(5000);
-  if (!groupExists()) return;
+  if (signal?.aborted || !groupExists()) return;
   try {
     process.kill(-child.pid, "SIGKILL");
   } catch {
     return;
   }
   await waitForGroupExit(1000);
+}
+
+export function hasExited(child: ChildProcess): boolean {
+  return !child.pid || child.exitCode !== null || child.signalCode !== null;
+}
+
+function waitForExit(child: ChildProcess, timeoutMs: number): Promise<void> {
+  if (hasExited(child)) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => { clearTimeout(timer); child.off("exit", done); resolve(); };
+    const timer = setTimeout(done, timeoutMs);
+    child.once("exit", done);
+    if (hasExited(child)) done();
+  });
+}
+
+/** One cleanup owner; its outer deadline is independent of task/startup timers. */
+export async function cleanupChild(child: ChildProcess, watchdog: ChildProcess | undefined, orderly: boolean): Promise<{ leaderExited: boolean; error?: string }> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<string>((resolve) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      try { terminateProcessTree(child, "SIGKILL"); } catch { /* Retain unconfirmed ownership below. */ }
+      resolve("Child process cleanup exceeded its 16-second deadline.");
+    }, 16_000);
+  });
+  const cleanup = async (): Promise<string | undefined> => {
+    if (orderly) {
+      child.stdin?.end();
+      await waitForExit(child, 3_000);
+    }
+    if (!orderly || !hasExited(child)) {
+      if (controller.signal.aborted) return;
+      terminateProcessTree(child, "SIGTERM");
+      child.stdin?.end();
+      await waitForExit(child, 3_000);
+      if (controller.signal.aborted) return;
+      // Escalate the saved descendant snapshot even if the leader has exited.
+      terminateProcessTree(child, "SIGKILL");
+      await waitForExit(child, 1_000);
+    }
+    if (controller.signal.aborted) return;
+    await sweepRootProcessGroup(child, controller.signal);
+    return hasExited(child) ? undefined : "Child process exit could not be confirmed after cleanup.";
+  };
+  try {
+    const error = await Promise.race([cleanup(), deadline]);
+    return { leaderExited: hasExited(child), ...(error ? { error } : {}) };
+  } catch (error) {
+    controller.abort();
+    try { terminateProcessTree(child, "SIGKILL"); } catch { /* Best effort; report unconfirmed cleanup. */ }
+    await waitForExit(child, 1_000);
+    return { leaderExited: hasExited(child), error: `Child process cleanup failed: ${error instanceof Error ? error.message : error}` };
+  } finally {
+    if (timer) clearTimeout(timer);
+    // Only disarm after orderly shutdown/escalation, never before async hooks.
+    watchdog?.stdin?.end();
+    child.stdin?.destroy();
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+  }
 }

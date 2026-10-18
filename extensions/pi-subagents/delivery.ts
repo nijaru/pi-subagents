@@ -1,41 +1,7 @@
-import type { AgentBeforeSettleEvent, AgentEndEvent, BoundaryResult, ExtensionContext, MessageEndEvent, TurnEndEvent } from "@earendil-works/pi-coding-agent";
-import { boundDetails } from "./bounds.ts";
+import type { AgentBeforeSettleEvent, AgentEndEvent, BoundaryResult, ExtensionContext, TurnEndEvent } from "@earendil-works/pi-coding-agent";
 import { SessionChildren } from "./children.ts";
-import { MAX_COMPLETION_BYTES } from "./limits.ts";
-import { childReports } from "./reports.ts";
-import type { ChildResult, SubagentDetails } from "./types.ts";
 
-function completionMessage(results: ChildResult[]) {
-  return {
-    customType: "subagent-complete",
-    content: `${results.length === 1 ? "Background child finished." : "Background children finished."}\n${childReports(results, { maxReportBytes: MAX_COMPLETION_BYTES })}`,
-    display: true,
-    details: boundDetails({ command: "wait", results }),
-  };
-}
-
-function completionIds(details: unknown): string[] {
-  const results = (details as Partial<SubagentDetails> | undefined)?.results;
-  return Array.isArray(results) ? results.flatMap((result) => typeof result?.id === "string" ? [result.id] : []) : [];
-}
-
-/** Child ids the response's own tool calls still need before admission runs. */
-function referencedChildIds(message: MessageEndEvent["message"]): Set<string> {
-  const ids = new Set<string>();
-  const content = (message as { content?: unknown }).content;
-  if (!Array.isArray(content)) return ids;
-  for (const part of content) {
-    if (!part || typeof part !== "object") continue;
-    const block = part as { type?: unknown; name?: unknown; arguments?: unknown };
-    if (block.type !== "toolCall" || block.name !== "subagent" || !block.arguments || typeof block.arguments !== "object") continue;
-    const args = block.arguments as { id?: unknown; ids?: unknown };
-    if (typeof args.id === "string") ids.add(args.id);
-    if (Array.isArray(args.ids)) for (const id of args.ids) if (typeof id === "string") ids.add(id);
-  }
-  return ids;
-}
-
-/** Host turn policy only. SessionChildren owns whether a result is still unread. */
+/** Readiness announcements never contain or acknowledge the child's report. */
 export class CompletionDelivery {
   private ctx?: ExtensionContext;
   private closed = false;
@@ -54,6 +20,7 @@ export class CompletionDelivery {
   started(ctx: ExtensionContext): void {
     this.bind(ctx);
     this.suppressDelivery = false;
+    this.children.resetContinuationNotices();
   }
 
   ended(event: AgentEndEvent, ctx: ExtensionContext): void {
@@ -62,75 +29,37 @@ export class CompletionDelivery {
     if (last?.role === "assistant" && (last.stopReason === "aborted" || last.stopReason === "error")) this.suppressDelivery = true;
   }
 
-  /** Called after a boundary has committed, not while its draft is being built. */
-  reconcile(ctx: ExtensionContext): boolean {
-    this.bind(ctx);
-    if (!this.children.hasOfferedCompletions()) return false;
-    const ids = new Set<string>();
-    for (const entry of ctx.sessionManager.getBranch()) {
-      if (entry.type !== "custom_message" || entry.customType !== "subagent-complete") continue;
-      for (const id of completionIds(entry.details)) ids.add(id);
-    }
-    const dropped = this.children.reconcileCompletions(ids);
-    if (dropped) this.suppressDelivery = true;
-    this.refreshStatus();
-    return dropped;
-  }
-
-  responded(event: MessageEndEvent, ctx: ExtensionContext): void {
-    if (this.closed || ctx.signal?.aborted || event.message.role !== "assistant") return;
-    if (!["stop", "toolUse", "length"].includes(event.message.stopReason)) return;
-    this.reconcile(ctx);
-    if (!this.children.hasPublishedCompletions()) return;
-    // A successful assistant response acknowledges the preceding visible notices
-    // before its tools run, so admission can reclaim their retained handles.
-    // This is canonical-context evidence, not a provider-specific wire receipt.
-    const ids = new Set<string>();
-    for (const entry of ctx.sessionManager.buildSessionProjection().entries) {
-      const source = entry.sourceEntry;
-      if (source.type !== "custom_message" || source.customType !== "subagent-complete") continue;
-      // Do not acknowledge a notice removed, compacted or redacted out of context.
-      if (!entry.messages.some((message) => message.role === "custom" && message.content === source.content)) continue;
-      for (const id of completionIds(source.details)) ids.add(id);
-    }
-    // A response's tools have not run yet. Do not evict a handle that its own
-    // wait/status/stop call still references; the next response acknowledges it.
-    const protectedIds = referencedChildIds(event.message);
-    this.children.acknowledgeCompletions(ids, protectedIds);
-    this.refreshStatus();
-  }
-
   boundary(event: TurnEndEvent | AgentBeforeSettleEvent, ctx: ExtensionContext): BoundaryResult | undefined {
     if (this.closed) return;
-    this.reconcile(ctx);
-    // Pi's outcome follows the assistant stop reason, so an aborted tool turn
-    // can still report "completed". Publication alone is not acknowledgement:
-    // a later boundary handler may abort before the next request starts.
-    const stopped = event.outcome !== "completed" || ctx.signal?.aborted === true;
-    this.suppressDelivery ||= stopped;
-    // Never turn an abort or provider failure into an automatic restart.
+    this.bind(ctx);
+    this.suppressDelivery ||= event.outcome !== "completed" || ctx.signal?.aborted === true;
     if (this.suppressDelivery) return;
     const results = this.children.pendingCompletions();
     if (!results.length) return;
-    const message = completionMessage(results);
+    // One attempt per child per parent run avoids continuation loops even if a
+    // later extension drops this draft. Reports remain unread, discoverable in
+    // the inbox/status, and eligible again on the next parent run.
     this.children.offerCompletions(results.map((result) => result.id));
-    this.refreshStatus();
-    // Pi coalesces this with any naturally required next request. Unlike a
-    // follow-up queue, a later wait cannot race a second prequeued delivery.
-    return { entries: [...event.entries, { type: "custom_message", ...message }], continue: true };
+    const handles = results.map((result) => result.handle ?? result.id);
+    return {
+      entries: [...event.entries, {
+        type: "custom_message", customType: "subagent-ready", display: true,
+        content: `Child results ready: ${handles.join(", ")}. Read them with subagent wait; this notice does not contain their reports.`,
+        details: { handles },
+      }],
+      continue: true,
+    };
   }
 
   settled(ctx: ExtensionContext): void {
     if (this.closed) return;
-    this.reconcile(ctx);
+    this.bind(ctx);
     this.refreshStatus();
-    // Pi exposes no late session abort signal. Neither settlement nor a later
-    // completion may wake an idle parent: doing so can undo an invisible abort.
-    // Reports remain unread for an active-turn boundary or an explicit join.
+    // Never wake an idle parent: Pi has no reliable late idle-abort signal.
   }
 
   close(): void {
     this.closed = true;
-    try { this.ctx?.ui?.setStatus("subagents", undefined); } catch { /* The host may already be gone. */ }
+    try { this.ctx?.ui?.setStatus("subagents", undefined); } catch { /* Host may already be gone. */ }
   }
 }

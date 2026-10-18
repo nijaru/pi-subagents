@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { RpcChildSupervisor, getRpcInvocation, startupRemainingMs, type ChildControl, type ChildTask } from "../extensions/pi-subagents/supervisor.ts";
+import { getRpcInvocation } from "../extensions/pi-subagents/launch.ts";
+import { RpcChildSupervisor, startupRemainingMs, type ChildControl, type ChildTask } from "../extensions/pi-subagents/supervisor.ts";
 
 const directories: string[] = [];
 function tempDir(): string {
@@ -53,7 +54,7 @@ describe("public RPC child host", () => {
     process.env.PI_SUBAGENT_SESSION_DIR = sessionDir;
     const result = await run(task(dir, { persist: true }));
     expect(result.outcome).toBe("completed");
-    expect(result.sessionFile).toBe(path.join(sessionDir, "run-1.jsonl"));
+    expect(result.sessionFile).toBe(path.join(fs.realpathSync.native(sessionDir), "run-1.jsonl"));
     const capture = JSON.parse(fs.readFileSync(path.join(dir, ".fake-rpc-capture.json"), "utf8"));
     expect(capture.args).toContain("--session");
     expect(capture.args).not.toContain("--no-session");
@@ -168,7 +169,7 @@ test("resume and trustProject are passed to the child invocation", () => {
   const session = path.join(dir, "existing.jsonl");
   fs.writeFileSync(session, `${JSON.stringify({ type: "session", version: 3, id: "existing", cwd: dir })}\n`);
   const invocation = getRpcInvocation(task(dir, { resume: session, trustProject: true }));
-  expect(invocation.sessionFile).toBe(session);
+  expect(invocation.sessionFile).toBe(fs.realpathSync.native(session));
   expect(invocation.args).toContain("--session");
   expect(invocation.args).toContain("--approve");
   expect(invocation.args).not.toContain("--no-session");
@@ -232,7 +233,7 @@ test("passes explicit nested-tool exclusions to the child CLI", () => {
 test("startup command budgets use the remaining resolved deadline", () => {
   expect(startupRemainingMs(0, 60_000, 31_000)).toBe(29_000);
   expect(startupRemainingMs(0, 60_000, 1_000)).toBe(59_000);
-  expect(startupRemainingMs(0, 500, 900)).toBe(1_000);
+  expect(startupRemainingMs(0, 500, 900)).toBe(1);
 });
 
 test("fails before prompting when the probe command is unavailable", async () => {
@@ -252,4 +253,51 @@ test("refuses to resume a session from a different workspace", () => {
   const session = path.join(first, "session.jsonl");
   fs.writeFileSync(session, `${JSON.stringify({ type: "session", version: 3, id: "x", cwd: first })}\n`);
   expect(() => getRpcInvocation(task(second, { resume: session }))).toThrow("does not match requested cwd");
+});
+
+test("session ownership spans orderly shutdown and is released before returning", async () => {
+  const dir = tempDir();
+  const session = path.join(dir, "owned.jsonl");
+  fs.writeFileSync(session, `${JSON.stringify({ type: "session", cwd: dir })}\n`);
+  const stopping = Promise.withResolvers<void>();
+  const first = run(task(dir, { resume: session, prompt: "SCENARIO=shutdown" }), undefined,
+    (data: { phase: string }) => { if (data.phase === "stopping") stopping.resolve(); });
+  try {
+    await stopping.promise;
+    const contender = await run(task(dir, { resume: session }));
+    expect(contender.outcome).toBe("failed");
+    expect(contender.errorKind).toBe("startup");
+    expect(contender.errorMessage).toContain("already owned");
+  } finally { await first; }
+  expect(fs.existsSync(path.join(dir, "shutdown.done"))).toBe(true);
+  expect((await run(task(dir, { resume: session }))).outcome).toBe("completed");
+});
+
+test.each([
+  { id: "startup", startupTimeoutMs: 80 },
+  { id: "failed", prompt: "SCENARIO=fail" },
+  { id: "deadline", prompt: "SCENARIO=slow", executionTimeoutMs: 100 },
+])("failed child $id releases session ownership after cleanup", async (options) => {
+  const dir = tempDir();
+  const session = path.join(dir, "owned.jsonl");
+  fs.writeFileSync(session, `${JSON.stringify({ type: "session", cwd: dir })}\n`);
+  const result = await run(task(dir, { resume: session, ...options }));
+  expect(result.outcome).not.toBe("completed");
+  expect((await run(task(dir, { resume: session }))).outcome).toBe("completed");
+});
+
+test("drains buffered terminal records when the child exits immediately", async () => {
+  const result = await run(task(tempDir(), { prompt: "SCENARIO=exit-final" }));
+  expect(result.outcome).toBe("completed");
+  expect(result.output).toContain("BUFFERED_FINAL");
+  expect(result.outputTruncation?.originalBytes).toBe(Buffer.byteLength("BUFFERED_FINAL".repeat(40000)));
+});
+
+test("interrupted streams keep truthful byte counts beyond the retained buffer", async () => {
+  const result = await run(task(tempDir(), { prompt: "SCENARIO=partial-large", executionTimeoutMs: 200 }));
+  const total = Buffer.byteLength("界🙂".repeat(1000)) * 32;
+  expect(result.outcome).toBe("timed_out");
+  expect(result.outputTruncation).toMatchObject({ truncated: true, originalBytes: total });
+  expect(result.outputTruncation?.retainedBytes).toBe(Buffer.byteLength(result.output!));
+  expect(result.output).toContain(`of ${total} bytes`);
 });

@@ -76,7 +76,7 @@ describe("tool selection", () => {
 });
 
 describe("child environment", () => {
-  test("forwards model refs and credentials, not unrelated application state", () => {
+  test("inherits provider, tool and shell configuration without credential heuristics", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-children-env-")); dirs.push(dir);
     process.env.PI_CODING_AGENT_DIR = dir;
     process.env.CHILD_TEST_MODEL_SECRET = "model-secret";
@@ -91,18 +91,22 @@ describe("child environment", () => {
     expect(child.child_test_header).toBe("header-secret");
     expect(child.CHILD_TEST_API_KEY).toBe("api-key");
     expect(child.CHILD_TEST_TOKEN).toBe("token");
-    expect(child.CHILD_TEST_APP_VALUE).toBeUndefined();
+    expect(child.CHILD_TEST_APP_VALUE).toBe("private-app-state");
     expect(child.PI_SUBAGENT_DEPTH).toBe("1");
     expect(child.PI_SUBAGENT_RUN_ID).toBe("child-1");
     expect(child.PWD).toBe(dir);
   });
-  test("explicit passthrough supports globs but cannot override the child marker", () => {
-    process.env.CHILD_TEST_APP_VALUE = "allowed";
+  test("does not lend parent session identity or mutate its environment", () => {
+    process.env.PI_SESSION_ID = "parent-session";
+    process.env.PI_INTERCOM_SESSION_ID = "parent-intercom";
     process.env.PI_SUBAGENT_DEPTH = "0";
-    process.env.PI_SUBAGENT_PASSTHROUGH_ENV = "CHILD_TEST_*,PI_SUBAGENT_DEPTH";
-    const child = childEnvironment("id", process.cwd());
-    expect(child.CHILD_TEST_APP_VALUE).toBe("allowed");
+    const child = childEnvironment("id", "/child");
+    expect(child.PI_SESSION_ID).toBeUndefined();
+    expect(child.PI_INTERCOM_SESSION_ID).toBeUndefined();
     expect(child.PI_SUBAGENT_DEPTH).toBe("1");
+    expect(child.PWD).toBe("/child");
+    expect(process.env.PI_SESSION_ID).toBe("parent-session");
+    expect(process.env.PI_SUBAGENT_DEPTH).toBe("0");
   });
 });
 

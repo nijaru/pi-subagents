@@ -26,6 +26,16 @@ let scenario = "ok";
 
 function emitTask() {
   if (scenario === "startup") return;
+  if (scenario === "exit-final") {
+    send({ type: "message_end", message: message("BUFFERED_FINAL".repeat(40000)) });
+    process.stdout.write(JSON.stringify({ type: "agent_settled", aborted: false }) + "\n", () => process.exit(0));
+    return;
+  }
+  if (scenario === "partial-large") {
+    send({ type: "message_start", message: { role: "assistant", content: [] } });
+    for (let i = 0; i < 32; i++) send({ type: "message_update", usage, assistantMessageEvent: { type: "text_delta", delta: "界🙂".repeat(1000) } });
+    return;
+  }
   if (scenario === "exit") { process.exit(1); }
   if (scenario === "fail") {
     send({ type: "message_end", message: message("", "error") });
@@ -104,11 +114,11 @@ input.on("line", (line) => {
   }
   if (command.type === "get_state") {
     if (startupScenario) return;
-    send({ id: command.id, type: "response", command: "get_state", success: true, data: {
+    setTimeout(() => send({ id: command.id, type: "response", command: "get_state", success: true, data: {
       model: { provider, id: modelId }, thinkingLevel: thinking, isStreaming: false, isCompacting: false,
       steeringMode: "all", followUpMode: "all", sessionId: "fake", autoCompactionEnabled: true,
       messageCount: 0, pendingMessageCount: 0,
-    } });
+    } }), Number(process.env.FAKE_RPC_STARTUP_DELAY ?? 0));
     return;
   }
   if (command.type === "prompt") {
@@ -129,14 +139,7 @@ input.on("line", (line) => {
   if (command.type === "steer") {
     fs.writeFileSync(".fake-rpc-steer", command.message);
     send({ id: command.id, type: "response", command: "steer", success: true, data: { disposition: "queued" } });
-    if (scenario === "descendant") {
-    const descendant = spawn("sh", ["-c", "sleep 30"], { stdio: "ignore" });
-    fs.writeFileSync("descendant.pid", String(descendant.pid));
-    send({ type: "message_end", message: message("done") });
-    settle();
-    return;
-  }
-  if (scenario === "steer") {
+    if (scenario === "steer") {
       send({ type: "message_end", message: message(`steered: ${command.message}`) });
       settle();
     }
