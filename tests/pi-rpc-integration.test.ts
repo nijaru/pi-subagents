@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 // A real Pi parent, a real RPC child, and only the model HTTP endpoint faked.
-test("real Pi parent delegates through a real RPC child", async () => {
+test.each(["run", "spawn"] as const)("real Pi parent delegates with %s and retrieves the report explicitly", async (mode) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rpc-parent-"));
   const requests: any[] = [];
   const server = Bun.serve({
@@ -20,10 +20,24 @@ test("real Pi parent delegates through a real RPC child", async () => {
       if (isParent && !returned) {
         delta = { tool_calls: [{ index: 0, id: "parent_subagent", type: "function", function: {
           name: "subagent",
-          arguments: JSON.stringify({ command: "run", prompt: "/capture CHILD_SENTINEL: read fixture.txt and report it.", tools: ["read"] }),
+          arguments: JSON.stringify({ command: mode, notify: "turn", prompt: "/capture CHILD_SENTINEL: read fixture.txt and report it.", tools: ["read"] }),
         } }] };
       } else if (isParent) {
-        delta = { content: "PARENT_OK" };
+        const text = JSON.stringify(body.messages);
+        if (mode === "run" || body.messages.some((message: any) => message.role === "tool" && JSON.stringify(message.content).includes("CHILD_OK"))) {
+          delta = { content: "PARENT_OK" };
+        } else {
+          const handle = /Started child (sa-\d+)/.exec(text)?.[1];
+          if (!handle) throw new Error("Spawn did not expose a handle.");
+          const announced = text.includes("Child results ready:");
+          // Keep the parent active through public status snapshots until the
+          // child settles. The continuation notice must then cause an explicit
+          // wait, not silently deliver or acknowledge the report.
+          if (!announced) await Bun.sleep(20);
+          delta = { tool_calls: [{ index: 0, id: `parent_${requests.length}`, type: "function", function: {
+            name: "subagent", arguments: JSON.stringify(announced ? { command: "wait", ids: [handle] } : { command: "status", id: handle }),
+          } }] };
+        }
       } else if (isChild && !returned) {
         delta = { tool_calls: [{ index: 0, id: "child_read", type: "function", function: {
           name: "read", arguments: JSON.stringify({ path: "fixture.txt" }),
@@ -36,7 +50,7 @@ test("real Pi parent delegates through a real RPC child", async () => {
         choices: [{ index: 0, delta: part, finish_reason }],
         usage: finish_reason ? { prompt_tokens: isParent ? 10 : 20, completion_tokens: 2, total_tokens: isParent ? 12 : 22 } : undefined,
       })}\n\n`;
-      return new Response(chunk({ role: "assistant", ...delta }, null) + chunk({}, returned ? "stop" : "tool_calls") + "data: [DONE]\n\n", {
+      return new Response(chunk({ role: "assistant", ...delta }, null) + chunk({}, delta.tool_calls ? "tool_calls" : "stop") + "data: [DONE]\n\n", {
         headers: { "Content-Type": "text/event-stream" },
       });
     },
@@ -81,8 +95,17 @@ export default (pi: any) => pi.registerCommand("capture", { handler: async () =>
     const events = out.trim().split("\n").map((line) => JSON.parse(line));
     const delegated = events.find((event) => event.type === "message_end" && event.message.role === "toolResult" && event.message.toolName === "subagent");
     expect(delegated.message.isError).toBe(false);
-    expect(JSON.stringify(delegated.message)).toContain("CHILD_OK");
-    expect(requests).toHaveLength(4);
+    if (mode === "run") expect(JSON.stringify(delegated.message)).toContain("CHILD_OK");
+    else expect(delegated.message.details.command).toBe("spawn");
+    if (mode === "run") expect(requests).toHaveLength(4);
+    else {
+      const announced = requests.find((request) => JSON.stringify(request.messages).includes("Child results ready:"));
+      expect(announced).toBeDefined();
+      expect(JSON.stringify(announced.messages)).not.toContain("CHILD_OK");
+      const reports = events.filter((event) => event.type === "message_end" && event.message.role === "toolResult" && event.message.details?.command === "wait");
+      expect(reports).toHaveLength(1);
+      expect(reports[0].message.details.results[0].state.outcome).toBe("completed");
+    }
     const childRequests = requests.filter((request) => request.tools.length === 1 && request.tools[0].function.name === "read");
     expect(childRequests).toHaveLength(2);
     expect(childRequests[0].tools.map((tool: any) => tool.function.name)).toEqual(["read"]);

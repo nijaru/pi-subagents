@@ -15,12 +15,13 @@ function tempDir(): string {
 function host() {
   let tool: any;
   const commands = new Map<string, any>();
+  const handlers = new Map<string, any>();
   const notifications: string[] = [];
   extension({
     registerTool(value: any) { tool = value; },
     registerMessageRenderer() {},
     registerCommand(name: string, command: any) { commands.set(name, command); },
-    on() {},
+    on(name: string, handler: any) { handlers.set(name, handler); },
     getActiveTools() { return ["read", "bash"]; },
   } as any);
   const cwd = tempDir();
@@ -30,7 +31,7 @@ function host() {
     sessionManager: { getBranch: () => [], getSessionFile: (): string | undefined => undefined }, ui: { notify: (message: string) => notifications.push(message) },
   };
   const instance = {
-    tool, cwd, commands, notifications, context,
+    tool, cwd, commands, notifications, context, handlers,
     execute: (params: any, signal?: AbortSignal) => tool.execute("call", params, signal, undefined, context),
   };
   hosts.push(instance);
@@ -111,6 +112,31 @@ describe("RPC-backed subagent tool", () => {
       const result = await h.execute({ command: "wait", ids: [handle], timeoutMs: 1000 });
       expect(result.details.results[0].output).toContain("late readiness");
     } finally { await h.execute({ command: "stop", id: handle }); }
+  });
+
+  test("low-level agent restarts cannot rearm readiness continuations", async () => {
+    const h = host();
+    h.handlers.get("before_agent_start")?.({}, h.context);
+    const started = await h.execute({ command: "spawn", prompt: "hello", tools: [], notify: "turn" });
+    const id = started.details.results[0].handle;
+    try {
+      const deadline = Date.now() + 3000;
+      let ready = false;
+      while (Date.now() < deadline) {
+        const status = await h.execute({ command: "status", id });
+        if (status.details.results[0].state.status === "terminal") { ready = true; break; }
+        await Bun.sleep(10);
+      }
+      expect(ready).toBe(true);
+      const boundary = () => h.handlers.get("agent_before_settle")({ entries: [], outcome: "completed" }, h.context);
+      expect(boundary()?.continue).toBe(true);
+      // Pi emits agent_start on automatic agent.continue(), without starting a
+      // new user/custom-message run. It must not reoffer the same child again.
+      h.handlers.get("agent_start")?.({}, h.context);
+      expect(boundary()).toBeUndefined();
+      h.handlers.get("before_agent_start")?.({}, h.context);
+      expect(boundary()?.continue).toBe(true);
+    } finally { await h.execute({ command: "stop", id }); }
   });
 
   test("relative resumes use the parent cwd and cannot target its active session", async () => {

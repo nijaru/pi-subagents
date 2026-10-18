@@ -34,21 +34,25 @@ export function canonicalSession(file: string): string {
 }
 
 function sessionCwd(file: string): string | undefined {
-  const fd = fs.openSync(file, "r");
+  // Opening a FIFO synchronously would freeze the parent before any deadline
+  // or cancellation handler can run. Validate the opened descriptor, not only
+  // the path, so replacement between stat/open cannot bypass the check.
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
   try {
+    if (!fs.fstatSync(fd).isFile()) throw new Error(`Child session must be a regular file: ${file}`);
     const buffer = Buffer.alloc(64 * 1024);
     const length = fs.readSync(fd, buffer, 0, buffer.length, 0);
-    const header = JSON.parse(buffer.toString("utf8", 0, length).split("\n", 1)[0] ?? "");
-    return header?.type === "session" && typeof header.cwd === "string" ? header.cwd : undefined;
-  } catch { return undefined; }
-  finally { fs.closeSync(fd); }
+    try {
+      const header = JSON.parse(buffer.toString("utf8", 0, length).split("\n", 1)[0] ?? "");
+      return header?.type === "session" && typeof header.cwd === "string" ? header.cwd : undefined;
+    } catch { return undefined; }
+  } finally { fs.closeSync(fd); }
 }
 
 export interface RpcInvocation {
   command: string;
   args: string[];
   sessionFile?: string;
-  probe: boolean;
 }
 
 export function getRpcInvocation(task: ChildTask): RpcInvocation {
@@ -57,8 +61,7 @@ export function getRpcInvocation(task: ChildTask): RpcInvocation {
     : path.join(getPackageDir(), "dist", "cli.js");
   if (!fs.existsSync(cli)) throw new Error("Child RPC host requires an installed Pi CLI (dist/cli.js).");
   const args = [cli, "--mode", "rpc"];
-  const probe = !process.env.PI_SUBAGENT_CLI || process.env.PI_SUBAGENT_FORCE_PROBE === "1";
-  if (probe) args.push("--extension", fileURLToPath(new URL("./probe-extension.ts", import.meta.url)));
+  args.push("--extension", fileURLToPath(new URL("./probe-extension.ts", import.meta.url)));
   let sessionFile: string | undefined;
   if (task.resume !== undefined) {
     if (!fs.existsSync(task.resume)) throw new Error(`Child session to resume does not exist: ${task.resume}`);
@@ -84,7 +87,7 @@ export function getRpcInvocation(task: ChildTask): RpcInvocation {
   if (task.model) args.push("--model", task.model);
   if (task.thinking) args.push("--thinking", task.thinking);
   if (task.trustProject) args.push("--approve");
-  return { command: nodeRuntime(), args, sessionFile, probe };
+  return { command: nodeRuntime(), args, sessionFile };
 }
 
 /**

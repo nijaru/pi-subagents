@@ -8,7 +8,4 @@ export const PROBE_DEADLINE_ENV = "PI_SUBAGENT_PROBE_DEADLINE";
 export interface ProbeReport {
   token: string;
   tools: string[];
-  requested: string[];
-  missing?: string[];
-  error?: string;
 }

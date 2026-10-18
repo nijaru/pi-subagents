@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import type { AssistantMessage, ModelThinkingLevel, StopReason } from "@earendil-works/pi-ai";
+import type { AssistantMessage, ModelThinkingLevel, StopReason, Usage } from "@earendil-works/pi-ai";
 import { boundedDiagnostic, truncateOutput, utf8Prefix } from "./bounds.ts";
 import { childEnvironment } from "./env.ts";
 import { MAX_OUTPUT_BYTES, RUNNING_PROGRESS_TEXT, processTimeoutMs, startupTimeoutMs } from "./limits.ts";
@@ -100,21 +100,18 @@ export class RpcChildSupervisor implements ChildSupervisor {
     let releaseSession: (() => void) | undefined;
     let child: ChildProcess;
     let invocation: ReturnType<typeof getRpcInvocation>;
-    let probeToken: string | undefined;
+    const probeToken = randomUUID();
     try {
       if (signal.aborted) return { ...snapshot(), ...classify({ kind: "cancelled" }, undefined, undefined) };
       invocation = getRpcInvocation(task);
       data.sessionFile = invocation.sessionFile;
       if (invocation.sessionFile) releaseSession = acquireSession(invocation.sessionFile, task.id);
       const env = childEnvironment(task.id, task.cwd);
-      if (invocation.probe) {
-        env[PROBE_TOKEN_ENV] = randomUUID();
-        env[PROBE_TOOLS_ENV] = JSON.stringify(task.tools);
-        // An absolute shared deadline avoids another relative probe clock.
-        env[PROBE_DEADLINE_ENV] = String(startedAt + startupBudget);
-      }
+      env[PROBE_TOKEN_ENV] = probeToken;
+      env[PROBE_TOOLS_ENV] = JSON.stringify(task.tools);
+      // An absolute shared deadline avoids another relative probe clock.
+      env[PROBE_DEADLINE_ENV] = String(startedAt + startupBudget);
       child = spawn(invocation.command, invocation.args, { cwd: task.cwd, env, shell: false, detached: true, stdio: ["pipe", "pipe", "pipe"] });
-      probeToken = env[PROBE_TOKEN_ENV];
     } catch (error) {
       releaseSession?.();
       return { ...snapshot(), ...classify({ kind: "failure", startup: true, message: String(error instanceof Error ? error.message : error) }, undefined, undefined) };
@@ -128,6 +125,7 @@ export class RpcChildSupervisor implements ChildSupervisor {
     let streaming = "";
     let streamingBytes = 0;
     let assistantOpen = false;
+    let streamingUsage: Usage | undefined;
     let lastPublish = 0;
     let rpc: ChildRpc;
     const stop = (reason: End) => {
@@ -148,8 +146,9 @@ export class RpcChildSupervisor implements ChildSupervisor {
       timer.unref?.();
     };
     const updateOutput = () => {
-      const text = assistantOpen ? streaming : assistant ? textFromMessage(assistant) : streaming;
-      const bytes = assistantOpen ? streamingBytes : Buffer.byteLength(text);
+      const current = assistantOpen && streamingBytes > 0;
+      const text = current ? streaming : assistant ? textFromMessage(assistant) : streaming;
+      const bytes = current ? streamingBytes : Buffer.byteLength(text);
       data.output = truncateOutput(text, MAX_OUTPUT_BYTES, bytes);
       data.outputTruncation = bytes > Buffer.byteLength(data.output) ? {
         truncated: true, originalBytes: bytes, retainedBytes: Buffer.byteLength(data.output),
@@ -165,9 +164,10 @@ export class RpcChildSupervisor implements ChildSupervisor {
           rpc.diagnostic(`\nChild extension error (${event.event ?? "unknown"}): ${event.error ?? "unknown"}`);
           break;
         case "message_start":
-          if (event.message?.role === "assistant") { streaming = ""; streamingBytes = 0; assistantOpen = true; }
+          if (event.message?.role === "assistant") { streaming = ""; streamingBytes = 0; streamingUsage = undefined; assistantOpen = true; }
           break;
         case "message_update":
+          if (isUsage(event.usage)) streamingUsage = { ...event.usage, cost: { ...event.usage.cost } };
           if (event.assistantMessageEvent?.type === "text_delta") {
             const delta = event.assistantMessageEvent.delta;
             if (typeof delta !== "string") throw new Error("Child RPC emitted a malformed text delta.");
@@ -192,6 +192,8 @@ export class RpcChildSupervisor implements ChildSupervisor {
             assistant = event.message;
             data.usage.turns++;
             if (isUsage(assistant.usage)) addUsage(data.usage, assistant.usage);
+            else if (streamingUsage) addUsage(data.usage, streamingUsage);
+            streamingUsage = undefined;
             data.errorMessage = boundedDiagnostic(assistant.errorMessage);
             updateOutput();
             publish();
@@ -235,18 +237,16 @@ export class RpcChildSupervisor implements ChildSupervisor {
       const model = `${state.model.provider}/${state.model.id}`;
       if (task.model && model !== task.model) throw new Error(`Child model ${model} does not match requested ${task.model}.`);
       if (task.strictThinking && state.thinkingLevel !== task.thinking) throw new Error(`Child thinking ${state.thinkingLevel} does not match requested ${task.thinking}.`);
-      if (invocation.probe) {
-        const commands = (await rpc.request({ type: "get_commands" }, remaining())).data?.commands;
-        if (!Array.isArray(commands) || !commands.some((command) => command.name === PROBE_COMMAND && command.source === "extension")) throw new Error("Child probe extension is unavailable.");
-        const response = await rpc.request({ type: "prompt", message: `/${PROBE_COMMAND}` }, remaining());
-        if (response.data?.disposition !== "handled") throw new Error("Child probe command was not handled.");
-        const report = await probe.promise;
-        if (phase !== "starting") return;
-        if (!report) throw new Error("Child probe ended without readiness.");
-        const missing = task.tools.filter((tool) => !report.tools.includes(tool));
-        if (missing.length) throw new Error(`Requested child tools are unavailable: ${missing.join(", ")}`);
-        if (new Set(report.tools).size !== task.tools.length || report.tools.length !== task.tools.length) throw new Error("Child tool selection did not match request.");
-      }
+      const commands = (await rpc.request({ type: "get_commands" }, remaining())).data?.commands;
+      if (!Array.isArray(commands) || !commands.some((command) => command.name === PROBE_COMMAND && command.source === "extension")) throw new Error("Child probe extension is unavailable.");
+      const probeResponse = await rpc.request({ type: "prompt", message: `/${PROBE_COMMAND}` }, remaining());
+      if (probeResponse.data?.disposition !== "handled") throw new Error("Child probe command was not handled.");
+      const report = await probe.promise;
+      if (phase !== "starting") return;
+      if (!report) throw new Error("Child probe ended without readiness.");
+      const missing = task.tools.filter((tool) => !report.tools.includes(tool));
+      if (missing.length) throw new Error(`Requested child tools are unavailable: ${missing.join(", ")}`);
+      if (new Set(report.tools).size !== task.tools.length || report.tools.length !== task.tools.length) throw new Error("Child tool selection did not match request.");
       if (phase !== "starting") return;
       data.model = model;
       data.thinking = state.thinkingLevel;
@@ -272,6 +272,12 @@ export class RpcChildSupervisor implements ChildSupervisor {
 
     const end = await ended.promise;
     signal.removeEventListener("abort", abort);
+    // Updates are cumulative for the open assistant call. Final message usage
+    // replaces them; an interruption accounts the latest reported snapshot once.
+    if (assistantOpen) {
+      data.usage.turns++;
+      if (streamingUsage) addUsage(data.usage, streamingUsage);
+    }
     updateOutput();
     const cleanup = await cleanupChild(child, watchdog, end.kind === "settled");
     await watchdogSetup;

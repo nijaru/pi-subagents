@@ -58,10 +58,10 @@ function emitTask() {
     settle();
     return;
   }
-  if (scenario === "partial-after") {
+  if (scenario === "partial-after" || scenario === "partial-thinking") {
     send({ type: "message_end", message: message("FIRST") });
     send({ type: "message_start", message: { role: "assistant", content: [] } });
-    send({ type: "message_update", usage, assistantMessageEvent: { type: "text_delta", delta: "SECOND" } });
+    if (scenario === "partial-after") send({ type: "message_update", usage, assistantMessageEvent: { type: "text_delta", delta: "SECOND" } });
     return;
   }
   if (scenario === "extension-error") {
@@ -75,9 +75,13 @@ function emitTask() {
     settle();
     return;
   }
-  if (scenario === "detached-descendant") {
+  if (scenario === "detached-descendant" || scenario === "detached-complete") {
     const detached = spawn("sh", ["-c", "trap '' TERM; while :; do sleep 1; done"], { detached: true, stdio: "ignore" });
     fs.writeFileSync("detached.pid", String(detached.pid));
+    if (scenario === "detached-complete") {
+      send({ type: "message_end", message: message("done") });
+      settle();
+    }
     return;
   }
   if (scenario === "slow") {
@@ -125,7 +129,7 @@ input.on("line", (line) => {
     if (command.message.startsWith("/__pi_subagent_ready")) {
       let requested = [];
       try { requested = JSON.parse(process.env.PI_SUBAGENT_PROBE_TOOLS ?? "[]"); } catch { /* invalid */ }
-      const payload = { token: process.env.PI_SUBAGENT_PROBE_TOKEN ?? "", tools: requested, requested };
+      const payload = { token: process.env.PI_SUBAGENT_PROBE_TOKEN ?? "", tools: requested };
       send({ type: "entry_appended", entry: { type: "custom", customType: "subagent-probe", data: payload, id: "probe-entry", parentId: null, timestamp: new Date().toISOString() } });
       send({ id: command.id, type: "response", command: "prompt", success: true, data: { disposition: "handled" } });
       return;

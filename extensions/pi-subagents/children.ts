@@ -118,6 +118,7 @@ export class SessionChildren {
           if (progress !== undefined) present(progress);
         },
         onControl: (control) => {
+          if (this.closed || run.settled) return;
           run.control = control;
           for (const ready of run.readinessWaiters) ready();
           run.readinessWaiters.clear();
@@ -150,6 +151,9 @@ export class SessionChildren {
         addUsage(this.pendingUsage, run.result.usage);
       }
       run.settled = true;
+      // The control closes over the RPC runtime and its full final message.
+      // Terminal retention owns only the bounded snapshot, not execution state.
+      delete run.control;
       for (const ready of run.readinessWaiters) ready();
       run.readinessWaiters.clear();
       for (const complete of run.waiters) complete();

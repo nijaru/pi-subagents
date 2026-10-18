@@ -111,15 +111,17 @@ describe("public RPC child host", () => {
     expect(alive()).toBe(false);
   });
 
-  test("kills detached descendants that ignore SIGTERM on timeout", async () => {
+  test.each([["detached-descendant", "timed_out"], ["detached-complete", "completed"]] as const)("cleans detached work after %s", async (scenario, outcome) => {
     const dir = tempDir();
-    const result = await run(task(dir, { prompt: "SCENARIO=detached-descendant", executionTimeoutMs: 100 }));
-    expect(result.outcome).toBe("timed_out");
+    const result = await run(task(dir, { prompt: `SCENARIO=${scenario}`, executionTimeoutMs: 100 }));
+    expect(result.outcome).toBe(outcome);
     const pid = Number(fs.readFileSync(path.join(dir, "detached.pid"), "utf8"));
-    const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
-    const deadline = Date.now() + 2_000;
-    while (alive() && Date.now() < deadline) await Bun.sleep(25);
-    expect(alive()).toBe(false);
+    try {
+      const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+      const deadline = Date.now() + 2_000;
+      while (alive() && Date.now() < deadline) await Bun.sleep(25);
+      expect(alive()).toBe(false);
+    } finally { try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ } }
   });
 
   test("surfaces process exits and startup failures as failures", async () => {
@@ -196,11 +198,11 @@ test("ignores oversized agent_end history frames", async () => {
   expect(result.output).toBe("done");
 });
 
-test("prefers the current streaming report when interrupted", async () => {
+test.each([["partial-after", "SECOND"], ["partial-thinking", "FIRST"]])("interrupted %s retains the latest available text", async (scenario, expected) => {
   const dir = tempDir();
-  const result = await run(task(dir, { prompt: "SCENARIO=partial-after", executionTimeoutMs: 100 }));
+  const result = await run(task(dir, { prompt: `SCENARIO=${scenario}`, executionTimeoutMs: 100 }));
   expect(result.outcome).toBe("timed_out");
-  expect(result.output).toBe("SECOND");
+  expect(result.output).toBe(expected);
 });
 
 test("malformed assistant content fails instead of hanging cleanup", async () => {
@@ -238,7 +240,6 @@ test("startup command budgets use the remaining resolved deadline", () => {
 
 test("fails before prompting when the probe command is unavailable", async () => {
   const dir = tempDir();
-  process.env.PI_SUBAGENT_FORCE_PROBE = "1";
   const result = await run(task(dir, { id: "no-probe", prompt: "must not run" }));
   expect(result.outcome).toBe("failed");
   expect(result.errorKind).toBe("startup");
@@ -300,4 +301,5 @@ test("interrupted streams keep truthful byte counts beyond the retained buffer",
   expect(result.outputTruncation).toMatchObject({ truncated: true, originalBytes: total });
   expect(result.outputTruncation?.retainedBytes).toBe(Buffer.byteLength(result.output!));
   expect(result.output).toContain(`of ${total} bytes`);
+  expect(result.usage).toMatchObject({ input: 2, output: 3, cacheRead: 4, cacheWrite: 5, totalTokens: 9, turns: 1 });
 });

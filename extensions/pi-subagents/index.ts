@@ -96,7 +96,9 @@ export default function (pi: ExtensionAPI) {
     runtime = createRuntime();
     runtime.delivery.bind(ctx);
   });
-  pi.on("agent_start", (_event, ctx) => runtime.delivery.started(ctx));
+  // agent_start also fires for retries/boundary continuations. Rearm notices
+  // only for a new external run, or a dropped notice can cause a restart loop.
+  pi.on("before_agent_start", (_event, ctx) => runtime.delivery.started(ctx));
   pi.on("agent_end", (event, ctx) => runtime.delivery.ended(event, ctx));
   pi.on("turn_start", () => runtime.children.resetInboxNotices());
   pi.on("turn_end", (event, ctx) => runtime.delivery.boundary(event, ctx));

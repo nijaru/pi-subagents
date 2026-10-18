@@ -37,11 +37,17 @@ function descendantPids(pid: number): number[] {
  */
 const terminatedProcessDescendants = new WeakMap<ChildProcess, Set<number>>();
 
+function rememberDescendants(child: ChildProcess): void {
+  if (process.platform === "win32" || !child.pid || hasExited(child)) return;
+  const tracked = terminatedProcessDescendants.get(child) ?? new Set<number>();
+  for (const pid of descendantPids(child.pid)) tracked.add(pid);
+  terminatedProcessDescendants.set(child, tracked);
+}
+
 export function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
   if (process.platform !== "win32" && child.pid) {
+    rememberDescendants(child);
     const tracked = terminatedProcessDescendants.get(child) ?? new Set<number>();
-    for (const pid of descendantPids(child.pid)) tracked.add(pid);
-    if (signal === "SIGTERM") terminatedProcessDescendants.set(child, tracked);
     for (const pid of tracked) {
       try {
         process.kill(pid, signal);
@@ -205,6 +211,9 @@ export async function cleanupChild(child: ChildProcess, watchdog: ChildProcess |
   });
   const cleanup = async (): Promise<string | undefined> => {
     if (orderly) {
+      // Preserve detached descendants while they still have a discoverable
+      // parent, before EOF can make the leader exit and reparent them.
+      rememberDescendants(child);
       child.stdin?.end();
       await waitForExit(child, 3_000);
     }
@@ -219,7 +228,9 @@ export async function cleanupChild(child: ChildProcess, watchdog: ChildProcess |
       await waitForExit(child, 1_000);
     }
     if (controller.signal.aborted) return;
+    if (orderly) terminateProcessTree(child, "SIGTERM");
     await sweepRootProcessGroup(child, controller.signal);
+    if (!controller.signal.aborted) terminateProcessTree(child, "SIGKILL");
     return hasExited(child) ? undefined : "Child process exit could not be confirmed after cleanup.";
   };
   try {

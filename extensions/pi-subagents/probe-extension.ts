@@ -25,7 +25,7 @@ export default function subagentProbe(pi: ExtensionAPI): void {
       return;
     }
     sending = true;
-    const payload: ProbeReport = { token, tools: active, requested, missing };
+    const payload: ProbeReport = { token, tools: active };
     pi.appendEntry(PROBE_CUSTOM_TYPE, payload);
   };
 

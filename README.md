@@ -110,7 +110,9 @@ Child reports remain bounded in memory; they are not spilled to disk. `outputTru
 
 ## Usage
 
-Child usage includes assistant calls, completed compaction summaries, and usage reported by child tools. After cleanup, each child's usage is added once to the next parent tool result, including failed results. Repeated `status`, `wait`, or `stop` calls do not charge it again.
+Child usage includes assistant calls, completed compaction summaries, and usage reported by child tools. Interrupted calls retain the latest reported cumulative usage; updates are not added repeatedly. Providers that report usage only at finalization can leave interrupted usage unknown.
+
+After cleanup, each child's usage is added once to the next parent tool result, including failed results. Repeated `status`, `wait`, or `stop` calls do not charge it again.
 
 Pi cannot attach usage to a custom completion message. Background costs enter native totals on the next parent tool result; until then they remain visible in child details. Quit, reload, or session replacement discards unreported usage.
 

@@ -87,9 +87,12 @@ describe("session ownership", () => {
   test("repeated stops return independent snapshots after cleanup", async () => {
     const c = controlled();
     const run = c.start();
+    c.requests[0]!.onControl?.({ steer: async () => {} });
+    expect(run.control).toBeDefined();
     c.executions[0]!.usage.input = 5;
     c.executions[0]!.usage.cost.total = 1;
     const first = await c.children.stop(run.result.id);
+    expect(run.control).toBeUndefined();
     first.tools.push("bash");
     first.usage.input = 999;
     first.usage.cost.total = 999;
