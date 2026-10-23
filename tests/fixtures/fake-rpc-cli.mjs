@@ -36,6 +36,13 @@ function emitTask() {
     for (let i = 0; i < 32; i++) send({ type: "message_update", usage, assistantMessageEvent: { type: "text_delta", delta: "界🙂".repeat(1000) } });
     return;
   }
+  if (scenario === "usage") {
+    send({ type: "entry_appended", entry: { type: "usage", kind: "cache_warm", usage } });
+    send({ type: "entry_appended", entry: { type: "usage", kind: "cache_warm", usage: { ...usage, input: -1 } } });
+    // A committed compaction is announced twice, but billed only by its end event.
+    send({ type: "entry_appended", entry: { type: "compaction", usage } });
+    send({ type: "compaction_end", result: { usage } });
+  }
   if (scenario === "exit") { process.exit(1); }
   if (scenario === "fail") {
     send({ type: "message_end", message: message("", "error") });

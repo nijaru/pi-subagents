@@ -48,6 +48,15 @@ describe("public RPC child host", () => {
     expect(capture.cwd).toBe(fs.realpathSync.native(dir));
   });
 
+  test("counts background usage and compaction once without adding foreground turns", async () => {
+    const result = await run(task(tempDir(), { prompt: "SCENARIO=usage" }));
+    expect(result.outcome).toBe("completed");
+    expect(result.usage).toMatchObject({
+      input: 6, output: 9, cacheRead: 12, cacheWrite: 15, totalTokens: 27,
+      cost: { total: 3 }, turns: 1,
+    });
+  });
+
   test("keeps persisted sessions when requested", async () => {
     const dir = tempDir();
     const sessionDir = path.join(tempDir(), "sessions");

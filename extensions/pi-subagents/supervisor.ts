@@ -178,7 +178,13 @@ export class RpcChildSupervisor implements ChildSupervisor {
           }
           break;
         case "entry_appended":
-          if (event.entry?.type === "custom" && event.entry.customType === PROBE_CUSTOM_TYPE) {
+          // Pi records background calls (including cache warming) as standalone
+          // usage entries, without assistant message events. Compaction entries
+          // are accounted separately by compaction_end below.
+          if (event.entry?.type === "usage" && isUsage(event.entry.usage)) {
+            addUsage(data.usage, event.entry.usage);
+            publish();
+          } else if (event.entry?.type === "custom" && event.entry.customType === PROBE_CUSTOM_TYPE) {
             const report = event.entry.data as Partial<ProbeReport> | undefined;
             if (report?.token !== probeToken || !Array.isArray(report?.tools) || !report.tools.every((name) => typeof name === "string")) {
               throw new Error("Child probe returned malformed readiness.");
