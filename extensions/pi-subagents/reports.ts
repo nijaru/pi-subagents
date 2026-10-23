@@ -53,6 +53,7 @@ export function runtimeLabel(result: ChildResult): string {
 
 /** Content-free activity only; absolute time stays truthful in old snapshots. */
 export function activitySummary(result: ChildResult): string {
+  if (!isRunning(result) && !failed(result)) return "";
   const current = isRunning(result) && result.activity
     ? `activity: ${result.activity}${result.currentTool ? ` (${truncateOutput(result.currentTool, 256)})` : ""}` : "";
   const last = result.lastActivityAt === undefined ? "" : `last activity: ${new Date(result.lastActivityAt).toISOString()}`;

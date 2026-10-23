@@ -55,11 +55,14 @@ describe("public RPC child host", () => {
       (data: ChildExecutionData, text?: string) => { updates.push(data); if (text) progress.push(text); });
     const model = updates.find((data) => data.activity === "model")!;
     const thinking = updates.filter((data) => data.activity === "thinking");
-    expect(thinking).toHaveLength(34);
+    expect(thinking.length).toBeGreaterThan(0);
+    expect(thinking.length).toBeLessThan(32); // Do not publish a snapshot for every token in the burst.
     expect(thinking[0]!.lastActivityAt!).toBeGreaterThan(model.lastActivityAt!);
     expect(thinking.every((data) => !data.output && !data.currentTool)).toBe(true);
     const tools = updates.filter((data) => data.activity === "tool");
-    expect(tools.map((data) => data.currentTool)).toEqual(["read", "read", "bash", "bash", "bash", "read"]);
+    expect(tools.some((data) => data.currentTool === "bash")).toBe(true);
+    // The first read remains active after the overlapping read and bash finish.
+    expect(tools.at(-1)!.currentTool).toBe("read");
     const afterTools = updates[updates.indexOf(tools.at(-1)!) + 1]!;
     expect(afterTools.activity).toBeUndefined();
     expect(afterTools.currentTool).toBeUndefined();
@@ -69,7 +72,7 @@ describe("public RPC child host", () => {
     expect(result.currentTool).toBeUndefined();
     expect(result.lastActivityAt).toBe(updates.at(-1)!.lastActivityAt);
     expect(result.lastActivityAt!).toBeLessThanOrEqual(result.taskFinishedAt!);
-    // A burst of tokens/tools updates registry facts, not the UI for each token.
+    // Phase changes remain inspectable without redrawing the UI for each token.
     expect(progress.length).toBeLessThan(5);
     expect(JSON.stringify([updates, result, progress])).not.toContain("PRIVATE_");
   });

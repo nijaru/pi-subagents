@@ -159,15 +159,17 @@ export class RpcChildSupervisor implements ChildSupervisor {
       } : undefined;
     };
     const recordActivity = (kind?: ChildActivity) => {
-      data.lastActivityAt = Date.now();
+      const previousActivity = data.activity, previousTool = data.currentTool;
+      const now = Date.now();
+      data.lastActivityAt = now;
       data.currentTool = [...activeTools.keys()].at(-1);
       data.activity = activeTools.size ? "tool" : kind;
-      // Registry snapshots see every event; only foreground presentation is
-      // throttled. Silence never advances lastActivityAt or resets a deadline.
-      if (Date.now() - lastPublish >= 500) {
+      // Keep phase changes inspectable, but do not clone snapshots per token.
+      // Silence never advances lastActivityAt or resets a deadline.
+      if (now - lastPublish >= 500) {
         updateOutput();
         publish(RUNNING_PROGRESS_TEXT);
-      } else publish();
+      } else if (data.activity !== previousActivity || data.currentTool !== previousTool) publish();
     };
     const event = (event: ChildEvent) => {
       if (phase === "stopping" || phase === "settled") return;

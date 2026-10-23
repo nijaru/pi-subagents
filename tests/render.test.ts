@@ -139,6 +139,9 @@ describe("compact child rendering", () => {
     const expanded = lines("status", { command: "status", id: child.id }, true, [failed], 120).join("\n");
     expect(expanded).toContain("last activity: 2023-11-14T22:13:20.000Z");
     expect(expanded).toContain("session: /tmp/recover.jsonl");
+    const completed = { ...child, lastActivityAt };
+    expect(childStatus(completed)).not.toContain("last activity:");
+    expect(lines("wait", { command: "wait", ids: [child.id] }, true, [completed], 120).join("\n")).not.toContain("last activity:");
     for (const width of [20, 40, 80]) {
       const rows = renderChildResult(result("status", [{ ...active, currentTool: "a".repeat(256) }]), { expanded: false }, theme).render(width);
       expect(rows).toHaveLength(1);
