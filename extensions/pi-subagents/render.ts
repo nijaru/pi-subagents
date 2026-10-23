@@ -3,7 +3,7 @@ import { getMarkdownTheme, keyText } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { truncateHeadTail, truncateOutput } from "./bounds.ts";
 import { MAX_OUTPUT_BYTES, MAX_RETAINED_RUNS } from "./limits.ts";
-import { formatElapsed, isTimeoutSummary, resultText, runtimeLabel } from "./reports.ts";
+import { activitySummary, formatElapsed, isTimeoutSummary, resultText, runtimeLabel } from "./reports.ts";
 import type { SubagentDetails } from "./types.ts";
 import { Check } from "typebox/value";
 import { ChildResultSchema } from "./result-schema.ts";
@@ -130,7 +130,9 @@ function childHeading(child: ChildResult, theme: Theme, options: { expanded: boo
   const id = showId ? `${theme.fg("accent", displayId(child.handle ?? child.id, expanded))} ` : "";
   // Spawn/status/wait are snapshots, not live activity indicators.
   const duration = active && command !== "run" ? "" : runtimeLabel(child);
-  return `${theme.fg(color, icon)} ${id}${theme.fg(color, status)}${duration ? theme.fg("dim", ` · ${duration}`) : ""}`;
+  const activity = active && child.activity
+    ? ` · ${child.activity}${child.currentTool ? `: ${oneLine(clean(child.currentTool, 256))}` : ""}` : "";
+  return `${theme.fg(color, icon)} ${id}${theme.fg(color, status)}${duration ? theme.fg("dim", ` · ${duration}`) : ""}${theme.fg("dim", activity)}`;
 }
 
 function renderChildren(details: unknown, expanded: boolean, theme: Theme, targetId?: string): Component | undefined {
@@ -154,6 +156,8 @@ function renderChildren(details: unknown, expanded: boolean, theme: Theme, targe
       container.addChild(new Text(theme.fg("dim", data.waitExpired === false ? "Child continues." : "Wait expired; child continues."), 0, 0));
     }
     if (expanded) {
+      const activity = activitySummary(child);
+      if (activity) container.addChild(new Text(theme.fg("dim", clean(activity, 512)), 0, 0));
       // Status/wait/stop rows need task labels; run/spawn show the prompt in their call header.
       if (data?.command !== "run" && data?.command !== "spawn") {
         container.addChild(new Text(theme.fg("dim", child.omittedFields?.includes("prompt") ? "Task prompt omitted to fit the response budget." : clean(child.prompt, 8192)), 0, 0));

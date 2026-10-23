@@ -36,6 +36,38 @@ function emitTask() {
     for (let i = 0; i < 32; i++) send({ type: "message_update", usage, assistantMessageEvent: { type: "text_delta", delta: "界🙂".repeat(1000) } });
     return;
   }
+  if (scenario === "activity" || scenario === "activity-hang") {
+    send({ type: "message_start", message: { role: "assistant", content: [] } });
+    setTimeout(() => {
+      const update = (type, fields = {}) => send({ type: "message_update", usage, assistantMessageEvent: { type, contentIndex: 0, ...fields } });
+      update("thinking_start");
+      for (let i = 0; i < 32; i++) update("thinking_delta", { delta: "PRIVATE_REASONING" });
+      update("thinking_end", { content: "PRIVATE_REASONING" });
+      update("toolcall_start", { id: "read-1", toolName: "read" });
+      update("toolcall_delta", { delta: '{"path":"PRIVATE_ARGS"}' });
+      update("toolcall_end", { toolCall: { id: "read-1", name: "read", arguments: { path: "PRIVATE_ARGS" } } });
+      send({ type: "message_end", message: { ...message([], "toolUse"), content: [
+        { type: "thinking", thinking: "PRIVATE_REASONING" },
+        { type: "toolCall", id: "read-1", name: "read", arguments: { path: "PRIVATE_ARGS" } },
+      ] } });
+      const tool = (type, toolCallId, toolName) => send({ type, toolCallId, toolName,
+        args: { path: "PRIVATE_ARGS" }, result: { content: [{ type: "text", text: "PRIVATE_RESULT" }] },
+        partialResult: { content: [{ type: "text", text: "PRIVATE_PARTIAL" }] }, isError: false });
+      tool("tool_execution_start", "read-1", "read");
+      if (scenario === "activity-hang") return;
+      tool("tool_execution_start", "read-2", "read");
+      tool("tool_execution_start", "bash-1", "bash");
+      tool("tool_execution_end", "read-2", "read");
+      tool("tool_execution_update", "bash-1", "bash");
+      tool("tool_execution_end", "bash-1", "bash");
+      tool("tool_execution_end", "read-1", "read");
+      send({ type: "message_start", message: { role: "assistant", content: [] } });
+      update("text_delta", { delta: "public report" });
+      send({ type: "message_end", message: message("public report") });
+      settle();
+    }, 20);
+    return;
+  }
   if (scenario === "usage") {
     send({ type: "entry_appended", entry: { type: "usage", kind: "cache_warm", usage } });
     send({ type: "entry_appended", entry: { type: "usage", kind: "cache_warm", usage: { ...usage, input: -1 } } });

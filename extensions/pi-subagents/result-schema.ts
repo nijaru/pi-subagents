@@ -36,6 +36,10 @@ export const OutputTruncationSchema = Type.Object({
   retainedBytes: Type.Integer({ minimum: 0, description: "Retained UTF-8 bytes, including any truncation marker." }),
 }, { additionalProperties: false });
 
+export const ChildActivitySchema = StringEnum(["model", "thinking", "text", "tool"] as const, {
+  description: "Current model/token/tool activity while running; absent after execution stops. No reasoning text or tool payloads.",
+});
+
 export const ChildResultSchema = Type.Object({
   id: Type.String(),
   handle: Type.Optional(Type.String({ description: "Short session-scoped handle; preferred in wait/status/stop calls." })),
@@ -44,9 +48,12 @@ export const ChildResultSchema = Type.Object({
   timeoutPhase: Type.Optional(StringEnum(["startup", "execution"] as const, { description: "Which deadline expired for a timed_out result." })),
   cleanupMs: Type.Optional(Type.Integer({ minimum: 0, description: "Process-tree cleanup time excluded from the reported task runtime." })),
   taskFinishedAt: Type.Optional(Type.Number({ minimum: 0, description: "Leader exit or terminal-cause time, before cleanup." })),
+  lastActivityAt: Type.Optional(Type.Integer({ minimum: 0, maximum: 8_640_000_000_000_000, description: "Parent-observed Unix milliseconds of the latest model/token/tool activity; retained after termination. Not a stall verdict." })),
+  activity: Type.Optional(ChildActivitySchema),
+  currentTool: Type.Optional(Type.String({ maxLength: 256, pattern: "^[A-Za-z][A-Za-z0-9_.:-]*$", description: "An executing tool from the requested allowlist; one name when calls overlap. Name only; no arguments or results. Absent after execution stops." })),
   prompt: Type.String(),
   cwd: Type.String(),
-  sessionFile: Type.Optional(Type.String({ description: "Persisted child Pi session path, when persist was requested." })),
+  sessionFile: Type.Optional(Type.String({ description: "Child Pi session path for persist/resume, including failed runs. Startup failure may occur before the file is created." })),
   tools: Type.Array(Type.String()),
   omittedFields: Type.Optional(Type.Array(StringEnum(["prompt", "cwd", "tools"] as const), {
     uniqueItems: true, description: "Context fields omitted to fit the response budget; empty placeholders are not execution values.",

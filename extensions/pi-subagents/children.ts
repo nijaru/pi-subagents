@@ -143,6 +143,8 @@ export class SessionChildren {
         stopReason: cancelled ? "aborted" : "error", finishedAt: Date.now(),
       };
     } finally {
+      delete run.result.activity;
+      delete run.result.currentTool;
       run.result.prompt = truncateOutput(run.result.prompt, MAX_DIAGNOSTIC_BYTES);
       // Account each execution once, independently of notices, repeated reads,
       // and handle eviction. Closed sessions must never publish pending costs.

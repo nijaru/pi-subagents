@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-type Delta = { content?: string; tool_calls?: unknown[] };
+type Delta = { content?: string; reasoning_content?: string; tool_calls?: unknown[] };
 
 /** Isolate a real Pi CLI from live providers; only its HTTP endpoint is fake. */
 export function realRpcFixture(respond: (body: any) => Delta | Promise<Delta> = () => ({ content: "OK" })) {

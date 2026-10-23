@@ -128,6 +128,24 @@ describe("compact child rendering", () => {
     for (const label of ["! incomplete", child.output!, "Model output limit reached", "Output shortened", "diagnostic stdout", "diagnostic stderr"]) expect(text).toContain(label);
   });
 
+  test("activity is visible without private payloads and last activity survives failure rendering", () => {
+    const lastActivityAt = 1_700_000_000_000;
+    const active: ChildResult = { ...child, state: { status: "running" }, startedAt: undefined, lastActivityAt, activity: "tool", currentTool: "read" };
+    expect(childStatus(active)).toContain("activity: tool (read) · last activity: 2023-11-14T22:13:20.000Z");
+    expect(lines("status", { command: "status", id: child.id }, false, [active]).join("\n")).toContain("running · tool: read");
+    expect(lines("status", { command: "status", id: child.id }, false, [{ ...active, activity: "thinking", currentTool: undefined }]).join("\n")).toContain("running · thinking");
+    const failed: ChildResult = { ...child, lastActivityAt, sessionFile: "/tmp/recover.jsonl",
+      state: { status: "terminal", outcome: "failed", exitCode: 1, finishedAt: 8000 }, errorMessage: "provider failed" };
+    const expanded = lines("status", { command: "status", id: child.id }, true, [failed], 120).join("\n");
+    expect(expanded).toContain("last activity: 2023-11-14T22:13:20.000Z");
+    expect(expanded).toContain("session: /tmp/recover.jsonl");
+    for (const width of [20, 40, 80]) {
+      const rows = renderChildResult(result("status", [{ ...active, currentTool: "a".repeat(256) }]), { expanded: false }, theme).render(width);
+      expect(rows).toHaveLength(1);
+      expect(visibleWidth(rows[0]!)).toBeLessThanOrEqual(width);
+    }
+  });
+
   test("narrow terminals keep one bounded preview row per child", () => {
     const long = { ...child, prompt: "wide界🙂 ".repeat(1000), state: { status: "running" } as const };
     for (const width of [20, 40, 80, 120]) {

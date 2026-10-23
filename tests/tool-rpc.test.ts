@@ -95,6 +95,25 @@ describe("RPC-backed subagent tool", () => {
     expect(value.content[0].text).toContain("session:");
   });
 
+  test("failed persisted task status retains its recovery path and last activity", async () => {
+    const h = host();
+    process.env.PI_SUBAGENT_SESSION_DIR = path.join(tempDir(), "sessions");
+    const failed = await h.execute({ command: "run", prompt: "SCENARIO=activity-hang", tools: ["read"], persist: true, executionTimeoutMs: 150 });
+    const child = failed.details.results[0];
+    expect(child.state).toMatchObject({ status: "terminal", outcome: "timed_out" });
+    expect(child.lastActivityAt).toBeGreaterThan(0);
+    expect(child.currentTool).toBeUndefined();
+    expect(child.activity).toBeUndefined();
+    const status = await h.execute({ command: "status", id: child.handle });
+    expect(status.details.results[0]).toMatchObject({ sessionFile: child.sessionFile, lastActivityAt: child.lastActivityAt });
+    for (const response of [failed, status]) {
+      expect(response.structuredContent).toEqual(response.details);
+      expect(response.content[0].text).toContain(`session: ${child.sessionFile}`);
+      expect(response.content[0].text).toContain("last activity:");
+      expect(JSON.stringify(response)).not.toContain("PRIVATE_");
+    }
+  });
+
   test("steering joins the child's startup deadline instead of a separate polling window", async () => {
     const h = host();
     process.env.FAKE_RPC_STARTUP_DELAY = "2800";

@@ -49,6 +49,9 @@ describe("session ownership", () => {
       result.prompt = "rewritten";
       result.tools.push("write");
       result.output = "rewritten";
+      result.lastActivityAt = 999;
+      result.activity = "thinking";
+      result.currentTool = "write";
       result.usage.input = 999;
       result.usage.cost.total = 999;
       result.state = { status: "terminal", outcome: "failed", exitCode: 1, finishedAt: 0 };
@@ -58,20 +61,27 @@ describe("session ownership", () => {
     expect(c.requests[0]!.task).toMatchObject({ prompt: "original task", tools: ["read"], model: "fixture/model" });
     const data = c.executions[0]!;
     data.output = "done";
+    data.lastActivityAt = 10;
+    data.activity = "tool";
+    data.currentTool = "read";
     data.usage.input = 5;
     data.usage.cost.total = 1;
     c.requests[0]!.onUpdate?.(data, "progress");
     expect(c.children.snapshot(run)).toMatchObject({
       prompt: "original task", tools: ["read"], output: "done", state: { status: "running" },
+      lastActivityAt: 10, activity: "tool", currentTool: "read",
       usage: { input: 5, cost: { total: 1 } },
     });
     data.output = "later backend update";
-    expect(c.children.snapshot(run).output).toBe("done");
+    data.lastActivityAt = 12;
+    expect(c.children.snapshot(run)).toMatchObject({ output: "done", lastActivityAt: 10 });
     c.gates[0]!.resolve();
     await run.promise;
     data.usage.input = 999;
     data.usage.cost.total = 999;
-    expect(c.children.snapshot(run)).toMatchObject({ output: "done", state: { outcome: "completed" }, usage: { input: 5, cost: { total: 1 } } });
+    expect(c.children.snapshot(run)).toMatchObject({ output: "done", lastActivityAt: 12, state: { outcome: "completed" }, usage: { input: 5, cost: { total: 1 } } });
+    expect(c.children.snapshot(run).activity).toBeUndefined();
+    expect(c.children.snapshot(run).currentTool).toBeUndefined();
     expect(c.children.takePendingUsage()).toMatchObject({ input: 5, cost: { total: 1 } });
     await c.children.close();
   });

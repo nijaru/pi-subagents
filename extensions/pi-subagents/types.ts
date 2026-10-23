@@ -1,10 +1,11 @@
 import type { Message, ModelThinkingLevel, Usage } from "@earendil-works/pi-ai";
 import type { Static } from "typebox";
-import type { OutcomeSchema, ChildStateSchema, UsageSchema, OutputTruncationSchema, ChildResultSchema, SubagentDetailsSchema } from "./result-schema.ts";
+import type { OutcomeSchema, ChildStateSchema, ChildActivitySchema, UsageSchema, OutputTruncationSchema, ChildResultSchema, SubagentDetailsSchema } from "./result-schema.ts";
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const satisfies readonly ModelThinkingLevel[];
 export type AgentOutcome = Static<typeof OutcomeSchema>;
 export type ChildState = Static<typeof ChildStateSchema>;
+export type ChildActivity = Static<typeof ChildActivitySchema>;
 export type UsageSummary = Static<typeof UsageSchema>;
 export type OutputTruncation = Static<typeof OutputTruncationSchema>;
 export type ChildResult = Static<typeof ChildResultSchema>;

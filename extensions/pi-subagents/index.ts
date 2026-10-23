@@ -16,7 +16,7 @@ import { childStatus as summary, childReports, formatElapsed } from "./reports.t
 
 export { SubagentParamsSchema } from "./params.ts";
 export type { SubagentParams } from "./params.ts";
-export type { ChildResult, SubagentDetails, AgentOutcome, ChildState, UsageSummary } from "./types.ts";
+export type { ChildResult, ChildActivity, SubagentDetails, AgentOutcome, ChildState, UsageSummary } from "./types.ts";
 export { MAX_CONCURRENCY } from "./limits.ts";
 
 function answer(command: SubagentDetails["command"], results: ChildResult[], text: string, waitExpired?: boolean): AgentToolResult<SubagentDetails> {
@@ -108,7 +108,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
-    description: "Delegate one self-contained task to a fresh Pi child over the public RPC protocol. run joins within a join budget, then lets the child finish as background work; spawn returns a handle immediately. status, wait, stop, and steer control session-scoped children. Defaults to read/search/web tools; request bash, edit, or write explicitly for mutating work. Children are leaves.",
+    description: "Delegate one self-contained task to a fresh Pi child over the public RPC protocol. run joins within a join budget, then lets the child finish as background work; spawn returns a handle immediately. status, wait, stop, and steer control session-scoped children. Defaults to read/search/web tools; request bash, edit, or write explicitly for mutating work. Children are leaves. For long tasks needing later inspection or recovery, opt into persist: true and continue the returned sessionFile with resume after the child stops.",
     parameters: SubagentParamsSchema,
     outputSchema: SubagentDetailsSchema,
     executionMode: "parallel",
@@ -121,6 +121,7 @@ export default function (pi: ExtensionAPI) {
       "Spawn independent subagent tasks before waiting. Inbox results are advertised on the next tool result and never wake an idle parent; notify: \"turn\" opts into an active-boundary continuation. Use subagent wait with ids when blocked; it wakes when any finishes. Do not poll or wait again on reports already received. Cancelling wait leaves children running; stop cancels them.",
       "subagent run joins within a join budget; if it expires the child keeps working and reports completion like spawn, so never relaunch it as a duplicate.",
       "Bound task execution with executionTimeoutMs (default 30m, at most 2h), separate from startupTimeoutMs, run's joinTimeoutMs, and wait's timeoutMs. A timed-out result keeps partial output and states elapsed runtime and the deadline, so split the task or raise the deadline instead of relaunching it unchanged.",
+      "Use persist: true for long tasks that need inspection or recovery after failure; it saves the Pi conversation (potentially sensitive), not a full token trace. Once the child stops, resume its returned sessionFile in the same cwd with a focused continuation prompt. Persistence is off by default. status exposes content-free activity and lastActivityAt; silence alone does not prove a stall.",
       "Give concurrent subagent writers separate worktrees, including parent-versus-child writers. Child processes share the selected working tree; subagent does not arbitrate write ownership.",
     ],
     async execute(_toolCallId, params, signal, onUpdate, ctx) {

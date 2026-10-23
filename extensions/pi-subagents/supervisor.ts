@@ -6,7 +6,7 @@ import { childEnvironment } from "./env.ts";
 import { MAX_OUTPUT_BYTES, RUNNING_PROGRESS_TEXT, processTimeoutMs, startupTimeoutMs } from "./limits.ts";
 import { timeoutSummary, withCredentialHint } from "./reports.ts";
 import { cleanupChild, hasExited, spawnDeathWatchdog } from "./process-tree.ts";
-import { addUsage, copyUsage, emptyUsage, isUsage, textFromMessage, type ChildResult } from "./types.ts";
+import { addUsage, copyUsage, emptyUsage, isUsage, textFromMessage, type ChildActivity, type ChildResult } from "./types.ts";
 import { PROBE_COMMAND, PROBE_CUSTOM_TYPE, PROBE_DEADLINE_ENV, PROBE_TOKEN_ENV, PROBE_TOOLS_ENV, type ProbeReport } from "./probe-protocol.ts";
 import { acquireSession, getRpcInvocation } from "./launch.ts";
 import { ChildRpc, type ChildEvent } from "./rpc.ts";
@@ -29,7 +29,7 @@ export interface ChildTask {
 
 /** Execution facts; the session registry owns handles, admission and delivery. */
 export type ChildExecutionData = Pick<ChildResult,
-  "startedAt" | "taskFinishedAt" | "phase" | "model" | "thinking" | "usage" | "output" | "outputTruncation" | "stdout" | "stderr" | "errorMessage" | "sessionFile"
+  "startedAt" | "taskFinishedAt" | "lastActivityAt" | "activity" | "currentTool" | "phase" | "model" | "thinking" | "usage" | "output" | "outputTruncation" | "stdout" | "stderr" | "errorMessage" | "sessionFile"
 >;
 export interface ChildControl { steer(message: string, signal?: AbortSignal): Promise<void>; }
 export interface ChildRunRequest {
@@ -90,7 +90,11 @@ export class RpcChildSupervisor implements ChildSupervisor {
     const startupBudget = task.startupTimeoutMs ?? startupTimeoutMs();
     const data: ChildExecutionData = { phase: "starting", startedAt, stderr: "", usage: emptyUsage() };
     const snapshot = (): ChildExecutionData => ({ ...data, usage: copyUsage(data.usage), outputTruncation: data.outputTruncation ? { ...data.outputTruncation } : undefined });
-    const publish = (progress?: string) => { try { onUpdate?.(snapshot(), progress); } catch { /* Presentation is best effort. */ } };
+    let lastPublish = 0;
+    const publish = (progress?: string) => {
+      if (progress !== undefined) lastPublish = Date.now();
+      try { onUpdate?.(snapshot(), progress); } catch { /* Presentation is best effort. */ }
+    };
     let phase: Phase = "starting";
     let releaseSession: (() => void) | undefined;
     let child: ChildProcess;
@@ -121,13 +125,18 @@ export class RpcChildSupervisor implements ChildSupervisor {
     let streamingBytes = 0;
     let assistantOpen = false;
     let streamingUsage: Usage | undefined;
-    let lastPublish = 0;
+    // Counts by allowlisted name handle parallel/nested calls without retaining
+    // call IDs, arguments, results, or an unbounded history of tool events.
+    const activeTools = new Map<string, number>();
     let rpc: ChildRpc;
     const stop = (reason: End) => {
       if (phase === "stopping" || phase === "settled") return;
       phase = "stopping";
       data.phase = "stopping";
       data.taskFinishedAt = Date.now();
+      data.activity = undefined;
+      data.currentTool = undefined;
+      activeTools.clear();
       if (timer) clearTimeout(timer);
       rpc.close();
       probe.resolve(undefined);
@@ -149,6 +158,17 @@ export class RpcChildSupervisor implements ChildSupervisor {
         truncated: true, originalBytes: bytes, retainedBytes: Buffer.byteLength(data.output),
       } : undefined;
     };
+    const recordActivity = (kind?: ChildActivity) => {
+      data.lastActivityAt = Date.now();
+      data.currentTool = [...activeTools.keys()].at(-1);
+      data.activity = activeTools.size ? "tool" : kind;
+      // Registry snapshots see every event; only foreground presentation is
+      // throttled. Silence never advances lastActivityAt or resets a deadline.
+      if (Date.now() - lastPublish >= 500) {
+        updateOutput();
+        publish(RUNNING_PROGRESS_TEXT);
+      } else publish();
+    };
     const event = (event: ChildEvent) => {
       if (phase === "stopping" || phase === "settled") return;
       switch (event.type) {
@@ -158,8 +178,12 @@ export class RpcChildSupervisor implements ChildSupervisor {
         case "extension_error":
           rpc.diagnostic(`\nChild extension error (${event.event ?? "unknown"}): ${event.error ?? "unknown"}`);
           break;
+        case "turn_start": recordActivity("model"); break;
         case "message_start":
-          if (event.message?.role === "assistant") { streaming = ""; streamingBytes = 0; streamingUsage = undefined; assistantOpen = true; }
+          if (event.message?.role === "assistant") {
+            streaming = ""; streamingBytes = 0; streamingUsage = undefined; assistantOpen = true;
+            recordActivity("model");
+          }
           break;
         case "message_update":
           if (isUsage(event.usage)) streamingUsage = { ...event.usage, cost: { ...event.usage.cost } };
@@ -169,7 +193,13 @@ export class RpcChildSupervisor implements ChildSupervisor {
             assistantOpen = true;
             streamingBytes += Buffer.byteLength(delta);
             streaming = utf8Prefix(streaming + delta, MAX_OUTPUT_BYTES * 2);
-            if (Date.now() - lastPublish >= 500) { lastPublish = Date.now(); updateOutput(); publish(); }
+          }
+          // Classify the wire event, never copy its thinking/argument content.
+          switch (event.assistantMessageEvent?.type) {
+            case "thinking_start": case "thinking_delta": case "thinking_end": recordActivity("thinking"); break;
+            case "text_start": case "text_delta": case "text_end": recordActivity("text"); break;
+            case "start": case "toolcall_start": case "toolcall_delta": case "toolcall_end": recordActivity("model"); break;
+            case "done": case "error": recordActivity(); break;
           }
           break;
         case "entry_appended":
@@ -178,7 +208,7 @@ export class RpcChildSupervisor implements ChildSupervisor {
           // are accounted separately by compaction_end below.
           if (event.entry?.type === "usage" && isUsage(event.entry.usage)) {
             addUsage(data.usage, event.entry.usage);
-            publish();
+            recordActivity(data.activity);
           } else if (event.entry?.type === "custom" && event.entry.customType === PROBE_CUSTOM_TYPE) {
             const report = event.entry.data as Partial<ProbeReport> | undefined;
             if (report?.token !== probeToken || !Array.isArray(report?.tools) || !report.tools.every((name) => typeof name === "string")) {
@@ -197,13 +227,28 @@ export class RpcChildSupervisor implements ChildSupervisor {
             streamingUsage = undefined;
             data.errorMessage = boundedDiagnostic(assistant.errorMessage);
             updateOutput();
-            publish();
+            recordActivity();
           } else if (event.message?.role === "toolResult" && isUsage(event.message.usage)) addUsage(data.usage, event.message.usage);
           break;
         case "compaction_end":
           if (isUsage(event.result?.usage)) addUsage(data.usage, event.result.usage);
           break;
-        case "tool_execution_start": publish(`Running ${truncateOutput(String(event.toolName), 256)}...`); break;
+        case "tool_execution_start":
+          if (task.tools.includes(event.toolName)) {
+            const count = activeTools.get(event.toolName) ?? 0;
+            activeTools.delete(event.toolName);
+            activeTools.set(event.toolName, count + 1);
+          }
+          recordActivity("tool");
+          break;
+        case "tool_execution_update": recordActivity("tool"); break;
+        case "tool_execution_end": {
+          const count = activeTools.get(event.toolName) ?? 0;
+          if (count > 1) activeTools.set(event.toolName, count - 1);
+          else activeTools.delete(event.toolName);
+          recordActivity();
+          break;
+        }
         case "agent_settled": stop(event.aborted ? { kind: "cancelled" } : { kind: "settled" }); break;
       }
     };

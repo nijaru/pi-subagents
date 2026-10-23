@@ -18,13 +18,29 @@ function child(id = "child-1"): ChildResult {
 
 describe("serialized result bounds", () => {
   test("session and deadline metadata survive both result envelopes", () => {
-    const metadata = { sessionFile: "/tmp/session.jsonl", taskFinishedAt: 3, cleanupMs: 1, errorKind: "deadline" as const, timeoutPhase: "startup" as const };
+    const metadata = { lastActivityAt: 2, sessionFile: "/tmp/session.jsonl", taskFinishedAt: 3, cleanupMs: 1, errorKind: "deadline" as const, timeoutPhase: "startup" as const };
     const result = { ...child(), ...metadata,
       state: { status: "terminal", outcome: "timed_out", exitCode: 1, finishedAt: 4 } as const };
     expect(minimalChildResult(result)).toMatchObject(metadata);
     const bounded = boundDetails({ command: "wait", results: [result] });
     expect(bounded.results[0]).toMatchObject(metadata);
     expect(Check(SubagentDetailsSchema, bounded)).toBe(true);
+  });
+
+  test("live activity pays for space in minimal and 32-child envelopes without stale truncation counts", () => {
+    const metadata = { lastActivityAt: 1_700_000_000_000, activity: "tool" as const, currentTool: "a".repeat(256) };
+    const results = Array.from({ length: 32 }, (_, index) => ({ ...child(`child-${index}`), ...metadata, state: { status: "running" } as const }));
+    const minimal = minimalChildResult(results[0]!);
+    expect(minimal).toMatchObject(metadata);
+    expect(jsonBytes(boundChildResult(results[0]!, jsonBytes(minimal)))).toBeLessThanOrEqual(jsonBytes(minimal));
+    const bounded = boundDetails({ command: "status", results });
+    expect(jsonBytes(bounded)).toBeLessThanOrEqual(51200);
+    expect(Check(SubagentDetailsSchema, bounded)).toBe(true);
+    for (const result of bounded.results) {
+      expect(result).toMatchObject(metadata);
+      expect(result.outputTruncation?.retainedBytes).toBe(Buffer.byteLength(result.output ?? ""));
+    }
+    expect(Buffer.byteLength(childReports(results))).toBeLessThanOrEqual(51200);
   });
 
   test("batch truncation adds metadata even when the original budget was not reached", () => {

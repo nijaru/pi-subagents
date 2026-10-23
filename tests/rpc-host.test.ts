@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getRpcInvocation } from "../extensions/pi-subagents/launch.ts";
-import { RpcChildSupervisor, type ChildControl, type ChildTask } from "../extensions/pi-subagents/supervisor.ts";
+import { RpcChildSupervisor, type ChildControl, type ChildExecutionData, type ChildTask } from "../extensions/pi-subagents/supervisor.ts";
 
 const directories: string[] = [];
 function tempDir(): string {
@@ -46,6 +46,45 @@ describe("public RPC child host", () => {
     expect(capture.args).toContain("--tools");
     expect(capture.args).toContain("read");
     expect(capture.cwd).toBe(fs.realpathSync.native(dir));
+  });
+
+  test("observes thinking and overlapping tool lifecycles without retaining private payloads", async () => {
+    const updates: ChildExecutionData[] = [];
+    const progress: string[] = [];
+    const result = await run(task(tempDir(), { prompt: "SCENARIO=activity", tools: ["read", "bash"] }), undefined,
+      (data: ChildExecutionData, text?: string) => { updates.push(data); if (text) progress.push(text); });
+    const model = updates.find((data) => data.activity === "model")!;
+    const thinking = updates.filter((data) => data.activity === "thinking");
+    expect(thinking).toHaveLength(34);
+    expect(thinking[0]!.lastActivityAt!).toBeGreaterThan(model.lastActivityAt!);
+    expect(thinking.every((data) => !data.output && !data.currentTool)).toBe(true);
+    const tools = updates.filter((data) => data.activity === "tool");
+    expect(tools.map((data) => data.currentTool)).toEqual(["read", "read", "bash", "bash", "bash", "read"]);
+    const afterTools = updates[updates.indexOf(tools.at(-1)!) + 1]!;
+    expect(afterTools.activity).toBeUndefined();
+    expect(afterTools.currentTool).toBeUndefined();
+    expect(updates.some((data) => data.activity === "text")).toBe(true);
+    expect(result).toMatchObject({ outcome: "completed", output: "public report", usage: { turns: 2, totalTokens: 18 } });
+    expect(result.activity).toBeUndefined();
+    expect(result.currentTool).toBeUndefined();
+    expect(result.lastActivityAt).toBe(updates.at(-1)!.lastActivityAt);
+    expect(result.lastActivityAt!).toBeLessThanOrEqual(result.taskFinishedAt!);
+    // A burst of tokens/tools updates registry facts, not the UI for each token.
+    expect(progress.length).toBeLessThan(5);
+    expect(JSON.stringify([updates, result, progress])).not.toContain("PRIVATE_");
+  });
+
+  test("a stalled tool times out without replacing its last activity with cleanup time", async () => {
+    const updates: ChildExecutionData[] = [];
+    const result = await run(task(tempDir(), { prompt: "SCENARIO=activity-hang", executionTimeoutMs: 150 }), undefined,
+      (data: ChildExecutionData) => updates.push(data));
+    const tool = updates.find((data) => data.currentTool === "read")!;
+    expect(tool.activity).toBe("tool");
+    expect(result).toMatchObject({ outcome: "timed_out", timeoutPhase: "execution", lastActivityAt: tool.lastActivityAt });
+    expect(result.lastActivityAt!).toBeLessThan(result.taskFinishedAt!);
+    expect(result.activity).toBeUndefined();
+    expect(result.currentTool).toBeUndefined();
+    expect(JSON.stringify([updates, result])).not.toContain("PRIVATE_");
   });
 
   test("counts background usage and compaction once without adding foreground turns", async () => {

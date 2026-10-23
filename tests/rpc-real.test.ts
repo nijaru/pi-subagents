@@ -1,24 +1,35 @@
 import { expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { RpcChildSupervisor } from "../extensions/pi-subagents/supervisor.ts";
+import { RpcChildSupervisor, type ChildExecutionData } from "../extensions/pi-subagents/supervisor.ts";
 import { realRpcFixture } from "./fixtures/real-rpc.ts";
 
 // Each test starts the installed CLI, not an SDK bootstrap or fake RPC process.
 test("real RPC child executes a tool and reports usage", async () => {
   using f = realRpcFixture((body) => body.messages.some((message: any) => message.role === "tool")
     ? { content: "FILE_SENTINEL" }
-    : { tool_calls: [{ index: 0, id: "read_call", type: "function", function: { name: "read", arguments: JSON.stringify({ path: "fixture.txt" }) } }] });
+    : { reasoning_content: "PRIVATE_REASONING", tool_calls: [{ index: 0, id: "read_call", type: "function", function: { name: "read", arguments: JSON.stringify({ path: "fixture.txt" }) } }] });
   fs.writeFileSync(path.join(f.dir, "fixture.txt"), "SENTINEL_CONTENT");
+  const updates: ChildExecutionData[] = [];
   const result = await new RpcChildSupervisor().run({
     task: {
       id: "real-run", prompt: "Read fixture.txt and report its content.", cwd: f.dir,
       tools: ["read"], model: "fixture/model", thinking: "off", executionTimeoutMs: 20_000,
     },
     signal: new AbortController().signal,
+    onUpdate: (data) => updates.push(data),
   });
   expect(result.outcome).toBe("completed");
   expect(result.output).toContain("FILE_SENTINEL");
+  const reasoning = updates.find((data) => data.activity === "thinking");
+  expect(reasoning).toBeDefined();
+  expect(reasoning!.output).toBeFalsy();
+  expect(updates.some((data) => data.activity === "tool" && data.currentTool === "read")).toBe(true);
+  expect(updates.some((data) => data.activity === "text" && !data.currentTool)).toBe(true);
+  expect(result.lastActivityAt).toBeGreaterThanOrEqual(reasoning!.lastActivityAt!);
+  expect(result.activity).toBeUndefined();
+  expect(result.currentTool).toBeUndefined();
+  for (const secret of ["PRIVATE_REASONING", "fixture.txt", "SENTINEL_CONTENT"]) expect(JSON.stringify(updates)).not.toContain(secret);
   expect(result.usage).toMatchObject({ turns: 2, input: 34, output: 8, totalTokens: 42 });
   expect(f.requests).toHaveLength(2);
   expect(f.requests[0].tools.map((tool: any) => tool.function.name)).toEqual(["read"]);
@@ -39,14 +50,14 @@ test("missing tools exhaust startup without submitting model work", async () => 
   expect(f.requests).toEqual([]);
 }, 20_000);
 
-test("persisted sessions resume their history only in the original workspace", async () => {
-  using f = realRpcFixture();
+test("failed persisted sessions recover their history only in the original workspace", async () => {
+  using f = realRpcFixture((body) => ({ content: JSON.stringify(body.messages).includes("SECOND_MARKER") ? "OK" : "" }));
   const supervisor = new RpcChildSupervisor();
   const first = await supervisor.run({
     task: { id: "persisted", prompt: "FIRST_MARKER", cwd: f.dir, tools: [], model: "fixture/model", persist: true, executionTimeoutMs: 10_000 },
     signal: new AbortController().signal,
   });
-  expect(first.outcome).toBe("completed");
+  expect(first.outcome).toBe("failed");
   expect(first.sessionFile).toBeDefined();
   expect(fs.existsSync(first.sessionFile!)).toBe(true);
   const other = path.join(f.dir, "other");

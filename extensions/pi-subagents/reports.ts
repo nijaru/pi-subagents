@@ -51,6 +51,14 @@ export function runtimeLabel(result: ChildResult): string {
   return duration ? `${duration}${isRunning(result) ? " elapsed" : ""}` : "";
 }
 
+/** Content-free activity only; absolute time stays truthful in old snapshots. */
+export function activitySummary(result: ChildResult): string {
+  const current = isRunning(result) && result.activity
+    ? `activity: ${result.activity}${result.currentTool ? ` (${truncateOutput(result.currentTool, 256)})` : ""}` : "";
+  const last = result.lastActivityAt === undefined ? "" : `last activity: ${new Date(result.lastActivityAt).toISOString()}`;
+  return [current, last].filter(Boolean).join(" · ");
+}
+
 /** Failure causes precede partial output so bounds cannot hide why the child stopped. */
 export function resultText(result: ChildResult): string {
   if (!failed(result)) return result.output || "(no output)";
@@ -83,7 +91,8 @@ export function childSummary(result: ChildResult, includePrompt = true): string 
   const model = result.model ? `\nmodel: ${truncateOutput(result.model, 512)}${result.thinking ? ` · thinking: ${result.thinking}` : ""}` : "";
   const session = result.sessionFile ? `\nsession: ${truncateOutput(result.sessionFile, 1024)}` : "";
   const handle = result.handle ?? result.id;
-  const head = `${handle} [${status}]${duration ? ` · ${duration}` : ""}${model}${session}`;
+  const activity = activitySummary(result);
+  const head = `${handle} [${status}]${duration ? ` · ${duration}` : ""}${model}${session}${activity ? `\n${activity}` : ""}`;
   return includePrompt ? `${head}\n${truncateOutput(result.prompt, 256)}` : head;
 }
 
