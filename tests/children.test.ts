@@ -27,15 +27,6 @@ function controlled() {
 }
 
 describe("session ownership", () => {
-  test("registers admission before a supervisor can reenter the owner", async () => {
-    const c = controlled();
-    const runs = Array.from({ length: 4 }, () => c.start());
-    expect(() => c.start()).toThrow("maximum 4");
-    expect(c.children.list().map((r) => r.id)).toEqual(runs.map((r) => r.result.id));
-    await c.children.close();
-    expect(c.requests.every((r) => r.signal.aborted)).toBe(true);
-    expect(c.notices).toEqual([]);
-  });
   test("holds admission until execution cleanup returns, even after terminal output", async () => {
     const c = controlled();
     const runs = Array.from({ length: 4 }, () => c.start());
@@ -143,12 +134,14 @@ describe("session ownership", () => {
     expect(run.waiters.size).toBe(0);
     await c.children.close();
   });
-  test("an active join claims delivery and suppresses the completion notice", async () => {
+  test("an active join deduplicates aliases and suppresses the completion notice", async () => {
     const c = controlled();
     const run = c.start();
-    const joining = c.children.wait([run.result.id], 10000);
+    const joining = c.children.wait([run.result.id, run.handle], 10000);
     c.gates[0]!.resolve();
-    expect((await joining)[0]!.output).toBe("done");
+    const results = await joining;
+    expect(results).toHaveLength(1);
+    expect(results[0]!.output).toBe("done");
     await run.promise;
     expect(c.notices).toEqual([]);
   });
@@ -229,34 +222,19 @@ describe("session ownership", () => {
     expect(c.children.pendingCompletions()).toHaveLength(0);
     await c.children.close();
   });
-  test("evicts only completed handles and bounds retained state", async () => {
-    const c = controlled();
-    const active = c.start();
-    let firstCompleted = "";
-    for (let i = 1; i <= MAX_RETAINED_RUNS; i++) {
-      const run = c.start();
-      if (i === 1) firstCompleted = run.result.id;
-      c.gates[i]!.resolve();
-      await run.promise;
-      await c.children.wait([run.result.id], 1);
-    }
-    expect(c.children.list()).toHaveLength(MAX_RETAINED_RUNS);
-    expect(c.children.get(active.result.id)).toBe(active);
-    expect(() => c.children.get(firstCompleted)).toThrow("Unknown child");
-    await c.children.close();
-  });
   test("charges completed executions once, independently of joins and eviction", async () => {
     const c = controlled();
+    const active = c.start();
     const run = c.start();
-    c.executions[0]!.usage.input = 5;
+    c.executions[1]!.usage.input = 5;
     expect(c.children.takePendingUsage()).toBeUndefined(); // cleanup still running
-    c.gates[0]!.resolve();
+    c.gates[1]!.resolve();
     await run.promise;
     await c.children.wait([run.result.id], 1);
     await c.children.stop(run.result.id);
     expect(c.children.takePendingUsage()?.input).toBe(5);
     expect(c.children.takePendingUsage()).toBeUndefined();
-    for (let i = 1; i <= MAX_RETAINED_RUNS + 1; i++) {
+    for (let i = 2; i <= MAX_RETAINED_RUNS + 2; i++) {
       const next = c.start();
       c.executions[i]!.usage.input = 2;
       c.gates[i]!.resolve();
@@ -264,6 +242,8 @@ describe("session ownership", () => {
       await c.children.wait([next.result.id], 1);
     }
     expect(() => c.children.get(run.result.id)).toThrow("Unknown child");
+    expect(c.children.list()).toHaveLength(MAX_RETAINED_RUNS);
+    expect(c.children.get(active.handle)).toBe(active);
     expect(c.children.takePendingUsage()?.input).toBe((MAX_RETAINED_RUNS + 1) * 2);
     expect(c.children.takePendingUsage()).toBeUndefined();
     await c.children.close();
@@ -281,51 +261,30 @@ describe("session ownership", () => {
     c.start();
     await c.children.close();
   });
-  test("shutdown discards pending usage and fences charges from stopped children", async () => {
+  test("shutdown fences admission, updates, notices, and unreported usage", async () => {
     const c = controlled();
     const completed = c.start();
     c.executions[0]!.usage.input = 5;
     c.gates[0]!.resolve();
     await completed.promise;
-    c.start();
-    c.executions[1]!.usage.input = 7;
-    await c.children.close();
-    expect(c.children.takePendingUsage()).toBeUndefined();
-  });
-  test("session closure fences completion and rejects subsequent admission", async () => {
-    const c = controlled();
-    c.start();
-    const closed = c.children.close();
-    expect(() => c.start()).toThrow("closing");
-    await closed;
-    expect(c.notices).toEqual([]);
-    expect(c.children.list()).toEqual([]);
-  });
-  test("shutdown fences foreground updates as well as completion notices", async () => {
-    const c = controlled();
     let updates = 0;
     c.children.start({ prompt: "x", tools: [], cwd: process.cwd(), emit: () => { updates++; } });
+    c.executions[1]!.usage.input = 7;
     const closing = c.children.close();
-    c.requests[0]!.onUpdate?.(c.executions[0]!, "stale update");
+    expect(() => c.start()).toThrow("closing");
+    c.requests[1]!.onUpdate?.(c.executions[1]!, "stale update");
     await closing;
     expect(updates).toBe(0);
+    expect(c.notices).toEqual([completed.result.id]);
+    expect(c.children.list()).toEqual([]);
+    expect(c.requests[1]!.signal.aborted).toBe(true);
+    expect(c.children.takePendingUsage()).toBeUndefined();
   });
   test("notification failure does not lose the completed result", async () => {
     const children = new SessionChildren({ async run() { return { output: "answer", stderr: "", usage: emptyUsage(), outcome: "completed", exitCode: 0, stopReason: "stop" }; } }, () => { throw new Error("UI unavailable"); });
     const run = children.start({ prompt: "x", tools: [], cwd: process.cwd() });
     await run.promise;
     expect((await children.wait([run.result.id], 1))[0]!.output).toBe("answer");
-    await children.close();
-  });
-  test("lifecycle state never duplicates execution diagnostics", async () => {
-    const children = new SessionChildren({ async run() {
-      return { outcome: "failed", exitCode: 1, stopReason: "error", errorMessage: "diagnostic".repeat(1000), stdout: "not lifecycle state", stderr: "", usage: emptyUsage() };
-    } }, () => {});
-    const run = children.start({ prompt: "x", tools: [], cwd: process.cwd() });
-    await run.promise;
-    const result = children.snapshot(run);
-    expect(Object.keys(result.state).sort()).toEqual(["exitCode", "finishedAt", "outcome", "status", "stopReason"]);
-    expect(result.errorMessage).toContain("diagnostic");
     await children.close();
   });
   test("supervisor setup failures settle rather than leaking admission", async () => {

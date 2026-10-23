@@ -17,13 +17,14 @@ function child(id = "child-1"): ChildResult {
 }
 
 describe("serialized result bounds", () => {
-  test("session and task-finish metadata survive bounding", () => {
-    const result = { ...child(), sessionFile: "/tmp/session.jsonl", taskFinishedAt: 3 };
-    const minimal = minimalChildResult(result);
-    expect(minimal.sessionFile).toBe("/tmp/session.jsonl");
-    expect(minimal.taskFinishedAt).toBe(3);
+  test("session and deadline metadata survive both result envelopes", () => {
+    const metadata = { sessionFile: "/tmp/session.jsonl", taskFinishedAt: 3, cleanupMs: 1, errorKind: "deadline" as const, timeoutPhase: "startup" as const };
+    const result = { ...child(), ...metadata,
+      state: { status: "terminal", outcome: "timed_out", exitCode: 1, finishedAt: 4 } as const };
+    expect(minimalChildResult(result)).toMatchObject(metadata);
     const bounded = boundDetails({ command: "wait", results: [result] });
-    expect(bounded.results[0]).toMatchObject({ sessionFile: "/tmp/session.jsonl", taskFinishedAt: 3 });
+    expect(bounded.results[0]).toMatchObject(metadata);
+    expect(Check(SubagentDetailsSchema, bounded)).toBe(true);
   });
 
   test("batch truncation adds metadata even when the original budget was not reached", () => {
@@ -33,20 +34,6 @@ describe("serialized result bounds", () => {
     expect(bounded.outputTruncation).toMatchObject({
       truncated: true, originalBytes: 40_000, retainedBytes: Buffer.byteLength(bounded.output!),
     });
-  });
-
-  test("timeoutPhase survives minimal and bounded results", () => {
-    const timedOut = {
-      ...child(),
-      state: { status: "terminal", outcome: "timed_out", exitCode: 1, finishedAt: 2 } as const,
-      errorKind: "deadline" as const,
-      timeoutPhase: "startup" as const,
-      errorMessage: "Subagent timed out during startup.",
-    };
-    expect(minimalChildResult(timedOut).timeoutPhase).toBe("startup");
-    const bounded = boundDetails({ command: "status", results: [timedOut] });
-    expect(bounded.results[0]!.timeoutPhase).toBe("startup");
-    expect(Check(SubagentDetailsSchema, bounded)).toBe(true);
   });
 
   test("32 escaped diagnostics retain every identity within the default budget", () => {
@@ -157,7 +144,15 @@ describe("output truncation", () => {
   test("ASCII and UTF-8 prefixes are bounded and truthful across digit boundaries", () => {
     for (const value of ["x".repeat(1200), "😀é中".repeat(200), "x".repeat(52)]) {
       const total = Buffer.byteLength(value);
-      for (let budget = 0; budget <= Math.min(total + 1, 1201); budget++) {
+      const budgets = new Set([0, 1, total - 1, total, total + 1, "[Output truncated]".length - 1, "[Output truncated]".length]);
+      // Exercise either side of marker/prefix digit changes, rather than every
+      // byte budget repeating the same assertions. UTF-8 also crosses code points.
+      for (const kept of [0, 9, 10, 99, 100, 999, 1000]) {
+        if (kept >= total) continue;
+        const fit = kept + Buffer.byteLength(`\n\n[Output truncated: kept ${kept} of ${total} bytes.]`);
+        for (const delta of [-1, 0, 1]) budgets.add(fit + delta);
+      }
+      for (const budget of budgets) {
         const output = truncateOutput(value, budget);
         expect(Buffer.byteLength(output)).toBeLessThanOrEqual(budget);
         expect(output).not.toContain("\ufffd");

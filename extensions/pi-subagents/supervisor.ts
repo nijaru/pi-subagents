@@ -6,7 +6,7 @@ import { childEnvironment } from "./env.ts";
 import { MAX_OUTPUT_BYTES, RUNNING_PROGRESS_TEXT, processTimeoutMs, startupTimeoutMs } from "./limits.ts";
 import { timeoutSummary, withCredentialHint } from "./reports.ts";
 import { cleanupChild, hasExited, spawnDeathWatchdog } from "./process-tree.ts";
-import { addUsage, emptyUsage, isUsage, textFromMessage, type ChildResult } from "./types.ts";
+import { addUsage, copyUsage, emptyUsage, isUsage, textFromMessage, type ChildResult } from "./types.ts";
 import { PROBE_COMMAND, PROBE_CUSTOM_TYPE, PROBE_DEADLINE_ENV, PROBE_TOKEN_ENV, PROBE_TOOLS_ENV, type ProbeReport } from "./probe-protocol.ts";
 import { acquireSession, getRpcInvocation } from "./launch.ts";
 import { ChildRpc, type ChildEvent } from "./rpc.ts";
@@ -76,11 +76,6 @@ function classify(end: End, assistant: AssistantMessage | undefined, output: str
   return { outcome: "failed", exitCode: 1, stopReason: "error", errorKind: "protocol", errorMessage: errorMessage || "Child produced no terminal assistant output; a final response is required." };
 }
 
-/** All startup operations share this deadline; no additional readiness ceiling. */
-export function startupRemainingMs(startedAt: number, budgetMs: number, now = Date.now()): number {
-  return Math.max(1, budgetMs - Math.max(0, now - startedAt));
-}
-
 async function drainBeforeExit(rpc: ChildRpc): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -94,7 +89,7 @@ export class RpcChildSupervisor implements ChildSupervisor {
     const startedAt = Date.now();
     const startupBudget = task.startupTimeoutMs ?? startupTimeoutMs();
     const data: ChildExecutionData = { phase: "starting", startedAt, stderr: "", usage: emptyUsage() };
-    const snapshot = (): ChildExecutionData => ({ ...data, usage: { ...data.usage, cost: { ...data.usage.cost } }, outputTruncation: data.outputTruncation ? { ...data.outputTruncation } : undefined });
+    const snapshot = (): ChildExecutionData => ({ ...data, usage: copyUsage(data.usage), outputTruncation: data.outputTruncation ? { ...data.outputTruncation } : undefined });
     const publish = (progress?: string) => { try { onUpdate?.(snapshot(), progress); } catch { /* Presentation is best effort. */ } };
     let phase: Phase = "starting";
     let releaseSession: (() => void) | undefined;
@@ -237,7 +232,8 @@ export class RpcChildSupervisor implements ChildSupervisor {
     const initialize = async () => {
       await watchdogSetup;
       if (phase !== "starting") return;
-      const remaining = () => startupRemainingMs(startedAt, startupBudget);
+      // Every startup command spends the same deadline, including the probe.
+      const remaining = () => Math.max(1, startupBudget - Math.max(0, Date.now() - startedAt));
       const state = (await rpc.request({ type: "get_state" }, remaining())).data;
       if (!state?.model) throw new Error("Child has no selected model.");
       const model = `${state.model.provider}/${state.model.id}`;
@@ -253,7 +249,6 @@ export class RpcChildSupervisor implements ChildSupervisor {
       const missing = task.tools.filter((tool) => !report.tools.includes(tool));
       if (missing.length) throw new Error(`Requested child tools are unavailable: ${missing.join(", ")}`);
       if (new Set(report.tools).size !== task.tools.length || report.tools.length !== task.tools.length) throw new Error("Child tool selection did not match request.");
-      if (phase !== "starting") return;
       data.model = model;
       data.thinking = state.thinkingLevel;
       data.phase = "running";

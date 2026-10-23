@@ -92,10 +92,6 @@ export function truncateOutput(value: string, maxBytes = MAX_OUTPUT_BYTES, total
   return prefix + markerFor(Buffer.byteLength(prefix, "utf8"));
 }
 
-export function appendDiagnostic(current: string, next: string): string {
-  return truncateHeadTail(current + next, MAX_STDERR_BYTES);
-}
-
 export function boundedDiagnostic(value: string | undefined, maxBytes = MAX_DIAGNOSTIC_BYTES): string | undefined {
   return value === undefined ? undefined : truncateOutput(value, maxBytes);
 }

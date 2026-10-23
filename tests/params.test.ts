@@ -1,19 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
 import { excludedChildTools, MCP_RESOURCE_TOOLS, selectTools, validateCommand, SubagentParamsSchema } from "../extensions/pi-subagents/params.ts";
 import { Check } from "typebox/value";
 import { childEnvironment } from "../extensions/pi-subagents/env.ts";
-import { isChildProcess, processTimeoutMs, DEFAULT_PROCESS_TIMEOUT_MS, STARTUP_TIMEOUT_ENV, startupTimeoutMs, MAX_PROCESS_TIMEOUT_MS, MAX_STARTUP_TIMEOUT_MS } from "../extensions/pi-subagents/limits.ts";
+import { isChildProcess, processTimeoutMs, DEFAULT_PROCESS_TIMEOUT_MS, STARTUP_TIMEOUT_ENV, startupTimeoutMs, MAX_PROCESS_TIMEOUT_MS, MAX_STARTUP_TIMEOUT_MS, foregroundBudgetMs, DEFAULT_FOREGROUND_MS, MAX_WAIT_MS } from "../extensions/pi-subagents/limits.ts";
 
 let env: NodeJS.ProcessEnv;
-const dirs: string[] = [];
 beforeEach(() => { env = { ...process.env }; });
 afterEach(() => {
   for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];
   Object.assign(process.env, env);
-  for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
 describe("tool selection", () => {
@@ -39,13 +34,19 @@ describe("tool selection", () => {
       expect(isChildProcess()).toBe(true);
     }
   });
-  test("invalid timeout configuration cannot disable the deadline", () => {
-    for (const value of ["0", "-1", "Infinity", "1.5", "99999999999"]) {
-      process.env.PI_SUBAGENT_TIMEOUT_MS = value;
-      expect(processTimeoutMs()).toBe(DEFAULT_PROCESS_TIMEOUT_MS);
+  test.each([
+    ["PI_SUBAGENT_TIMEOUT_MS", processTimeoutMs, DEFAULT_PROCESS_TIMEOUT_MS, MAX_PROCESS_TIMEOUT_MS],
+    [STARTUP_TIMEOUT_ENV, startupTimeoutMs, 30_000, MAX_STARTUP_TIMEOUT_MS],
+    ["PI_SUBAGENT_FOREGROUND_MS", foregroundBudgetMs, DEFAULT_FOREGROUND_MS, MAX_WAIT_MS],
+  ] as const)("invalid %s cannot disable or overflow its timer", (key, read, fallback, maximum) => {
+    for (const value of ["0", "-1", "Infinity", "1.5", String(maximum + 1), "2147483648"]) {
+      process.env[key] = value;
+      expect(read()).toBe(fallback);
     }
-    process.env.PI_SUBAGENT_TIMEOUT_MS = "1234";
-    expect(processTimeoutMs()).toBe(1234);
+    process.env[key] = "1234";
+    expect(read()).toBe(1234);
+    process.env[key] = String(maximum);
+    expect(read()).toBe(maximum);
   });
   test("executionTimeoutMs is a run/spawn option within the two-hour bound", () => {
     expect(Check(SubagentParamsSchema, { command: "run", prompt: "x", executionTimeoutMs: 1 })).toBe(true);
@@ -70,23 +71,19 @@ describe("tool selection", () => {
     expect(Check(SubagentParamsSchema, { command: "run", prompt: "x", joinTimeoutMs: 1000, notify: "turn" })).toBe(true);
     expect(() => validateCommand({ command: "spawn", prompt: "x", joinTimeoutMs: 1000 })).toThrow("spawn does not join");
     expect(() => validateCommand({ command: "wait", ids: ["x"], notify: "inbox" })).toThrow("does not accept child creation or join options");
-    process.env[STARTUP_TIMEOUT_ENV] = "1234";
-    expect(startupTimeoutMs()).toBe(1234);
   });
 });
 
 describe("child environment", () => {
   test("inherits provider, tool and shell configuration without credential heuristics", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-children-env-")); dirs.push(dir);
-    process.env.PI_CODING_AGENT_DIR = dir;
+    process.env.PI_CODING_AGENT_DIR = "/custom-agent";
     process.env.CHILD_TEST_MODEL_SECRET = "model-secret";
     process.env.child_test_header = "header-secret";
     process.env.CHILD_TEST_API_KEY = "api-key";
     process.env.CHILD_TEST_TOKEN = "token";
     process.env.CHILD_TEST_APP_VALUE = "private-app-state";
-    delete process.env.PI_SUBAGENT_PASSTHROUGH_ENV;
-    fs.writeFileSync(path.join(dir, "models.json"), '\uFEFF{ // JSONC\n "providers": {"custom": {"apiKey": "$CHILD_TEST_MODEL_SECRET", "headers":{"x-key":"$child_test_header"}, "models": [], }, }, }');
-    const child = childEnvironment("child-1", dir);
+    const child = childEnvironment("child-1", "/child");
+    expect(child.PI_CODING_AGENT_DIR).toBe("/custom-agent");
     expect(child.CHILD_TEST_MODEL_SECRET).toBe("model-secret");
     expect(child.child_test_header).toBe("header-secret");
     expect(child.CHILD_TEST_API_KEY).toBe("api-key");
@@ -94,7 +91,7 @@ describe("child environment", () => {
     expect(child.CHILD_TEST_APP_VALUE).toBe("private-app-state");
     expect(child.PI_SUBAGENT_DEPTH).toBe("1");
     expect(child.PI_SUBAGENT_RUN_ID).toBe("child-1");
-    expect(child.PWD).toBe(dir);
+    expect(child.PWD).toBe("/child");
   });
   test("does not lend parent session identity or mutate its environment", () => {
     process.env.PI_SESSION_ID = "parent-session";

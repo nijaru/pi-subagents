@@ -40,21 +40,18 @@ function host() {
 beforeEach(() => {
   process.env.PI_SUBAGENT_CLI = path.resolve(import.meta.dir, "fixtures/fake-rpc-cli.mjs");
   delete process.env.PI_SUBAGENT_SESSION_DIR;
+  delete process.env.PI_SUBAGENT_DEPTH;
 });
-afterEach(() => {
-  for (const h of hosts.splice(0)) void h;
+afterEach(async () => {
+  await Promise.all(hosts.splice(0).map((h) => h.handlers.get("session_shutdown")()));
   for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
   Object.assign(process.env, saved);
   for (const dir of directories.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
 describe("RPC-backed subagent tool", () => {
-  test("registers the rewritten surface and starts a foreground child", async () => {
+  test("starts a foreground child with a shared structured result envelope", async () => {
     const h = host();
-    expect(Object.keys(h.tool.parameters.properties).sort()).toEqual([
-      "command", "cwd", "executionTimeoutMs", "id", "ids", "joinTimeoutMs", "message",
-      "model", "notify", "persist", "prompt", "resume", "startupTimeoutMs", "thinking", "timeoutMs", "tools", "trustProject",
-    ].sort());
     const value = await h.execute({ command: "run", prompt: "hello", tools: ["read"] });
     const child = value.details.results[0];
     expect(child.state).toMatchObject({ status: "terminal", outcome: "completed" });
@@ -62,6 +59,7 @@ describe("RPC-backed subagent tool", () => {
     expect(child.model).toBe("parent/model");
     expect(child.thinking).toBe("high");
     expect(value.isError).toBe(false);
+    expect(value.structuredContent).toEqual(value.details);
     const capture = JSON.parse(fs.readFileSync(path.join(fs.realpathSync.native(h.cwd), ".fake-rpc-capture.json"), "utf8"));
     expect(capture.args).toContain("--exclude-tools");
     expect(capture.args[capture.args.indexOf("--exclude-tools") + 1]).toContain("mcp__*");
@@ -72,11 +70,6 @@ describe("RPC-backed subagent tool", () => {
     const started = await h.execute({ command: "spawn", prompt: "SCENARIO=steer", tools: [] });
     const handle = started.details.results[0].handle;
     expect(started.details.results[0].state.status).toBe("running");
-    for (let i = 0; i < 100; i++) {
-      const status = await h.execute({ command: "status", id: handle });
-      if (status.details.results[0].state.status === "running") break;
-      await Bun.sleep(5);
-    }
     const steered = await h.execute({ command: "steer", id: handle, message: "focus" });
     expect(steered.details.command).toBe("steer");
     const joined = await h.execute({ command: "wait", ids: [handle], timeoutMs: 5000 });
@@ -151,13 +144,13 @@ describe("RPC-backed subagent tool", () => {
     expect(resumed.details.results[0].sessionFile).toBe(fs.realpathSync.native(file));
   });
 
-  test("rejects invalid steering and obsolete fields before launch", async () => {
+  test("rejects obsolete fields and nested delegation before launch", async () => {
     const h = host();
-    await expect(h.execute({ command: "steer", id: "x" })).rejects.toThrow("message");
-    await expect(h.execute({ command: "steer", message: "x" })).rejects.toThrow("id");
-    await expect(h.execute({ command: "run", prompt: "x", message: "x" })).rejects.toThrow();
-    await expect(h.execute({ command: "status", message: "x" })).rejects.toThrow();
-    await expect(h.execute({ command: "run", prompt: "x", persist: true, resume: "session.jsonl" })).rejects.toThrow("mutually exclusive");
+    await expect(h.execute({ command: "run", prompt: "x", agent: "legacy" })).rejects.toThrow("Invalid subagent parameters");
+    await expect(h.execute({ command: "run", prompt: "x", tools: ["subagent"] })).rejects.toThrow("leaves");
+    process.env.PI_SUBAGENT_DEPTH = "1";
+    await expect(h.execute({ command: "run", prompt: "x", tools: [] })).rejects.toThrow("nested subagent");
+    expect(fs.existsSync(path.join(h.cwd, ".fake-rpc-capture.json"))).toBe(false);
   });
 
   test("/subagents lists and clears retained children", async () => {

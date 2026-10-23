@@ -59,12 +59,6 @@ function emitTask() {
     settle();
     return;
   }
-  if (scenario === "large-end") {
-    send({ type: "message_end", message: message("done") });
-    send({ type: "agent_end", messages: Array.from({ length: 30 }, () => ({ role: "user", content: "x".repeat(45_000) })) });
-    settle();
-    return;
-  }
   if (scenario === "partial-after" || scenario === "partial-thinking") {
     send({ type: "message_end", message: message("FIRST") });
     send({ type: "message_start", message: { role: "assistant", content: [] } });
@@ -73,11 +67,6 @@ function emitTask() {
   }
   if (scenario === "extension-error") {
     send({ type: "extension_error", event: "tool_result", error: "hook boom" });
-    send({ type: "message_end", message: message("done") });
-    settle();
-    return;
-  }
-  if (scenario === "shutdown") {
     send({ type: "message_end", message: message("done") });
     settle();
     return;

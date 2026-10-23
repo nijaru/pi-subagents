@@ -19,6 +19,7 @@ interface Pending {
  */
 export class ChildRpc {
   private readonly decoder = new StringDecoder("utf8");
+  private readonly stderrDecoder = new StringDecoder("utf8");
   private readonly pending = new Map<string, Pending>();
   private nextId = 0;
   private closed = false;
@@ -43,7 +44,8 @@ export class ChildRpc {
     });
     child.stdout!.once("close", () => drained.resolve());
     child.stdout!.on("error", (error) => { this.fail(error); drained.resolve(); });
-    child.stderr!.on("data", (chunk: Buffer) => this.diagnostic(chunk.toString()));
+    child.stderr!.on("data", (chunk: Buffer) => this.diagnostic(this.stderrDecoder.write(chunk)));
+    child.stderr!.once("end", () => this.diagnostic(this.stderrDecoder.end()));
     child.stdin!.on("error", (error) => this.fail(error));
   }
 

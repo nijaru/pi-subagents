@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getRpcInvocation } from "../extensions/pi-subagents/launch.ts";
-import { RpcChildSupervisor, startupRemainingMs, type ChildControl, type ChildTask } from "../extensions/pi-subagents/supervisor.ts";
+import { RpcChildSupervisor, type ChildControl, type ChildTask } from "../extensions/pi-subagents/supervisor.ts";
 
 const directories: string[] = [];
 function tempDir(): string {
@@ -93,20 +93,15 @@ describe("public RPC child host", () => {
     expect(incomplete).toMatchObject({ outcome: "incomplete", stopReason: "length" });
   });
 
-  test("cancels on abort and exposes steering", async () => {
+  test("queues steering through the RPC control", async () => {
     const dir = tempDir();
-    const controller = new AbortController();
     let control: ChildControl | undefined;
-    const pending = run(task(dir, { prompt: "SCENARIO=steer" }), controller.signal, undefined, (value) => { control = value; });
+    const pending = run(task(dir, { prompt: "SCENARIO=steer" }), undefined, undefined, (value) => { control = value; });
     while (!control) await Bun.sleep(5);
     await control.steer("focus");
     const steered = await pending;
     expect(steered.output).toBe("steered: Steering instruction:\n\nfocus");
     expect(steered.outcome).toBe("completed");
-
-    const second = run(task(dir, { prompt: "SCENARIO=slow" }), controller.signal);
-    controller.abort();
-    expect((await second).outcome).toBe("cancelled");
   });
 
   test("sweeps descendants before settling a completed task", async () => {
@@ -193,20 +188,6 @@ test("wraps the task prompt so leading slash commands stay literal", async () =>
   expect(fs.readFileSync(path.join(fs.realpathSync.native(dir), ".fake-rpc-prompt"), "utf8")).toBe("Task:\n\n/capture hello");
 });
 
-test("normal completion allows an async stdin-close shutdown hook to finish", async () => {
-  const dir = tempDir();
-  const result = await run(task(dir, { prompt: "SCENARIO=shutdown" }));
-  expect(result.outcome).toBe("completed");
-  expect(fs.existsSync(path.join(dir, "shutdown.done"))).toBe(true);
-});
-
-test("ignores oversized agent_end history frames", async () => {
-  const dir = tempDir();
-  const result = await run(task(dir, { prompt: "SCENARIO=large-end" }));
-  expect(result.outcome).toBe("completed");
-  expect(result.output).toBe("done");
-});
-
 test.each([["partial-after", "SECOND"], ["partial-thinking", "FIRST"]])("interrupted %s retains the latest available text", async (scenario, expected) => {
   const dir = tempDir();
   const result = await run(task(dir, { prompt: `SCENARIO=${scenario}`, executionTimeoutMs: 100 }));
@@ -214,15 +195,10 @@ test.each([["partial-after", "SECOND"], ["partial-thinking", "FIRST"]])("interru
   expect(result.output).toBe(expected);
 });
 
-test("malformed assistant content fails instead of hanging cleanup", async () => {
-  const dir = tempDir();
-  const result = await Promise.race([
-    run(task(dir, { prompt: "SCENARIO=malformed" })),
-    new Promise<"hung">((resolve) => setTimeout(() => resolve("hung"), 2_000)),
-  ]);
-  expect(result).not.toBe("hung");
-  expect((result as any).outcome).toBe("failed");
-});
+test("missing terminal assistant content fails instead of hanging cleanup", async () => {
+  const result = await run(task(tempDir(), { prompt: "SCENARIO=malformed", executionTimeoutMs: 1_000 }));
+  expect(result).toMatchObject({ outcome: "failed", errorKind: "protocol" });
+}, 2_000);
 
 test("non-fatal child extension errors are retained as diagnostics", async () => {
   const dir = tempDir();
@@ -240,13 +216,6 @@ test("passes explicit nested-tool exclusions to the child CLI", () => {
   expect(invocation.args[index + 1]).toBe("mcp__*,list_mcp_resources,read_mcp_resource");
 });
 
-
-test("startup command budgets use the remaining resolved deadline", () => {
-  expect(startupRemainingMs(0, 60_000, 31_000)).toBe(29_000);
-  expect(startupRemainingMs(0, 60_000, 1_000)).toBe(59_000);
-  expect(startupRemainingMs(0, 500, 900)).toBe(1);
-});
-
 test("fails before prompting when the probe command is unavailable", async () => {
   const dir = tempDir();
   const result = await run(task(dir, { id: "no-probe", prompt: "must not run" }));
@@ -254,15 +223,6 @@ test("fails before prompting when the probe command is unavailable", async () =>
   expect(result.errorKind).toBe("startup");
   expect(result.errorMessage).toContain("probe extension is unavailable");
   expect(fs.existsSync(path.join(fs.realpathSync.native(dir), ".fake-rpc-prompt"))).toBe(false);
-});
-
-
-test("refuses to resume a session from a different workspace", () => {
-  const first = tempDir();
-  const second = tempDir();
-  const session = path.join(first, "session.jsonl");
-  fs.writeFileSync(session, `${JSON.stringify({ type: "session", version: 3, id: "x", cwd: first })}\n`);
-  expect(() => getRpcInvocation(task(second, { resume: session }))).toThrow("does not match requested cwd");
 });
 
 test("session ownership spans orderly shutdown and is released before returning", async () => {

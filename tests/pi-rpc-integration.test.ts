@@ -79,7 +79,8 @@ export default (pi: any) => pi.registerCommand("capture", { handler: async () =>
       "PARENT_SENTINEL: delegate the bounded task.",
     ], {
       cwd: dir,
-      env: process.env,
+      // This subprocess plays the parent, even when tests run in a Pi child.
+      env: { ...process.env, PI_SUBAGENT_DEPTH: "0" },
       stdout: "pipe", stderr: "pipe",
     });
     const stdout = new Response(proc.stdout as ReadableStream).text();
@@ -95,6 +96,13 @@ export default (pi: any) => pi.registerCommand("capture", { handler: async () =>
     const events = out.trim().split("\n").map((line) => JSON.parse(line));
     const delegated = events.find((event) => event.type === "message_end" && event.message.role === "toolResult" && event.message.toolName === "subagent");
     expect(delegated.message.isError).toBe(false);
+    const billedInput = events.filter((event) => event.type === "message_end" && event.message.role === "toolResult")
+      .reduce((sum, event) => sum + (event.message.usage?.input ?? 0), 0);
+    expect(billedInput).toBe(40); // Two child calls, charged once regardless of retrieval.
+    // Structured results belong to execution events; transcript tool messages
+    // intentionally retain only content/details/usage on the host.
+    const execution = events.find((event) => event.type === "tool_execution_end" && event.toolName === "subagent");
+    expect(execution.result.structuredContent).toEqual(execution.result.details);
     if (mode === "run") expect(JSON.stringify(delegated.message)).toContain("CHILD_OK");
     else expect(delegated.message.details.command).toBe("spawn");
     if (mode === "run") expect(requests).toHaveLength(4);

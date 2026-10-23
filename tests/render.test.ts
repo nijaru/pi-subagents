@@ -49,7 +49,7 @@ describe("compact child rendering", () => {
     row.setExpanded(true);
     const full = stripTerminalControls(row.render(80).join("\n"));
     expect(full.match(new RegExp(child.id, "g"))).toHaveLength(1);
-    expect(full).toContain("2 turns");
+    for (const value of [child.prompt, child.output!, "cwd: /project", "tools: read", "2 turns", "test/model"]) expect(full).toContain(value);
     row.setExpanded(false);
     expect(row.render(40).map((line) => stripTerminalControls(line).trim()).filter(Boolean)).toEqual(compact);
   });
@@ -64,18 +64,9 @@ describe("compact child rendering", () => {
       "subagent run", `○ 900c096e ${phase} · Read the package version.`,
     ]);
   });
-  test("targeted status and wait show the ID only in the call header", () => {
-    expect(lines("status", { command: "status", id: child.id })).toEqual([
-      "subagent status 900c096e", "✓ completed · 8s · Read the package version.",
-    ]);
-    expect(lines("wait", { command: "wait", ids: [child.id] })).toEqual([
-      "subagent wait 900c096e", "✓ completed · 8s",
-    ]);
-  });
-  test("a handle-targeted row does not repeat the handle", () => {
-    const handled = { ...child, handle: "sa-42" };
-    expect(lines("status", { command: "status", id: "sa-42" }, false, [handled])).toEqual([
-      "subagent status sa-42", "✓ completed · 8s · Read the package version.",
+  test.each([child.id, "sa-42"])("targeted status identifies %s only in its header", (id) => {
+    expect(lines("status", { command: "status", id }, false, [{ ...child, handle: "sa-42" }])).toEqual([
+      `subagent status ${id.slice(0, 8)}`, "✓ completed · 8s · Read the package version.",
     ]);
   });
   test("status lists identify every child and task on one line each", () => {
@@ -83,11 +74,6 @@ describe("compact child rendering", () => {
     expect(lines("status", { command: "status" }, false, [child, second])).toEqual([
       "subagent status", "✓ 900c096e completed · 8s · Read the package version.", "✓ abcd1234 completed · 8s · Second task",
     ]);
-  });
-  test("expansion exposes full identity, context, output, and usage", () => {
-    const text = lines("wait", { command: "wait", ids: [child.id] }, true).join("\n");
-    expect(text.match(new RegExp(child.id, "g"))).toHaveLength(1);
-    for (const value of [child.prompt, child.output!, "cwd: /project", "tools: read", "2 turns", "test/model"]) expect(text).toContain(value);
   });
   test("omitted launch context is not rendered as a reasoning-only task", () => {
     const omitted = { ...child, cwd: "", tools: [], omittedFields: ["cwd", "tools"] as const };
@@ -172,24 +158,20 @@ describe("compact child rendering", () => {
     expect(expanded).toContain("execution deadline 30m 0s");
   });
   test("old or malformed transcript details fall back to text; oversized output stays bounded", () => {
-    for (const expanded of [false, true]) {
-      for (const details of [
-        { results: [{ agent: "worker" }] }, { command: "run", results: [{ ...child, model: {} }] },
-        { command: "run", results: [{ ...child, usage: { ...child.usage, turns: -1.5 } }] },
-      ]) {
-        const value = { content: [{ type: "text" as const, text: "old output" }], details } as any;
-        expect(renderChildResult(value, { expanded }, theme).render(80).join("\n")).toContain("old output");
-      }
+    for (const details of [
+      { results: [{ agent: "worker" }] }, { command: "run", results: [{ ...child, model: {} }] },
+      { command: "run", results: [{ ...child, usage: { ...child.usage, turns: -1.5 } }] },
+    ]) {
+      const value = { content: [{ type: "text" as const, text: "old output" }], details } as any;
+      expect(renderChildResult(value, { expanded: true }, theme).render(80).join("\n")).toContain("old output");
     }
     const oversized = result("run", [{ ...child, output: "x".repeat(200000) }]);
     expect(renderChildResult(oversized, { expanded: true }, theme).render(80).join("\n").length).toBeLessThan(70000);
   });
   test("readiness notices render safe text, never hidden reports", () => {
     const message = { role: "custom" as const, customType: "subagent-ready", content: "Ready: sa-1\u001b[31m. Use wait.", display: true, timestamp: 0, details: { handles: ["sa-1"] } };
-    for (const expanded of [false, true]) {
-      const text = renderChildNotice(message, { expanded, outputPad: 1 }, theme)!.render(80).join("\n");
-      expect(text).toContain("Ready: sa-1. Use wait.");
-      expect(text).not.toContain("\u001b[31m");
-    }
+    const text = renderChildNotice(message, { expanded: false, outputPad: 1 }, theme)!.render(80).join("\n");
+    expect(text).toContain("Ready: sa-1. Use wait.");
+    expect(text).not.toContain("\u001b[31m");
   });
 });

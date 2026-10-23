@@ -1,12 +1,8 @@
-import type { Message, ModelThinkingLevel, StopReason, Usage } from "@earendil-works/pi-ai";
+import type { Message, ModelThinkingLevel, Usage } from "@earendil-works/pi-ai";
 import type { Static } from "typebox";
 import type { OutcomeSchema, ChildStateSchema, UsageSchema, OutputTruncationSchema, ChildResultSchema, SubagentDetailsSchema } from "./result-schema.ts";
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const satisfies readonly ModelThinkingLevel[];
-export function isThinkingLevel(value: unknown): value is ModelThinkingLevel {
-  return typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value);
-}
-
 export type AgentOutcome = Static<typeof OutcomeSchema>;
 export type ChildState = Static<typeof ChildStateSchema>;
 export type UsageSummary = Static<typeof UsageSchema>;
@@ -91,26 +87,12 @@ export function isUsage(value: unknown): value is Usage {
     && ["cacheWrite1h", "reasoning"].every((key) => usage[key] === undefined || nonnegative(usage[key]));
 }
 
-export function isContentPart(value: unknown): value is { type: string; text?: unknown } {
-  if (!value || typeof value !== "object") return false;
-  const part = value as Record<string, unknown>;
-  if (part.type === "text") return typeof part.text === "string";
-  if (part.type === "thinking") return typeof part.thinking === "string";
-  if (part.type === "image") return typeof part.data === "string" && typeof part.mimeType === "string";
-  if (part.type === "toolCall") return typeof part.id === "string" && typeof part.name === "string" && !!part.arguments && typeof part.arguments === "object" && !Array.isArray(part.arguments);
-  return false;
-}
-
-export function isStopReason(value: unknown): value is StopReason {
-  return value === "stop" || value === "length" || value === "toolUse" || value === "error" || value === "aborted";
-}
-
 export function textFromMessage(message: Message): string {
   const content = (message as { content?: unknown }).content;
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   return content
-    .filter((part): part is { type: "text"; text: string } => isContentPart(part) && part.type === "text" && typeof part.text === "string")
+    .filter((part): part is { type: "text"; text: string } => part !== null && typeof part === "object" && part.type === "text" && typeof part.text === "string")
     .map((part) => part.text)
     .join("\n");
 }

@@ -34,12 +34,15 @@ test("correlates out-of-order responses and removes cancelled command waits", as
   try {
     const one = f.rpc.request({ type: "get_state" });
     const controller = new AbortController();
-    const two = f.rpc.request({ type: "get_commands" }, 1000, controller.signal);
+    const cancelled = f.rpc.request({ type: "get_commands" }, 1000, controller.signal);
+    const two = f.rpc.request({ type: "get_state" });
     controller.abort();
-    await expect(two).rejects.toThrow("cancelled");
+    await expect(cancelled).rejects.toThrow("cancelled");
+    f.send({ type: "response", id: f.commands[2].id, command: "get_state", success: true, data: { sessionId: "second" } });
     f.send({ type: "response", id: f.commands[1].id, command: "get_commands", success: true, data: { commands: [] } });
     f.send({ type: "response", id: f.commands[0].id, command: "get_state", success: true, data: { sessionId: "first" } });
     expect((await one).data.sessionId).toBe("first");
+    expect((await two).data.sessionId).toBe("second");
     expect(f.failures).toEqual([]);
   } finally { f.close(); }
 });
@@ -84,9 +87,10 @@ test("diagnostics remain bounded and preserve the opening and final causes", () 
   try {
     f.stderr.write("OPENING\n");
     for (let i = 0; i < 20; i++) f.stderr.write("x".repeat(10000));
-    f.stderr.write("\nFINAL_CAUSE");
+    for (const byte of Buffer.from("\nFINAL_CAUSE 界🙂")) f.stderr.write(Buffer.from([byte]));
+    f.stderr.end();
     expect(Buffer.byteLength(f.rpc.diagnostics)).toBeLessThanOrEqual(MAX_STDERR_BYTES);
     expect(f.rpc.diagnostics).toContain("OPENING");
-    expect(f.rpc.diagnostics).toContain("FINAL_CAUSE");
+    expect(f.rpc.diagnostics).toContain("FINAL_CAUSE 界🙂");
   } finally { f.close(); }
 });

@@ -275,8 +275,8 @@ export class SessionChildren {
   /** Join any selected child under one deadline; acknowledge only returned terminal reports. */
   async wait(ids: readonly string[], timeoutMs: number, signal?: AbortSignal): Promise<ChildResult[]> {
     if (!ids.length) throw new Error("wait requires at least one child id.");
-    // Resolve the entire selection before claiming reports or registering listeners.
-    const runs = [...new Set(ids)].map((id) => this.get(id));
+    // Resolve before claiming reports, then deduplicate UUID/handle aliases.
+    const runs = [...new Set(ids.map((id) => this.get(id)))];
     const collect = () => runs.map((run) => {
       if (run.settled) run.delivery = "delivered";
       return this.snapshot(run);

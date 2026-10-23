@@ -22,17 +22,18 @@ export const TIMEOUT_ENV = "PI_SUBAGENT_TIMEOUT_MS";
 export const STARTUP_TIMEOUT_ENV = "PI_SUBAGENT_STARTUP_TIMEOUT_MS";
 export const FOREGROUND_ENV = "PI_SUBAGENT_FOREGROUND_MS";
 
+function configuredBudget(key: string, fallback: number, maximum: number): number {
+  const configured = Number(process.env[key]);
+  return Number.isSafeInteger(configured) && configured > 0 && configured <= maximum ? configured : fallback;
+}
+
 export function processTimeoutMs(): number {
-  const configured = Number(process.env[TIMEOUT_ENV]);
-  return Number.isSafeInteger(configured) && configured > 0 && configured <= MAX_PROCESS_TIMEOUT_MS
-    ? configured : DEFAULT_PROCESS_TIMEOUT_MS;
+  return configuredBudget(TIMEOUT_ENV, DEFAULT_PROCESS_TIMEOUT_MS, MAX_PROCESS_TIMEOUT_MS);
 }
 
 /** Deadline for RPC process, model selection, tool probe, and MCP readiness. */
 export function startupTimeoutMs(): number {
-  const configured = Number(process.env[STARTUP_TIMEOUT_ENV]);
-  return Number.isSafeInteger(configured) && configured > 0 && configured <= MAX_STARTUP_TIMEOUT_MS
-    ? configured : DEFAULT_STARTUP_TIMEOUT_MS;
+  return configuredBudget(STARTUP_TIMEOUT_ENV, DEFAULT_STARTUP_TIMEOUT_MS, MAX_STARTUP_TIMEOUT_MS);
 }
 
 /**
@@ -41,8 +42,7 @@ export function startupTimeoutMs(): number {
  * times out is still reported to its caller as a timed-out result.
  */
 export function foregroundBudgetMs(): number {
-  const configured = Number(process.env[FOREGROUND_ENV]);
-  return Number.isSafeInteger(configured) && configured > 0 ? configured : DEFAULT_FOREGROUND_MS;
+  return configuredBudget(FOREGROUND_ENV, DEFAULT_FOREGROUND_MS, MAX_WAIT_MS);
 }
 
 /** Invalid or nonzero depth fails closed. Children cannot use this extension to delegate. */
