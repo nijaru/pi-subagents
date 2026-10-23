@@ -1,6 +1,6 @@
 {
   "name": "@nijaru/pi-subagents",
-  "version": "0.0.15",
+  "version": "0.0.16",
   "type": "module",
   "description": "Task-first child delegation for Pi over the public RPC protocol, with background completion, steering, persistence, and bounded lifecycle.",
   "keywords": [
