@@ -172,12 +172,48 @@ describe("RPC-backed subagent tool", () => {
     expect(fs.existsSync(path.join(h.cwd, ".fake-rpc-capture.json"))).toBe(false);
   });
 
-  test("/subagents lists and clears retained children", async () => {
+  test("wait model text adds continuation guidance only while children remain", async () => {
+    const h = host();
+    const completed = await h.execute({ command: "run", prompt: "hello", tools: [] });
+    const handle = completed.details.results[0].handle;
+    const settled = await h.execute({ command: "wait", ids: [handle] });
+    expect(settled.details.waitExpired).toBe(false);
+    expect(settled.content[0].text).not.toContain("wait_expired");
+    expect(settled.content[0].text).not.toContain("Wait again only");
+    const running = await h.execute({ command: "spawn", prompt: "SCENARIO=steer", tools: [] });
+    const runningHandle = running.details.results[0].handle;
+    try {
+      const mixed = await h.execute({ command: "wait", ids: [handle, runningHandle] });
+      expect(mixed.details.waitExpired).toBe(false);
+      expect(mixed.content[0].text.match(/Wait again only on remaining ids/g)).toHaveLength(1);
+      const expired = await h.execute({ command: "wait", ids: [runningHandle], timeoutMs: 1 });
+      expect(expired.details.waitExpired).toBe(true);
+      expect(expired.content[0].text).toContain("Wait budget expired");
+      expect(expired.content[0].text.match(/Wait again only on remaining ids/g)).toHaveLength(1);
+    } finally {
+      await h.execute({ command: "stop", id: runningHandle });
+    }
+  });
+
+  test("/subagents lists, omits zero-unread/default inbox decoration, and clears", async () => {
     const h = host();
     await h.execute({ command: "run", prompt: "hello", tools: [] });
-    await h.commands.get("subagents").handler("", { ui: { notify: (message: string) => h.notifications.push(message) } });
-    expect(h.notifications.at(-1)).toContain("1 retained");
-    await h.commands.get("subagents").handler("clear", { ui: { notify: (message: string) => h.notifications.push(message) } });
-    expect(h.notifications.at(-1)).toContain("Cleared 1 read child handle");
+    const command = h.commands.get("subagents");
+    const run = (args: string) => {
+      command.handler(args, { ui: { notify: (message: string) => h.notifications.push(message) } });
+      return h.notifications.at(-1);
+    };
+    const listed = run("");
+    expect(listed).toContain("1 retained");
+    expect(listed).not.toContain("unread");
+    expect(listed).not.toContain("inbox");
+    for (const alias of ["status", "prune"]) expect(run(alias)).toBe("Usage: /subagents [clear]");
+    expect(run("clear")).toContain("Cleared 1 read child handle");
+    const running = await h.execute({ command: "spawn", prompt: "SCENARIO=steer", tools: [], notify: "turn" });
+    try {
+      expect(run("")).toContain(" · turn · ");
+    } finally {
+      await h.execute({ command: "stop", id: running.details.results[0].handle });
+    }
   });
 });

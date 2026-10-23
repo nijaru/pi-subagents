@@ -53,10 +53,10 @@ Give concurrent writers distinct worktrees through `cwd`. Children are separate 
 | --- | --- | --- |
 | `startupTimeoutMs` | 30 seconds (`PI_SUBAGENT_STARTUP_TIMEOUT_MS`) | RPC process, model selection, tool probe, and readiness before the task starts |
 | `executionTimeoutMs` | 30 minutes (`PI_SUBAGENT_TIMEOUT_MS`) | Model/tool work, starting when the task is submitted |
-| `joinTimeoutMs` | 60 seconds (`PI_SUBAGENT_FOREGROUND_MS`) | How long a `run` call blocks before returning a running handle |
+| `joinTimeoutMs` | 60 seconds (`PI_SUBAGENT_FOREGROUND_MS`) | How long a `run` call blocks before returning a running handle; at most 10 minutes |
 | `timeoutMs` | 5 minutes | How long one `wait` call joins; never changes a child deadline |
 
-`startupTimeoutMs` and `executionTimeoutMs` are run/spawn options within 5 minutes and 2 hours respectively. `joinTimeoutMs` applies only to `run`. At startup/execution expiry the child is stopped and keeps partial output; `timeoutPhase` names startup or execution, and the cause carries elapsed runtime and the applied deadline. Cancelling `wait` leaves children running; use `stop` to cancel one.
+`startupTimeoutMs` and `executionTimeoutMs` are run/spawn options within 5 minutes and 2 hours respectively. `joinTimeoutMs` applies only to `run` and is capped at 10 minutes; an out-of-range `PI_SUBAGENT_FOREGROUND_MS` value falls back to the 60-second default. At startup/execution expiry the child is stopped and keeps partial output; `timeoutPhase` names startup or execution, and the cause carries elapsed runtime and the applied deadline. Cancelling `wait` leaves children running; use `stop` to cancel one.
 
 ## Failure and recovery
 

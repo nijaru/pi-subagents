@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { excludedChildTools, MCP_RESOURCE_TOOLS, selectTools, validateCommand, SubagentParamsSchema } from "../extensions/pi-subagents/params.ts";
+import { excludedChildTools, MCP_RESOURCE_TOOLS, resolveCwd, selectTools, validateCommand, SubagentParamsSchema } from "../extensions/pi-subagents/params.ts";
 import { Check } from "typebox/value";
 import { childEnvironment } from "../extensions/pi-subagents/env.ts";
 import { isChildProcess, processTimeoutMs, DEFAULT_PROCESS_TIMEOUT_MS, STARTUP_TIMEOUT_ENV, startupTimeoutMs, MAX_PROCESS_TIMEOUT_MS, MAX_STARTUP_TIMEOUT_MS, foregroundBudgetMs, DEFAULT_FOREGROUND_MS, MAX_WAIT_MS } from "../extensions/pi-subagents/limits.ts";
@@ -71,6 +71,13 @@ describe("tool selection", () => {
     expect(Check(SubagentParamsSchema, { command: "run", prompt: "x", joinTimeoutMs: 1000, notify: "turn" })).toBe(true);
     expect(() => validateCommand({ command: "spawn", prompt: "x", joinTimeoutMs: 1000 })).toThrow("spawn does not join");
     expect(() => validateCommand({ command: "wait", ids: ["x"], notify: "inbox" })).toThrow("does not accept child creation or join options");
+  });
+});
+
+describe("working directory resolution", () => {
+  test("distinguishes an existing file from a missing path", () => {
+    expect(() => resolveCwd(import.meta.dir, "../package.json")).toThrow("not a directory");
+    expect(() => resolveCwd(import.meta.dir, "../missing-cwd-for-test")).toThrow("does not exist");
   });
 });
 

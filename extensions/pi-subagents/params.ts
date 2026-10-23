@@ -7,7 +7,7 @@ import { THINKING_LEVELS } from "./types.ts";
 
 export const SubagentParamsSchema = Type.Object({
   command: StringEnum(["run", "spawn", "status", "wait", "stop", "steer"] as const, {
-    description: "run/spawn require prompt: run joins for up to 60s then continues in background; spawn returns immediately. steer requires id and message. wait requires ids and returns when any finishes. status optionally takes id; stop requires id and cancels/joins cleanup.",
+    description: "run/spawn require prompt: run joins within its join budget (60s default) then continues in background; spawn returns immediately. steer requires id and message. wait requires ids and returns when any finishes. status optionally takes id; stop requires id and cancels/joins cleanup.",
   }),
   prompt: Type.Optional(Type.String({ description: "Self-contained task: scope, relevant evidence, constraints, expected output and checks", minLength: 1, maxLength: MAX_TASK_BYTES })),
   tools: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 256, pattern: "^[A-Za-z][A-Za-z0-9_.:-]*$" }), {
@@ -113,8 +113,15 @@ export function validateCommand(params: SubagentParams): void {
 /** Resolve a child's working directory against the parent's; symlinks are canonicalized. */
 export function resolveCwd(parentCwd: string, requested: string | undefined): string {
   const directory = path.resolve(parentCwd, requested ?? ".");
+  let stats: fs.Stats;
   try {
-    if (fs.statSync(directory).isDirectory()) return fs.realpathSync.native(directory);
-  } catch { /* Report one actionable diagnostic for missing and invalid paths. */ }
-  throw new Error(`Working directory does not exist: ${directory}`);
+    stats = fs.statSync(directory);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOTDIR") throw new Error(`Working directory is not a directory: ${directory}`);
+    if (code === "ENOENT") throw new Error(`Working directory does not exist: ${directory}`);
+    throw new Error(`Cannot access working directory: ${directory}`);
+  }
+  if (!stats.isDirectory()) throw new Error(`Working directory is not a directory: ${directory}`);
+  return fs.realpathSync.native(directory);
 }

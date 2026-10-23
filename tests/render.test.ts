@@ -5,7 +5,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import extension from "../extensions/pi-subagents/index.ts";
-import { renderChildCall, renderChildResult, renderChildNotice, stripTerminalControls } from "../extensions/pi-subagents/render.ts";
+import { childListText, renderChildCall, renderChildResult, renderChildNotice, stripTerminalControls } from "../extensions/pi-subagents/render.ts";
 import { childStatus, timeoutSummary } from "../extensions/pi-subagents/reports.ts";
 import { emptyUsage, type ChildResult, type SubagentDetails } from "../extensions/pi-subagents/types.ts";
 
@@ -101,6 +101,49 @@ describe("compact child rendering", () => {
     expect(text).not.toContain("expired");
     expect(renderChildCall({ command: "wait", ids: [child.id, active.id] }, theme).render(80).join("\n")).toContain("2 children");
   });
+  test("wait emits one result-level continuation notice for several active children", () => {
+    const first = { ...child, id: "first", handle: "sa-1", state: { status: "running" } as const };
+    const second = { ...child, id: "second", handle: "sa-2", state: { status: "running" } as const };
+    const value = result("wait", [first, second]);
+    value.details.waitExpired = true;
+    const text = renderChildResult(value, { expanded: false }, theme).render(120).join("\n");
+    expect(text.match(/continue/gi)).toHaveLength(1);
+  });
+  test("expanded steer shows the steering message instead of the original task", () => {
+    const args = { command: "steer", id: child.id, message: "focus on empty input" };
+    const active = { ...child, state: { status: "running" } as const, prompt: "ORIGINAL_TASK_PROMPT", startedAt: undefined };
+    const text = lines("steer", args, true, [active], 120).join("\n");
+    expect(text).toContain("focus on empty input");
+    expect(text).not.toContain("ORIGINAL_TASK_PROMPT");
+  });
+  test("expanded active activity is rendered once with its last time", () => {
+    const lastActivityAt = 1_700_000_000_000;
+    const active = { ...child, state: { status: "running" } as const, activity: "tool" as const,
+      currentTool: "read", lastActivityAt, startedAt: undefined };
+    const expanded = lines("status", { command: "status", id: child.id }, true, [active], 120).join("\n");
+    expect(expanded).toContain("running · tool: read");
+    expect(expanded).not.toContain("activity: tool (read)");
+    expect(expanded).toContain(`last activity: ${new Date(lastActivityAt).toISOString()}`);
+  });
+  test("expanded failure reports include an embedded diagnostic once and keep partial output", () => {
+    const failedChild: ChildResult = { ...child, output: "partial report", stderr: "UNIQUE_STDERR_DIAGNOSTIC",
+      errorMessage: "Child produced no terminal assistant output; a final response is required.",
+      state: { status: "terminal", outcome: "failed", exitCode: 1, stopReason: "error", finishedAt: 8000 } };
+    const text = lines("wait", { command: "wait", ids: [child.id] }, true, [failedChild], 120).join("\n");
+    expect(text.match(/UNIQUE_STDERR_DIAGNOSTIC/g)).toHaveLength(1);
+    expect(text).toContain("partial report");
+  });
+  test("generic cancellation diagnostics are not repeated in compact rows", () => {
+    const cancelled: ChildResult = { ...child, stderr: "",
+      state: { status: "terminal", outcome: "cancelled", exitCode: 1, stopReason: "aborted", finishedAt: 8000 },
+      errorMessage: "Subagent cancelled." };
+    const generic = lines("stop", { command: "stop", id: child.id }, false, [cancelled]).join("\n");
+    expect(generic).toContain("cancelled");
+    expect(generic).not.toContain("Subagent cancelled.");
+    const withDiagnostic = { ...cancelled, stderr: "cancelled by user signal" };
+    expect(lines("stop", { command: "stop", id: child.id }, false, [withDiagnostic]).join("\n"))
+      .toContain("cancelled by user signal");
+  });
   test("old spawn and status snapshots do not acquire a live elapsed timer", () => {
     const active = { ...child, state: { status: "running" } as const, startedAt: 0 };
     for (const command of ["spawn", "status", "wait"] as const) {
@@ -149,6 +192,17 @@ describe("compact child rendering", () => {
     }
   });
 
+  test("command list omits default inbox and bounds cwd to one clean line", () => {
+    const inbox = { ...child, cwd: "/work\nspace\u001b[31m", notify: "inbox" as const };
+    const turn = { ...child, id: "second", handle: "sa-2", notify: "turn" as const, cwd: `/${"d".repeat(5000)}` };
+    const rows = childListText([inbox, turn]).split("\n");
+    expect(rows).toHaveLength(2);
+    const defaultRow = rows.find((row) => row.startsWith("900c096e"))!;
+    expect(defaultRow).toContain("/work space");
+    expect(defaultRow).not.toContain("inbox");
+    expect(defaultRow).not.toContain("\u001b");
+    expect(rows.find((row) => row.startsWith("sa-2"))).toContain(" · turn · ");
+  });
   test("narrow terminals keep one bounded preview row per child", () => {
     const long = { ...child, prompt: "wide界🙂 ".repeat(1000), state: { status: "running" } as const };
     for (const width of [20, 40, 80, 120]) {

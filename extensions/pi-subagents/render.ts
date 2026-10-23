@@ -3,7 +3,7 @@ import { getMarkdownTheme, keyText } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { truncateHeadTail, truncateOutput } from "./bounds.ts";
 import { MAX_OUTPUT_BYTES, MAX_RETAINED_RUNS } from "./limits.ts";
-import { activitySummary, formatElapsed, isTimeoutSummary, resultText, runtimeLabel } from "./reports.ts";
+import { activitySummary, formatElapsed, isTimeoutSummary, lastActivitySummary, resultText, runtimeLabel } from "./reports.ts";
 import type { SubagentDetails } from "./types.ts";
 import { Check } from "typebox/value";
 import { ChildResultSchema } from "./result-schema.ts";
@@ -59,6 +59,26 @@ function oneLine(text: string): string {
   return stripTerminalControls(text).replace(/\s+/g, " ").trim();
 }
 
+function oneLineBounded(text: string, bytes: number): string {
+  return truncateOutput(oneLine(text), bytes).replace(/\s+/g, " ").trim();
+}
+
+/** Human-facing /subagents list: live work first, then oldest starts. */
+export function childListText(results: readonly ChildResult[]): string {
+  const ordered = [...results].sort((left, right) => {
+    const running = Number(right.state.status === "running") - Number(left.state.status === "running");
+    return running || (left.startedAt ?? 0) - (right.startedAt ?? 0);
+  });
+  return ordered.map((result) => {
+    const status = result.state.status === "running"
+      ? `${result.phase ?? "starting"}${result.startedAt ? ` · ${Math.max(0, Math.round((Date.now() - result.startedAt) / 1000))}s` : ""}`
+      : result.state.outcome;
+    const handle = result.handle ?? result.id.slice(0, 8);
+    const notify = result.notify === "turn" ? " · turn" : "";
+    return `${handle} [${status}]${notify} · ${result.tools.length} tool${result.tools.length === 1 ? "" : "s"} · ${oneLineBounded(result.cwd, 512)}`;
+  }).join("\n");
+}
+
 /**
  * Collapsed rows are human-facing: a task label while it identifies live work
  * or a status listing, otherwise only a failure diagnostic. Successful reports
@@ -71,7 +91,11 @@ function collapsedPreview(child: ChildResult, command: SubagentDetails["command"
   // The timeout heading already says what happened and how long it ran; the
   // expanded view carries the elapsed/deadline summary.
   if (child.state.outcome === "timed_out" && isTimeoutSummary(child.errorMessage)) return "";
-  return oneLine(clean(child.errorMessage || child.stderr || "", 1024));
+  const genericCancellation = child.state.outcome === "cancelled" && /^subagent cancelled\.?$/i.test(child.errorMessage?.trim() ?? "");
+  const cause = genericCancellation
+    ? child.stderr || child.stdout
+    : child.errorMessage || child.stderr || child.stdout;
+  return cause ? oneLine(clean(cause, 1024)) : "";
 }
 
 /** IDs are abbreviated only for display; tool arguments and retained data stay exact. */
@@ -96,10 +120,11 @@ export function renderChildCall(args: Record<string, unknown>, theme: Theme, con
   const id = target ? ` ${displayId(target, expanded)}` : Array.isArray(args.ids) ? ` · ${args.ids.length} children` : "";
   const container = new Container();
   container.addChild(new Text(theme.fg("toolTitle", theme.bold(`subagent ${command}${id}`)), 0, 0));
-  // The prompt is agent-facing instruction text; humans see it only on expansion.
-  // Running rows preview it as task identity until the result replaces it.
-  if (expanded && typeof args.prompt === "string" && args.prompt) {
-    container.addChild(new Text(theme.fg("dim", clean(args.prompt, 8192)), 0, 0));
+  // Prompts and steering messages are agent-facing instruction text; humans see
+  // them only on expansion. Steering shows its message, never the original task.
+  const detail = command === "steer" ? args.message : args.prompt;
+  if (expanded && typeof detail === "string" && detail) {
+    container.addChild(new Text(theme.fg("dim", clean(detail, 8192)), 0, 0));
   }
   return container;
 }
@@ -141,8 +166,10 @@ function renderChildren(details: unknown, expanded: boolean, theme: Theme, targe
   if (!results.length || !results.every(isRenderableChildResult)) return undefined;
   const container = new Container();
   let remaining = MAX_OUTPUT_BYTES;
+  let runningCount = 0;
   for (const child of results) {
     const active = child.state.status === "running";
+    if (active) runningCount++;
     const targeted = targetId !== undefined && (child.id === targetId || child.handle === targetId);
     const heading = childHeading(child, theme, { expanded, showId: !targeted, command: data?.command });
     if (expanded) {
@@ -152,29 +179,33 @@ function renderChildren(details: unknown, expanded: boolean, theme: Theme, targe
       const preview = collapsedPreview(child, data?.command);
       container.addChild(singleLine(preview ? `${heading} · ${theme.fg("dim", preview)}` : heading));
     }
-    if (active && data?.command === "wait") {
-      container.addChild(new Text(theme.fg("dim", data.waitExpired === false ? "Child continues." : "Wait expired; child continues."), 0, 0));
-    }
     if (expanded) {
-      const activity = activitySummary(child);
+      // The heading already carries live activity; expansion adds only the last time.
+      const activity = active && child.activity ? lastActivitySummary(child) : activitySummary(child);
       if (activity) container.addChild(new Text(theme.fg("dim", clean(activity, 512)), 0, 0));
-      // Status/wait/stop rows need task labels; run/spawn show the prompt in their call header.
-      if (data?.command !== "run" && data?.command !== "spawn") {
+      // Status/wait/stop rows need task labels; run/spawn/steer payloads are in their call header.
+      if (data?.command !== "run" && data?.command !== "spawn" && data?.command !== "steer") {
         container.addChild(new Text(theme.fg("dim", child.omittedFields?.includes("prompt") ? "Task prompt omitted to fit the response budget." : clean(child.prompt, 8192)), 0, 0));
       }
       const report = resultText(child);
+      let renderedReport = "";
       if (!active) {
         const output = truncateOutput(report, remaining);
         remaining = Math.max(0, remaining - Buffer.byteLength(output, "utf8"));
-        container.addChild(renderOutput(stripTerminalControls(output).trimEnd(), true, theme));
+        renderedReport = stripTerminalControls(output).trimEnd();
+        container.addChild(renderOutput(renderedReport, true, theme));
       }
       if (child.outputTruncation?.truncated) {
         container.addChild(new Text(theme.fg("warning", `Output shortened: ${child.outputTruncation.retainedBytes}/${child.outputTruncation.originalBytes} UTF-8 bytes retained.`), 0, 0));
       }
       for (const [label, value] of [["stderr", child.stderr], ["stdout", child.stdout]] as const) {
-        if (!value || value === report || remaining <= 0) continue;
+        if (!value || remaining <= 0) continue;
+        // resultText may already embed the retained diagnostic. Keep the row only
+        // when it contributes content that the bounded report does not contain.
+        const safeValue = stripTerminalControls(value).trim();
+        if (!safeValue || value === report || renderedReport.includes(safeValue)) continue;
         const diagnostic = truncateHeadTail(value, Math.min(remaining, 2048));
-        remaining -= Buffer.byteLength(diagnostic);
+        remaining = Math.max(0, remaining - Buffer.byteLength(diagnostic));
         container.addChild(new Text(theme.fg("dim", `${label}: ${stripTerminalControls(diagnostic)}`), 0, 0));
       }
       const cwd = child.omittedFields?.includes("cwd") ? "not retained (response budget)" : clean(child.cwd, 1024);
@@ -186,6 +217,13 @@ function renderChildren(details: unknown, expanded: boolean, theme: Theme, targe
         container.addChild(new Text(theme.fg("dim", formatUsage(child.usage, child.model ? clean(child.model, 256) : undefined) + (child.thinking ? ` · thinking: ${child.thinking}` : "") + cleanup), 0, 0));
       }
     }
+  }
+  // A join result has one continuation state, not one notice per live child.
+  if (data?.command === "wait" && runningCount > 0) {
+    const notice = data.waitExpired === false
+      ? runningCount === 1 ? "Child continues." : "Children continue."
+      : runningCount === 1 ? "Wait expired; child continues." : "Wait expired; children continue.";
+    container.addChild(new Text(theme.fg("dim", notice), 0, 0));
   }
   return container;
 }

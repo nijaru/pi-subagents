@@ -42,7 +42,7 @@ export const ChildActivitySchema = StringEnum(["model", "thinking", "text", "too
 
 export const ChildResultSchema = Type.Object({
   id: Type.String(),
-  handle: Type.Optional(Type.String({ description: "Short session-scoped handle; preferred in wait/status/stop calls." })),
+  handle: Type.Optional(Type.String({ description: "Short session-scoped handle; preferred in wait/status/stop/steer calls." })),
   phase: Type.Optional(StringEnum(["starting", "running", "stopping"] as const, { description: "Live execution phase; absent once terminal." })),
   errorKind: Type.Optional(StringEnum(["startup", "provider", "protocol", "deadline", "cancelled", "cleanup", "unknown"] as const)),
   timeoutPhase: Type.Optional(StringEnum(["startup", "execution"] as const, { description: "Which deadline expired for a timed_out result." })),

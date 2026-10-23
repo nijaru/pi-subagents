@@ -51,13 +51,18 @@ export function runtimeLabel(result: ChildResult): string {
   return duration ? `${duration}${isRunning(result) ? " elapsed" : ""}` : "";
 }
 
+/** Last observed activity stays truthful in old snapshots; successful reports omit it. */
+export function lastActivitySummary(result: ChildResult): string {
+  if (result.lastActivityAt === undefined || (!isRunning(result) && !failed(result))) return "";
+  return `last activity: ${new Date(result.lastActivityAt).toISOString()}`;
+}
+
 /** Content-free activity only; absolute time stays truthful in old snapshots. */
 export function activitySummary(result: ChildResult): string {
   if (!isRunning(result) && !failed(result)) return "";
   const current = isRunning(result) && result.activity
     ? `activity: ${result.activity}${result.currentTool ? ` (${truncateOutput(result.currentTool, 256)})` : ""}` : "";
-  const last = result.lastActivityAt === undefined ? "" : `last activity: ${new Date(result.lastActivityAt).toISOString()}`;
-  return [current, last].filter(Boolean).join(" · ");
+  return [current, lastActivitySummary(result)].filter(Boolean).join(" · ");
 }
 
 /** Failure causes precede partial output so bounds cannot hide why the child stopped. */
@@ -118,7 +123,7 @@ export function childReports(results: ChildResult[], { includePrompt = true, max
     const output = outputs[index]!;
     const excerpt = truncateOutput(output, allocations[index]!);
     const guidance = excerpt === output ? "" : results.length > 1 || maxReportBytes < MAX_OUTPUT_BYTES
-      ? `\n\nExcerpt truncated; use subagent wait with ids: ["${result.id}"] for a longer retained report.`
+      ? `\n\nExcerpt truncated; use subagent wait with ids: ["${result.handle ?? result.id}"] for a longer retained report.`
       : "\n\nReport shortened to fit this response.";
     return `${head}\n\n${excerpt}${guidance}`;
   }).join(separator);

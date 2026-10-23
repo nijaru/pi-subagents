@@ -58,8 +58,10 @@ Notices contain handles, not reports, and never mark results read. Use `wait` to
 | --- | --- | --- |
 | `startupTimeoutMs` | 30s (`PI_SUBAGENT_STARTUP_TIMEOUT_MS`) | RPC process, model selection, tool probe, and readiness |
 | `executionTimeoutMs` | 30m (`PI_SUBAGENT_TIMEOUT_MS`) | Model/tool work, starting when the task is submitted |
-| `joinTimeoutMs` | 60s (`PI_SUBAGENT_FOREGROUND_MS`) | How long one `run` blocks |
+| `joinTimeoutMs` | 60s (`PI_SUBAGENT_FOREGROUND_MS`) | How long one `run` blocks; at most 10m |
 | `timeoutMs` | 5m | How long one `wait` joins; never changes a child deadline |
+
+`joinTimeoutMs` is a foreground join budget, not an execution deadline. It is capped at 10 minutes; an out-of-range `PI_SUBAGENT_FOREGROUND_MS` value falls back to the 60-second default.
 
 `status` exposes `lastActivityAt` (parent-observed Unix milliseconds) and, while work is active, `activity` (`model`, `thinking`, `text`, or `tool`) and `currentTool` (an executing tool name; calls can overlap). Model/token and tool lifecycle events refresh the timestamp, including thinking before visible text. Metadata contains no reasoning text, tool arguments, or tool results. Current activity clears when execution stops; the last timestamp survives failure and cleanup. Successful reports omit activity timestamps; running and failed reports retain them. These are observations, not stall detection: a quiet tool or provider can still be working.
 

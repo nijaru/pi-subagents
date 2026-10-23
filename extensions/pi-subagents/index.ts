@@ -10,7 +10,7 @@ import { boundDetails, truncateOutput } from "./bounds.ts";
 import { addUsage, failed, isRunning } from "./types.ts";
 import { SubagentDetailsSchema } from "./result-schema.ts";
 import type { ChildResult, SubagentDetails } from "./types.ts";
-import { renderChildCall, renderChildResult, renderChildNotice } from "./render.ts";
+import { childListText, renderChildCall, renderChildResult, renderChildNotice } from "./render.ts";
 import { CompletionDelivery } from "./delivery.ts";
 import { childStatus as summary, childReports, formatElapsed } from "./reports.ts";
 
@@ -32,24 +32,11 @@ function inboxNotice(results: ChildResult[]): string {
   return `[subagent] ${results.length} unread child result${results.length === 1 ? "" : "s"}: ${items}${more}. Call subagent wait to read ${results.length === 1 ? "it" : "them"}.`;
 }
 
-function childListText(results: ChildResult[]): string {
-  const ordered = [...results].sort((left, right) => {
-    const running = Number(right.state.status === "running") - Number(left.state.status === "running");
-    return running || (left.startedAt ?? 0) - (right.startedAt ?? 0);
-  });
-  return ordered.map((result) => {
-    const status = result.state.status === "running"
-      ? `${result.phase ?? "starting"}${result.startedAt ? ` · ${Math.max(0, Math.round((Date.now() - result.startedAt) / 1000))}s` : ""}`
-      : result.state.outcome;
-    const handle = result.handle ?? result.id.slice(0, 8);
-    return `${handle} [${status}] · ${result.notify ?? "inbox"} · ${result.tools.length} tool${result.tools.length === 1 ? "" : "s"} · ${result.cwd}`;
-  }).join("\n");
-}
-
 function outcome(command: "run" | "wait", results: ChildResult[]): AgentToolResult<SubagentDetails> {
   const waitExpired = command === "wait" ? results.every(isRunning) : undefined;
-  const preamble = command === "wait"
-    ? `wait_expired: ${waitExpired}\n${waitExpired ? "Wait budget expired; children continue." : "Returned ready reports; any running children continue."} Wait again only on remaining ids when their results block progress.\n\n`
+  const remaining = command === "wait" ? results.filter(isRunning).length : 0;
+  const preamble = remaining > 0
+    ? `${waitExpired ? "Wait budget expired; children continue." : "Returned ready reports; remaining children continue."} Wait again only on remaining ids when their results block progress.\n\n`
     : "";
   // The model authored run prompts; keep them only where the call lacks them.
   const text = preamble + childReports(results, { includePrompt: command !== "run" });
@@ -115,14 +102,13 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Use run for a fresh-context result, spawn for independent work alongside useful local work, and steer to redirect a running child.",
     promptGuidelines: [
       "Give subagent children relevant evidence, scope, constraints, expected output and checks. Their conversations start fresh without parent history.",
-      "Children default to read/search/web tools. Request bash, edit, or write explicitly only when the task needs mutations, and give concurrent writers separate worktrees.",
-      "Completion notices only announce handles; they never consume reports. Use wait to retrieve and acknowledge reports, including after a notify: \"turn\" announcement. Short sa-N handles are valid in wait/status/stop calls.",
+      "Children default to read/search/web tools. Request bash, edit, or write explicitly only when the task needs mutations. Give concurrent subagent writers separate worktrees, including parent-versus-child writers; child processes share the selected working tree and subagent does not arbitrate write ownership.",
+      "Completion notices only announce handles; they never consume reports. Use wait to retrieve and acknowledge reports, including after a notify: \"turn\" announcement. Short sa-N handles are valid in wait/status/stop/steer calls.",
       "Prefer direct work over subagent for routine or tightly coupled tasks. Do not duplicate delegated work; the parent owns integration and verification.",
       "Spawn independent subagent tasks before waiting. Inbox results are advertised on the next tool result and never wake an idle parent; notify: \"turn\" opts into an active-boundary continuation. Use subagent wait with ids when blocked; it wakes when any finishes. Do not poll or wait again on reports already received. Cancelling wait leaves children running; stop cancels them.",
       "subagent run joins within a join budget; if it expires the child keeps working and reports completion like spawn, so never relaunch it as a duplicate.",
       "Bound task execution with executionTimeoutMs (default 30m, at most 2h), separate from startupTimeoutMs, run's joinTimeoutMs, and wait's timeoutMs. A timed-out result keeps partial output and states elapsed runtime and the deadline, so split the task or raise the deadline instead of relaunching it unchanged.",
       "Use persist: true for long tasks that need inspection or recovery after failure; it saves the Pi conversation (potentially sensitive), not a full token trace. Once the child stops, resume its returned sessionFile in the same cwd with a focused continuation prompt. Persistence is off by default. status exposes content-free activity and lastActivityAt; silence alone does not prove a stall.",
-      "Give concurrent subagent writers separate worktrees, including parent-versus-child writers. Child processes share the selected working tree; subagent does not arbitrate write ownership.",
     ],
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       if (!Check(SubagentParamsSchema, params)) {
@@ -220,18 +206,18 @@ export default function (pi: ExtensionAPI) {
     description: "List retained child agents, or clear completed read handles",
     async handler(args, ctx) {
       const action = args.trim().toLowerCase();
-      if (action === "clear" || action === "prune") {
+      if (action === "clear") {
         const removed = runtime.children.pruneDelivered();
         ctx.ui.notify(`Cleared ${removed} read child handle${removed === 1 ? "" : "s"}.`, "info");
         return;
       }
-      if (action !== "" && action !== "status") {
+      if (action !== "") {
         ctx.ui.notify("Usage: /subagents [clear]", "info");
         return;
       }
       const results = runtime.children.list();
       const unread = runtime.children.unreadCompletionCount();
-      const header = results.length === 0 ? "No retained child agents." : `${results.length} retained · ${unread} unread`;
+      const header = results.length === 0 ? "No retained child agents." : `${results.length} retained${unread ? ` · ${unread} unread` : ""}`;
       ctx.ui.notify(`${header}\n${childListText(results)}`.trim(), "info");
     },
   });

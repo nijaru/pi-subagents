@@ -124,6 +124,16 @@ describe("serialized result bounds", () => {
     expect(rebound.omittedFields).toEqual(["cwd", "tools"]);
   });
 
+  test("truncation guidance points at the retained handle", () => {
+    const result = { ...child("child-uuid"), handle: "sa-42",
+      state: { status: "terminal", outcome: "completed", exitCode: 0, stopReason: "stop", finishedAt: 2 } as const,
+      errorMessage: undefined, model: undefined, output: "x".repeat(5_000),
+      outputTruncation: { truncated: false, originalBytes: 5_000, retainedBytes: 5_000 } };
+    const text = childReports([result], { maxReportBytes: 100 });
+    expect(text).toContain('ids: ["sa-42"]');
+    expect(text).not.toContain(`ids: ["${result.id}"]`);
+  });
+
   test("small batch reports return unused space to the large report in both envelopes", () => {
     const results = Array.from({ length: 32 }, (_, index) => {
       const output = index === 0 ? "x".repeat(50000) : "ok";
