@@ -54,7 +54,10 @@ function emitTask() {
         args: { path: "PRIVATE_ARGS" }, result: { content: [{ type: "text", text: "PRIVATE_RESULT" }] },
         partialResult: { content: [{ type: "text", text: "PRIVATE_PARTIAL" }] }, isError: false });
       tool("tool_execution_start", "read-1", "read");
-      if (scenario === "activity-hang") return;
+      if (scenario === "activity-hang") {
+        setTimeout(() => send({ type: "entry_appended", entry: { type: "usage", kind: "cache_warm", usage } }), 40);
+        return;
+      }
       tool("tool_execution_start", "read-2", "read");
       tool("tool_execution_start", "bash-1", "bash");
       tool("tool_execution_end", "read-2", "read");

@@ -74,13 +74,14 @@ describe("public RPC child host", () => {
     expect(JSON.stringify([updates, result, progress])).not.toContain("PRIVATE_");
   });
 
-  test("a stalled tool times out without replacing its last activity with cleanup time", async () => {
+  test("warming and cleanup do not hide a stalled tool's last activity", async () => {
     const updates: ChildExecutionData[] = [];
     const result = await run(task(tempDir(), { prompt: "SCENARIO=activity-hang", executionTimeoutMs: 150 }), undefined,
       (data: ChildExecutionData) => updates.push(data));
     const tool = updates.find((data) => data.currentTool === "read")!;
     expect(tool.activity).toBe("tool");
     expect(result).toMatchObject({ outcome: "timed_out", timeoutPhase: "execution", lastActivityAt: tool.lastActivityAt });
+    expect(result.usage.totalTokens).toBe(18); // Foreground and warmer usage are both billed.
     expect(result.lastActivityAt!).toBeLessThan(result.taskFinishedAt!);
     expect(result.activity).toBeUndefined();
     expect(result.currentTool).toBeUndefined();

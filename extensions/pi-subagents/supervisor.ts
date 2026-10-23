@@ -208,7 +208,8 @@ export class RpcChildSupervisor implements ChildSupervisor {
           // are accounted separately by compaction_end below.
           if (event.entry?.type === "usage" && isUsage(event.entry.usage)) {
             addUsage(data.usage, event.entry.usage);
-            recordActivity(data.activity);
+            // Automatic warming is billable, not foreground task activity.
+            publish();
           } else if (event.entry?.type === "custom" && event.entry.customType === PROBE_CUSTOM_TYPE) {
             const report = event.entry.data as Partial<ProbeReport> | undefined;
             if (report?.token !== probeToken || !Array.isArray(report?.tools) || !report.tools.every((name) => typeof name === "string")) {
