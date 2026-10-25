@@ -77,14 +77,17 @@ describe("non-consuming readiness announcements", () => {
     await c.close();
   });
 
-  test("an error assistant suppresses misleading completed tool boundaries", async () => {
+  test("an assistant error suppresses continuations even after a successful retry", async () => {
     const c = controlled();
     const run = c.start();
     c.gates[0]!.resolve();
     await run.promise;
     c.delivery.ended({ messages: [{ role: "assistant", stopReason: "error" }] } as any, c.ctx);
     expect(c.boundary()).toBeUndefined();
-    expect(c.children.unreadCompletionCount()).toBe(1);
+    c.delivery.ended({ messages: [{ role: "assistant", stopReason: "stop" }] } as any, c.ctx);
+    expect(c.boundary()).toBeUndefined();
+    expect(c.children.pendingInbox().map((result) => result.handle)).toEqual([run.handle]);
+    expect((await c.children.wait([run.handle], 1))[0]!.output).toBe("PRIVATE_REPORT");
     await c.close();
   });
 
@@ -115,7 +118,7 @@ describe("non-consuming readiness announcements", () => {
     c.gates[0]!.resolve();
     await run.promise;
     expect(c.statuses.at(-1)).toBe("1 unread child result");
-    expect(c.children.get(run.handle).delivery).toBe("unread");
+    expect(c.children.get(run.handle).collected).toBe(false);
     expect((await c.children.wait([run.handle], 1))[0]!.output).toBe("PRIVATE_REPORT");
     await c.close();
   });
@@ -132,7 +135,7 @@ describe("non-consuming readiness announcements", () => {
     expect(notice.details.handles).toHaveLength(MAX_RETAINED_RUNS);
     expect(Buffer.byteLength(JSON.stringify(notice))).toBeLessThan(MAX_OUTPUT_BYTES);
     expect(() => c.start()).toThrow("unread");
-    expect(c.children.pruneDelivered()).toBe(0);
+    expect(c.children.pruneCollected()).toBe(0);
     await c.children.wait([c.children.list()[0]!.id], 1);
     expect(c.start()).toBeDefined();
     await c.close();

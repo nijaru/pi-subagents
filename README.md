@@ -48,7 +48,9 @@ Task prompts are wrapped in a `Task:` envelope and steering messages in a `Steer
 - **`inbox`** (default): the next top-level non-subagent tool result advertises unread handles. An idle parent is never woken; `wait` retrieves the reports.
 - **`turn`**: additionally request a readiness announcement and continuation at an active boundary. It never wakes an idle parent. Each child gets at most one announcement attempt per parent run; a later extension may discard the draft.
 
-Notices contain handles, not reports, and never mark results read. Use `wait` to retrieve and acknowledge reports after either kind of notice. A completed `run` or `stop` also reads its result; `status` does not. Unread results remain discoverable in the inbox even if a continuation was aborted or its notice was dropped.
+Notices contain handles, not reports, and never consume them. Use `wait` to retrieve reports after either kind of notice. A completed `run`, `wait`, or `stop` marks its returned terminal reports collected locally; `status` does not. Collected reports become eligible for clearing or eviction. Collection does not confirm that a later tool-result transformation preserved the report, that it reached model context, or that the model read it. Unread results remain discoverable in the inbox even if a continuation was aborted or its notice was dropped.
+
+An assistant error, an unsuccessful boundary, or an observed abort suppresses `turn` announcements for the rest of that parent run, even if an automatic retry later succeeds. Explicit retrieval and inbox advertisements remain available. A new parent run rearms announcement attempts. The no-idle-wake policy is deliberate: Pi can trigger an idle turn, but does not expose a reliable late idle-abort signal to revoke that work safely.
 
 `/subagents` lists retained children and unread results. `/subagents clear` drops completed, read handles.
 

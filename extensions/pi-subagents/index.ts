@@ -176,7 +176,7 @@ export default function (pi: ExtensionAPI) {
       if (!foreground) {
         const snapshot = owner.snapshot(run);
         const session = snapshot.sessionFile ? `\nSession: ${snapshot.sessionFile}` : "";
-        return answer("spawn", [snapshot], `Started child ${run.handle}. Completion is delivered to the inbox${run.notify === "turn" ? " and requests one parent turn" : ""}; idle parents are not woken. Continue non-overlapping work; use wait when its result blocks finishing your task, or status/stop with this handle.${session}`);
+        return answer("spawn", [snapshot], `Started child ${run.handle}. Completion is advertised in the inbox${run.notify === "turn" ? " and attempts an active-boundary continuation when eligible" : ""}; idle parents are not woken. Continue non-overlapping work; use wait when its result blocks finishing your task, or status/stop with this handle.${session}`);
       }
       // Presentation stops at the foreground join, even when execution continues.
       const timer = onUpdate ? setInterval(() => {
@@ -189,7 +189,7 @@ export default function (pi: ExtensionAPI) {
         const budget = params.joinTimeoutMs ?? foregroundBudgetMs();
         const result = (await owner.wait([run.result.id], budget))[0]!;
         if (isRunning(result)) {
-          return answer("run", [result], `${summary(result)}\nStill running after ${formatElapsed(budget)}; it continues as background work. ${run.notify === "turn" ? "Completion requests one active-boundary turn; idle parents are not woken." : "Completion is advertised in the inbox on the next tool result; idle parents are not woken."} Use wait when its result blocks finishing your task, or status/stop with this handle.`);
+          return answer("run", [result], `${summary(result)}\nStill running after ${formatElapsed(budget)}; it continues as background work. ${run.notify === "turn" ? "Completion attempts an active-boundary announcement and continuation when eligible; idle parents are not woken." : "Completion is advertised in the inbox on the next tool result; idle parents are not woken."} Use wait when its result blocks finishing your task, or status/stop with this handle.`);
         }
         return outcome("run", [result]);
       } finally {
@@ -207,7 +207,7 @@ export default function (pi: ExtensionAPI) {
     async handler(args, ctx) {
       const action = args.trim().toLowerCase();
       if (action === "clear") {
-        const removed = runtime.children.pruneDelivered();
+        const removed = runtime.children.pruneCollected();
         ctx.ui.notify(`Cleared ${removed} read child handle${removed === 1 ? "" : "s"}.`, "info");
         return;
       }

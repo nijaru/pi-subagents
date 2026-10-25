@@ -14,8 +14,8 @@ export interface ChildRun {
   notify: "inbox" | "turn";
   /** Inbox notifications are emitted at most once per parent turn. */
   inboxNotified: boolean;
-  /** Only an explicit join/stop consumes a report; notices never do. */
-  delivery: "unread" | "delivered";
+  /** Locally collected by a join/stop, not confirmed published or model-read. */
+  collected: boolean;
   /** At most one continuation attempt per child in a parent run. */
   continuationOffered: boolean;
   controller: AbortController;
@@ -24,7 +24,7 @@ export interface ChildRun {
   promise: Promise<void>;
   /** Removable completion listeners; timed-out waits must not accumulate promise reactions. */
   waiters: Set<() => void>;
-  /** In-flight joins. A blocking waiter claims delivery, so it suppresses the notice. */
+  /** In-flight wait/stop joins suppress notices without consuming reports. */
   activeWaits: number;
   /** Set at prompt acceptance; startup failure wakes readiness joins too. */
   control?: ChildControl;
@@ -42,7 +42,7 @@ export interface StartChild {
   executionTimeoutMs?: number;
   /** Startup deadline for RPC process, tool probe, and MCP readiness. */
   startupTimeoutMs?: number;
-  /** Inbox (default) or a forced parent turn. */
+  /** Inbox (default) or an eligible active-boundary continuation attempt. */
   notify?: "inbox" | "turn";
   /** Keep the child Pi session for later inspection. */
   persist?: boolean;
@@ -73,7 +73,7 @@ export class SessionChildren {
     const active = [...this.runs.values()].filter((run) => !run.settled);
     if (active.length >= MAX_CONCURRENCY) throw new Error(`Too many active children (maximum ${MAX_CONCURRENCY}). Wait for or stop a child first.`);
     while (this.runs.size >= MAX_RETAINED_RUNS) {
-      const oldest = [...this.runs.values()].find((run) => run.settled && run.delivery === "delivered");
+      const oldest = [...this.runs.values()].find((run) => run.settled && run.collected);
       if (!oldest) throw new Error("Retained child results are unread or still running. Read completed results with wait before starting more children.");
       this.runs.delete(oldest.result.id);
     }
@@ -85,7 +85,7 @@ export class SessionChildren {
     };
     const completion = Promise.withResolvers<void>();
     const run: ChildRun = {
-      result, handle, notify, inboxNotified: false, delivery: "unread", continuationOffered: false,
+      result, handle, notify, inboxNotified: false, collected: false, continuationOffered: false,
       controller: new AbortController(), settled: false, readinessWaiters: new Set(),
       promise: completion.promise, waiters: new Set(), activeWaits: 0,
     };
@@ -165,7 +165,7 @@ export class SessionChildren {
   }
 
   private signalAvailable(run: ChildRun): void {
-    if (!this.closed && run.settled && run.delivery === "unread" && run.activeWaits === 0) {
+    if (!this.closed && run.settled && !run.collected && run.activeWaits === 0) {
       try { this.available(copyResult(run.result)); } catch { /* A later boundary or wait can still deliver it. */ }
     }
   }
@@ -174,7 +174,7 @@ export class SessionChildren {
   pendingCompletions(): ChildResult[] {
     if (this.closed) return [];
     return [...this.runs.values()]
-      .filter((run) => run.notify === "turn" && !run.continuationOffered && run.settled && run.delivery === "unread" && run.activeWaits === 0)
+      .filter((run) => run.notify === "turn" && !run.continuationOffered && run.settled && !run.collected && run.activeWaits === 0)
       .map((run) => this.snapshot(run));
   }
 
@@ -195,11 +195,11 @@ export class SessionChildren {
     for (const run of this.runs.values()) run.inboxNotified = false;
   }
 
-  /** Drop terminal, read handles without touching running or unread work. */
-  pruneDelivered(): number {
+  /** Drop terminal, locally collected handles; never running or unread work. */
+  pruneCollected(): number {
     let removed = 0;
     for (const [id, run] of this.runs) {
-      if (run.settled && run.delivery === "delivered") { this.runs.delete(id); removed++; }
+      if (run.settled && run.collected) { this.runs.delete(id); removed++; }
     }
     return removed;
   }
@@ -208,7 +208,7 @@ export class SessionChildren {
   pendingInbox(): ChildResult[] {
     if (this.closed) return [];
     const pending = [...this.runs.values()]
-      .filter((run) => run.settled && run.delivery === "unread" && run.activeWaits === 0 && !run.inboxNotified);
+      .filter((run) => run.settled && !run.collected && run.activeWaits === 0 && !run.inboxNotified);
     for (const run of pending) run.inboxNotified = true;
     return pending.map((run) => this.snapshot(run));
   }
@@ -216,7 +216,7 @@ export class SessionChildren {
   /** Notifications do not transfer ownership of an unread report. */
   unreadCompletionCount(): number {
     if (this.closed) return 0;
-    return [...this.runs.values()].filter((run) => run.settled && run.delivery !== "delivered" && run.activeWaits === 0).length;
+    return [...this.runs.values()].filter((run) => run.settled && !run.collected && run.activeWaits === 0).length;
   }
 
   /** Pi custom completion messages cannot carry usage; the next tool result does. */
@@ -267,22 +267,33 @@ export class SessionChildren {
 
   async stop(id: string): Promise<ChildResult> {
     const run = this.get(id);
-    // stop itself returns the result; do not wake a second parent turn for it.
-    run.delivery = "delivered";
-    run.controller.abort();
-    await run.promise;
-    return this.snapshot(run);
+    // Suppress notices during cleanup without prematurely consuming the report.
+    run.activeWaits++;
+    try {
+      run.controller.abort();
+      await run.promise;
+      const result = this.snapshot(run);
+      run.collected = true;
+      return result;
+    } finally {
+      run.activeWaits--;
+      this.signalAvailable(run);
+    }
   }
 
-  /** Join any selected child under one deadline; acknowledge only returned terminal reports. */
+  /** Join under one deadline; collect terminal snapshots, not publication acknowledgments. */
   async wait(ids: readonly string[], timeoutMs: number, signal?: AbortSignal): Promise<ChildResult[]> {
     if (!ids.length) throw new Error("wait requires at least one child id.");
     // Resolve before claiming reports, then deduplicate UUID/handle aliases.
     const runs = [...new Set(ids.map((id) => this.get(id)))];
-    const collect = () => runs.map((run) => {
-      if (run.settled) run.delivery = "delivered";
-      return this.snapshot(run);
-    });
+    const collect = () => {
+      // Completion can wake the join just before cancellation. Check again at
+      // collection, even though the completion listener has already detached.
+      if (signal?.aborted) throw new Error("Wait cancelled; use stop to cancel children.");
+      const results = runs.map((run) => this.snapshot(run));
+      for (const run of runs) if (run.settled) run.collected = true;
+      return results;
+    };
     if (signal?.aborted) throw new Error("Wait cancelled; use stop to cancel children.");
     if (runs.some((run) => run.settled)) return collect();
     for (const run of runs) run.activeWaits++;
@@ -307,7 +318,7 @@ export class SessionChildren {
     } finally {
       for (const run of runs) {
         run.activeWaits--;
-        // A cancelled join can race completion without having delivered it.
+        // A cancelled join can race completion without having collected it.
         this.signalAvailable(run);
       }
     }

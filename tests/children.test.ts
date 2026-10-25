@@ -92,7 +92,13 @@ describe("session ownership", () => {
     expect(run.control).toBeDefined();
     c.executions[0]!.usage.input = 5;
     c.executions[0]!.usage.cost.total = 1;
-    const first = await c.children.stop(run.result.id);
+    const stopping = c.children.stop(run.result.id);
+    // Suppressing stop's notices must not consume its report before cleanup.
+    expect(run.collected).toBe(false);
+    expect(c.children.pruneCollected()).toBe(0);
+    const first = await stopping;
+    expect(c.notices).toEqual([]);
+    expect(c.children.unreadCompletionCount()).toBe(0);
     expect(run.control).toBeUndefined();
     first.tools.push("bash");
     first.usage.input = 999;
@@ -165,7 +171,7 @@ describe("session ownership", () => {
     c.children.resetInboxNotices();
     expect(c.children.pendingInbox()).toHaveLength(1);
     expect((await c.children.wait([run.handle], 1))[0]!.output).toBe("done");
-    expect(c.children.pruneDelivered()).toBe(1);
+    expect(c.children.pruneCollected()).toBe(1);
     expect(() => c.children.get(run.handle)).toThrow("Unknown child");
   });
   test("a join that expires while the child is live re-arms the completion notice", async () => {
@@ -184,7 +190,7 @@ describe("session ownership", () => {
     c.gates[2]!.resolve();
     const results = await joining;
     expect(results.map((result) => result.state.status)).toEqual(["running", "terminal", "terminal"]);
-    expect(runs.map((run) => run.delivery)).toEqual(["unread", "delivered", "delivered"]);
+    expect(runs.map((run) => run.collected)).toEqual([false, true, true]);
     expect(runs.every((run) => run.waiters.size === 0 && run.activeWaits === 0)).toBe(true);
     expect(c.notices).toEqual([]);
     c.gates[0]!.resolve();
@@ -225,11 +231,28 @@ describe("session ownership", () => {
     expect([a, b].every((run) => run.activeWaits === 0 && run.waiters.size === 0 && !run.controller.signal.aborted)).toBe(true);
     // Resolve all ids before consuming even an already-completed report.
     await expect(c.children.wait([a.result.id, "unknown"], 1)).rejects.toThrow("Unknown child");
-    expect(a.delivery).toBe("unread");
+    expect(a.collected).toBe(false);
     await expect(c.children.wait([a.result.id, b.result.id], 1, controller.signal)).rejects.toThrow("Wait cancelled");
     expect(c.children.pendingCompletions()).toHaveLength(2);
     expect((await c.children.wait([a.result.id, b.result.id], 1)).every((result) => result.state.status === "terminal")).toBe(true);
     expect(c.children.pendingCompletions()).toHaveLength(0);
+    await c.children.close();
+  });
+  test("cancellation after completion wakes a wait preserves every selected report", async () => {
+    const c = controlled();
+    const runs = [c.start(), c.start()];
+    const controller = new AbortController();
+    const joining = c.children.wait(runs.map((run) => run.handle), 1000, controller.signal);
+    // A second completion observer cancels after the wait is woken, before its
+    // async continuation can collect reports. The abort listener is gone then.
+    runs[0]!.waiters.add(() => controller.abort());
+    c.gates.forEach((gate) => gate.resolve());
+    await expect(joining).rejects.toThrow("Wait cancelled");
+    await Promise.all(runs.map((run) => run.promise));
+    expect(c.children.pendingCompletions().map((result) => result.handle)).toEqual(runs.map((run) => run.handle));
+    expect(c.children.pruneCollected()).toBe(0);
+    expect(runs.every((run) => run.activeWaits === 0 && run.waiters.size === 0)).toBe(true);
+    expect((await c.children.wait(runs.map((run) => run.handle), 1)).map((result) => result.output)).toEqual(["done", "done"]);
     await c.children.close();
   });
   test("charges completed executions once, independently of joins and eviction", async () => {

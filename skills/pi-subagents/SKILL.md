@@ -21,7 +21,9 @@ Requires Pi 1.3.0+ from a Node/npm installation with the `pi` CLI and Node 22.19
 - **inbox** (default): no parent turn is spent. Once per parent turn, the next top-level non-subagent tool result advertises unread handles, the footer and `/subagents` show the count, and `wait` reads the reports. Idle parents are never woken.
 - **turn**: additionally request a handle announcement and continuation at an active boundary. It never wakes an idle parent. Each child gets at most one attempt per parent run; a later extension may discard the draft.
 
-Notices never contain or acknowledge reports. Call `wait` to retrieve reports after either kind of notice. A completed `run` or `stop` also reads its result; `status` does not. Unread reports remain discoverable in the inbox after aborted continuations or dropped notices.
+Notices never contain or consume reports. Call `wait` to retrieve reports after either kind of notice. A completed `run`, `wait`, or `stop` marks its returned terminal reports collected locally and eligible for eviction; this is not confirmation of receipt in model context. `status` does not collect reports. Unread reports remain discoverable in the inbox after aborted continuations or dropped notices.
+
+After an assistant error, an unsuccessful boundary, or an observed abort, `turn` announcements stay suppressed until a new parent run, even if an automatic retry succeeds. Use `wait` when reports block progress; do not rely on an extra turn.
 
 ```json
 {"command":"spawn","prompt":"Investigate the retry failure in src/client.ts. Return a reproduction and a concrete fix recommendation; do not edit files.","tools":["read"]}

@@ -5,6 +5,7 @@ import { SessionChildren } from "./children.ts";
 export class CompletionDelivery {
   private ctx?: ExtensionContext;
   private closed = false;
+  // Latched for the external run: successful automatic retries do not rearm it.
   private suppressDelivery = false;
 
   constructor(private readonly children: SessionChildren) {}
