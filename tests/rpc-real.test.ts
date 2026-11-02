@@ -99,6 +99,7 @@ test("a timed-out default session resumes completed work without restarting its 
   expect(first.outcome).toBe("timed_out");
   expect(first.timeoutPhase).toBe("execution");
   expect(first.output).toBe("EARLIER_FINDING");
+  expect(first.interruption).toEqual({ activity: "model", activeToolCount: 0, currentTool: undefined });
   expect(fs.existsSync(first.sessionFile!)).toBe(true);
   expect(f.requests).toHaveLength(2);
   // A changed file makes replaying the completed read observable.

@@ -12,7 +12,7 @@ import { SubagentDetailsSchema } from "./result-schema.ts";
 import type { ChildResult, SubagentDetails } from "./types.ts";
 import { childListText, renderChildCall, renderChildResult, renderChildNotice } from "./render.ts";
 import { CompletionDelivery } from "./delivery.ts";
-import { childStatus as summary, childReports, formatElapsed } from "./reports.ts";
+import { childStatus as summary, childStatuses, childReports, formatElapsed } from "./reports.ts";
 
 export { SubagentParamsSchema } from "./params.ts";
 export type { SubagentParams } from "./params.ts";
@@ -122,7 +122,7 @@ export default function (pi: ExtensionAPI) {
       runtime.delivery.bind(ctx);
       if (params.command === "status") {
         const results = params.id ? [owner.snapshot(owner.get(params.id))] : owner.list();
-        return answer("status", results, results.length ? results.map((result) => summary(result)).join("\n\n") : "No retained children.");
+        return answer("status", results, childStatuses(results));
       }
       if (params.command === "stop") {
         const result = await owner.stop(params.id!);

@@ -37,8 +37,10 @@ export const OutputTruncationSchema = Type.Object({
 }, { additionalProperties: false });
 
 export const ChildActivitySchema = Type.Enum(["model", "thinking", "text", "tool"] as const, { type: "string",
-  description: "Current model/token/tool activity while running; absent after execution stops. No reasoning text or tool payloads.",
+  description: "Observed model/token/tool activity. No reasoning text or tool payloads.",
 });
+
+const ToolNameSchema = Type.String({ maxLength: 256, pattern: "^[A-Za-z][A-Za-z0-9_.:-]*$" });
 
 export const ChildResultSchema = Type.Object({
   id: Type.String(),
@@ -54,14 +56,19 @@ export const ChildResultSchema = Type.Object({
     expiresAt: Type.Integer({ minimum: 0, maximum: 8_640_000_000_000_000 }),
   }, { additionalProperties: false, description: "Effective phase deadline in Unix milliseconds, after defaults/environment resolution. Retained after termination; activity never extends it." })),
   lastActivityAt: Type.Optional(Type.Integer({ minimum: 0, maximum: 8_640_000_000_000_000, description: "Parent-observed Unix milliseconds of the latest model/token/tool activity; retained after termination. Not a stall verdict." })),
-  activity: Type.Optional(ChildActivitySchema),
-  currentTool: Type.Optional(Type.String({ maxLength: 256, pattern: "^[A-Za-z][A-Za-z0-9_.:-]*$", description: "An executing tool from the requested allowlist; one name when calls overlap. Name only; no arguments or results. Absent after execution stops." })),
+  activity: Type.Optional({ ...ChildActivitySchema, description: "Current observed activity; absent after execution stops." }),
+  currentTool: Type.Optional({ ...ToolNameSchema, description: "An observed tool call from the requested allowlist; one name when calls overlap. Name only; no arguments or results. Absent after execution stops." }),
+  interruption: Type.Optional(Type.Object({
+    activity: Type.Optional(ChildActivitySchema),
+    activeToolCount: Type.Integer({ minimum: 0, description: "Tool calls with observed start and no observed end at interruption; includes parallel/nested calls, not proof that execution or side effects occurred." }),
+    currentTool: Type.Optional(ToolNameSchema),
+  }, { additionalProperties: false, description: "Observation frozen when execution was interrupted, before cleanup. currentTool is one allowlisted name, not the complete set. Not a cause diagnosis, rollback record, or safe-retry guarantee." })),
   prompt: Type.String(),
   cwd: Type.String(),
   sessionFile: Type.Optional(Type.String({ description: "Child Pi session path for persist/resume, including failed runs. Startup failure may occur before the file is created." })),
   tools: Type.Array(Type.String()),
-  omittedFields: Type.Optional(Type.Array(Type.Enum(["prompt", "cwd", "tools"] as const, { type: "string" }), {
-    uniqueItems: true, description: "Context fields omitted to fit the response budget; empty placeholders are not execution values.",
+  omittedFields: Type.Optional(Type.Array(Type.Enum(["prompt", "cwd", "tools", "sessionFile"] as const, { type: "string" }), {
+    uniqueItems: true, description: "Fields omitted to fit the response budget; empty placeholders are not execution values. Retrieve an omitted sessionFile with status for this child alone.",
   })),
   output: Type.Optional(Type.String({ description: "Final assistant report on success; bounded visible assistant-text history on failure or interruption. Not a complete execution trace." })),
   outputTruncation: Type.Optional(OutputTruncationSchema),

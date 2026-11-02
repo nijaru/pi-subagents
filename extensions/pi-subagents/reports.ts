@@ -69,7 +69,11 @@ export function activitySummary(result: ChildResult): string {
   if (!isRunning(result) && !failed(result)) return "";
   const current = isRunning(result) && result.activity
     ? `activity: ${result.activity}${result.currentTool ? ` (${truncateOutput(result.currentTool, 256)})` : ""}` : "";
-  return [current, lastActivitySummary(result)].filter(Boolean).join(" · ");
+  const interruption = result.interruption;
+  const observed = interruption ? `at interruption: ${interruption.activity ?? "between activities"}${interruption.activeToolCount
+    ? ` · ${interruption.activeToolCount} tool call${interruption.activeToolCount === 1 ? "" : "s"} without observed completion${interruption.currentTool ? ` (including ${truncateOutput(interruption.currentTool, 256)})` : ""}` : ""}` : "";
+  const warning = interruption?.activeToolCount ? "Tool effects may already have occurred; reconcile workspace/external state before retrying." : "";
+  return [[current, lastActivitySummary(result)].filter(Boolean).join(" · "), observed, warning].filter(Boolean).join("\n");
 }
 
 /** Failure causes precede partial output so bounds cannot hide why the child stopped. */
@@ -105,20 +109,37 @@ export function childSummary(result: ChildResult, includePrompt = true): string 
   const session = result.sessionFile ? `\nsession: ${truncateOutput(result.sessionFile, 1024)}` : "";
   const handle = result.handle ?? result.id;
   const observations = [deadlineSummary(result), activitySummary(result)].filter(Boolean).join("\n");
-  const head = `${handle} [${status}]${duration ? ` · ${duration}` : ""}${model}${session}${observations ? `\n${observations}` : ""}`;
+  const head = `${handle} [${status}]${duration ? ` · ${duration}` : ""}${observations ? `\n${observations}` : ""}${model}${session}`;
   return includePrompt ? `${head}\n${truncateOutput(result.prompt, 256)}` : head;
+}
+
+/** Variable metadata must not crowd later children out of a batch response. */
+function boundChildHeaders(results: ChildResult[], headers: string[], maxBytes: number): string[] {
+  const budgets = allocateBudget(headers.map((head) => Buffer.byteLength(head)), maxBytes);
+  return headers.map((head, index) => {
+    const budget = budgets[index]!;
+    if (Buffer.byteLength(head) <= budget) return head;
+    const guidance = `\nMetadata shortened; inspect child with status id: "${results[index]!.handle ?? results[index]!.id}".`;
+    return truncateOutput(head, Math.max(0, budget - Buffer.byteLength(guidance))) + guidance;
+  });
+}
+
+export function childStatuses(results: ChildResult[]): string {
+  if (!results.length) return "No retained children.";
+  const separator = "\n\n";
+  return boundChildHeaders(results, results.map(childStatus), MAX_OUTPUT_BYTES - 512 - Buffer.byteLength(separator) * (results.length - 1)).join(separator);
 }
 
 /** Every selected child keeps its identity/status, even when reports share a tight budget. */
 export function childReports(results: ChildResult[], { includePrompt = true, maxReportBytes = MAX_OUTPUT_BYTES } = {}): string {
   if (!results.length) return "No retained children.";
   const separator = "\n\n---\n\n";
-  const heads = results.map((result) => {
+  const heads = boundChildHeaders(results, results.map((result) => {
     const head = childSummary(result, includePrompt);
     return !isRunning(result) && result.outputTruncation?.truncated
       ? `${head}\nChild report truncated: ${result.outputTruncation.retainedBytes}/${result.outputTruncation.originalBytes} UTF-8 bytes retained in this report; saved sessions may retain completed messages.`
       : head;
-  });
+  }), MAX_OUTPUT_BYTES - 512 - Buffer.byteLength(separator) * (results.length - 1) - results.filter((result) => !isRunning(result)).length * 258);
   const outputs = results.map((result) => isRunning(result) ? "" : resultText(result));
   // Reserve identities, truncation guidance, and the caller's short preamble.
   const overhead = heads.reduce((bytes, head, index) => bytes + Buffer.byteLength(head) + (isRunning(results[index]!) ? 0 : 258), 0);

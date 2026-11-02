@@ -32,6 +32,7 @@ export function copyUsage(usage: UsageSummary): UsageSummary {
 export function copyResult(result: ChildResult): ChildResult {
   return { ...result, tools: [...result.tools], omittedFields: result.omittedFields ? [...result.omittedFields] : undefined, state: { ...result.state },
     deadline: result.deadline ? { ...result.deadline } : undefined,
+    interruption: result.interruption ? { ...result.interruption } : undefined,
     outputTruncation: result.outputTruncation ? { ...result.outputTruncation } : undefined,
     usage: copyUsage(result.usage) };
 }

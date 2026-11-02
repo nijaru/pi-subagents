@@ -192,6 +192,20 @@ describe("compact child rendering", () => {
     }
   });
 
+  test("interrupted tools show observational recovery evidence in text and expanded rendering", () => {
+    const interrupted: ChildResult = { ...child, state: { status: "terminal", outcome: "timed_out", exitCode: 1, finishedAt: 8000 },
+      interruption: { activity: "tool", activeToolCount: 2, currentTool: "bash" } };
+    for (const text of [childStatus(interrupted), lines("wait", { command: "wait" }, true, [interrupted], 120).join("\n")]) {
+      expect(text).toContain("at interruption: tool");
+      expect(text).toContain("2 tool calls without observed completion (including bash)");
+      expect(text).toContain("Tool effects may already have occurred");
+      expect(text).toContain("reconcile workspace/external state before retrying");
+    }
+    const waiting: ChildResult = { ...interrupted, interruption: { activity: "model", activeToolCount: 0 } };
+    expect(childStatus(waiting)).toContain("at interruption: model");
+    expect(childStatus(waiting)).not.toContain("Tool effects");
+  });
+
   test("command list omits default inbox and bounds cwd to one clean line", () => {
     const inbox = { ...child, cwd: "/work\nspace\u001b[31m", notify: "inbox" as const };
     const turn = { ...child, id: "second", handle: "sa-2", notify: "turn" as const, cwd: `/${"d".repeat(5000)}` };

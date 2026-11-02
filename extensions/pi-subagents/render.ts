@@ -213,7 +213,8 @@ function renderChildren(details: unknown, expanded: boolean, theme: Theme, targe
       }
       const cwd = child.omittedFields?.includes("cwd") ? "not retained (response budget)" : clean(child.cwd, 1024);
       const tools = child.omittedFields?.includes("tools") ? "not retained (response budget)" : clean(child.tools.join(", "), 1024) || "none";
-      const session = child.sessionFile ? `\nsession: ${clean(child.sessionFile, 1024)}` : "";
+      const session = child.sessionFile ? `\nsession: ${clean(child.sessionFile, 1024)}`
+        : child.omittedFields?.includes("sessionFile") ? "\nsession: omitted to fit response; inspect this child alone with status." : "";
       container.addChild(new Text(theme.fg("dim", `cwd: ${cwd}\ntools: ${tools}${session}`), 0, 0));
       if (!active) {
         const cleanup = child.cleanupMs ? ` · cleanup ${formatElapsed(child.cleanupMs)}` : "";

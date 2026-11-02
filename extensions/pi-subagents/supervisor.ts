@@ -30,7 +30,7 @@ export interface ChildTask {
 
 /** Execution facts; the session registry owns handles, admission and delivery. */
 export type ChildExecutionData = Pick<ChildResult,
-  "startedAt" | "taskFinishedAt" | "deadline" | "lastActivityAt" | "activity" | "currentTool" | "phase" | "model" | "thinking" | "usage" | "output" | "outputTruncation" | "stdout" | "stderr" | "errorMessage" | "sessionFile"
+  "startedAt" | "taskFinishedAt" | "deadline" | "lastActivityAt" | "activity" | "currentTool" | "interruption" | "phase" | "model" | "thinking" | "usage" | "output" | "outputTruncation" | "stdout" | "stderr" | "errorMessage" | "sessionFile"
 >;
 export interface ChildControl { steer(message: string, signal?: AbortSignal): Promise<void>; }
 export interface ChildRunRequest {
@@ -90,7 +90,7 @@ export class RpcChildSupervisor implements ChildSupervisor {
     const startedAt = Date.now();
     const startupBudget = task.startupTimeoutMs ?? startupTimeoutMs();
     const data: ChildExecutionData = { phase: "starting", startedAt, stderr: "", usage: emptyUsage() };
-    const snapshot = (): ChildExecutionData => ({ ...data, deadline: data.deadline ? { ...data.deadline } : undefined, usage: copyUsage(data.usage), outputTruncation: data.outputTruncation ? { ...data.outputTruncation } : undefined });
+    const snapshot = (): ChildExecutionData => ({ ...data, deadline: data.deadline ? { ...data.deadline } : undefined, interruption: data.interruption ? { ...data.interruption } : undefined, usage: copyUsage(data.usage), outputTruncation: data.outputTruncation ? { ...data.outputTruncation } : undefined });
     let lastPublish = 0;
     const publish = (progress?: string) => {
       if (progress !== undefined) lastPublish = Date.now();
@@ -131,6 +131,12 @@ export class RpcChildSupervisor implements ChildSupervisor {
     let rpc: ChildRpc;
     const stop = (reason: End) => {
       if (phase === "stopping" || phase === "settled") return;
+      if (phase === "running" && reason.kind !== "settled") {
+        data.interruption = {
+          activity: data.activity, currentTool: data.currentTool,
+          activeToolCount: [...activeTools.values()].reduce((sum, count) => sum + count, 0),
+        };
+      }
       phase = "stopping";
       data.phase = "stopping";
       data.taskFinishedAt = Date.now();

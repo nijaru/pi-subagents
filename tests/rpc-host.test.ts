@@ -70,11 +70,25 @@ describe("public RPC child host", () => {
     expect(result).toMatchObject({ outcome: "completed", output: "public report", usage: { turns: 2, totalTokens: 18 } });
     expect(result.activity).toBeUndefined();
     expect(result.currentTool).toBeUndefined();
+    expect(result.interruption).toBeUndefined();
     expect(result.lastActivityAt).toBe(updates.at(-1)!.lastActivityAt);
     expect(result.lastActivityAt!).toBeLessThanOrEqual(result.taskFinishedAt!);
     // Phase changes remain inspectable without redrawing the UI for each token.
     expect(progress.length).toBeLessThan(5);
     expect(JSON.stringify([updates, result, progress])).not.toContain("PRIVATE_");
+  });
+
+  test("interruption freezes overlapping tool counts without lending mutable snapshots", async () => {
+    const controller = new AbortController();
+    const result = await run(task(tempDir(), { prompt: "SCENARIO=activity", tools: ["read", "bash"] }), controller.signal,
+      (data: ChildExecutionData) => {
+        if (data.currentTool === "bash") controller.abort();
+        if (data.interruption) data.interruption.activeToolCount = 99;
+      });
+    expect(result).toMatchObject({ outcome: "cancelled", interruption: { activity: "tool", activeToolCount: 3, currentTool: "bash" } });
+    expect(result.activity).toBeUndefined();
+    expect(result.currentTool).toBeUndefined();
+    expect(JSON.stringify(result)).not.toContain("PRIVATE_");
   });
 
   test("warming and cleanup do not hide a stalled tool's last activity", async () => {
@@ -151,6 +165,7 @@ describe("public RPC child host", () => {
     const result = await run(task(dir, { id: "startup", prompt: "startup", startupTimeoutMs: 50 }));
     expect(result.outcome).toBe("timed_out");
     expect(result.timeoutPhase).toBe("startup");
+    expect(result.interruption).toBeUndefined();
   });
 
   test("classifies provider errors and output limits", async () => {

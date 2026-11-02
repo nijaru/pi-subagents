@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { boundChildResult, boundDetails, jsonBytes, minimalChildResult, truncateOutput } from "../extensions/pi-subagents/bounds.ts";
 import { emptyUsage, type ChildResult } from "../extensions/pi-subagents/types.ts";
-import { childReports } from "../extensions/pi-subagents/reports.ts";
+import { childReports, childStatuses } from "../extensions/pi-subagents/reports.ts";
 import { Check } from "typebox/value";
 import { SubagentDetailsSchema } from "../extensions/pi-subagents/result-schema.ts";
 
@@ -18,10 +18,14 @@ function child(id = "child-1"): ChildResult {
 
 describe("serialized result bounds", () => {
   test("session and deadline metadata survive both result envelopes", () => {
-    const metadata = { deadline: { phase: "execution" as const, startedAt: 1, expiresAt: 3 }, lastActivityAt: 2, sessionFile: "/tmp/session.jsonl", taskFinishedAt: 3, cleanupMs: 1, errorKind: "deadline" as const, timeoutPhase: "startup" as const };
+    const metadata = { interruption: { activity: "tool" as const, activeToolCount: 3, currentTool: "bash" }, deadline: { phase: "execution" as const, startedAt: 1, expiresAt: 3 }, lastActivityAt: 2, sessionFile: "/tmp/session.jsonl", taskFinishedAt: 3, cleanupMs: 1, errorKind: "deadline" as const, timeoutPhase: "execution" as const };
     const result = { ...child(), ...metadata,
       state: { status: "terminal", outcome: "timed_out", exitCode: 1, finishedAt: 4 } as const };
-    expect(minimalChildResult(result)).toMatchObject(metadata);
+    const minimal = minimalChildResult(result);
+    const { sessionFile: _path, ...required } = metadata;
+    expect(minimal).toMatchObject(required);
+    expect(minimal.sessionFile).toBeUndefined();
+    expect(minimal.omittedFields).toContain("sessionFile");
     const bounded = boundDetails({ command: "wait", results: [result] });
     expect(bounded.results[0]).toMatchObject(metadata);
     expect(Check(SubagentDetailsSchema, bounded)).toBe(true);
@@ -41,6 +45,47 @@ describe("serialized result bounds", () => {
       expect(result.outputTruncation?.retainedBytes).toBe(Buffer.byteLength(result.output ?? ""));
     }
     expect(Buffer.byteLength(childReports(results))).toBeLessThanOrEqual(51200);
+  });
+
+  test("32 interrupted children retain observations and recovery warnings within both budgets", () => {
+    const interruption = { activity: "tool" as const, activeToolCount: 64, currentTool: "a".repeat(256) };
+    const results = Array.from({ length: 32 }, (_, index) => ({ ...child(`child-${index}`), interruption }));
+    const bounded = boundDetails({ command: "wait", results });
+    expect(jsonBytes(bounded)).toBeLessThanOrEqual(51200);
+    expect(Check(SubagentDetailsSchema, bounded)).toBe(true);
+    for (const result of bounded.results) expect(result.interruption).toEqual(interruption);
+    bounded.results[0]!.interruption!.activeToolCount = 0;
+    expect(interruption.activeToolCount).toBe(64);
+    const text = childReports(results);
+    expect(Buffer.byteLength(text)).toBeLessThanOrEqual(51200);
+    expect(text.match(/reconcile workspace\/external state/g)).toHaveLength(32);
+  });
+
+  test("batch metadata cannot exceed either envelope or hide child identities", () => {
+    const results = Array.from({ length: 32 }, (_, index): ChildResult => ({
+      ...child(`00000000-0000-4000-8000-${String(index).padStart(12, "0")}`), handle: `sa-${1000 + index}`,
+      prompt: "p".repeat(256), tools: ["a".repeat(256)],
+      sessionFile: "/" + "segment/".repeat(86) + "session.jsonl", model: "provider/" + "m".repeat(200),
+      startedAt: 1_700_000_000_000, taskFinishedAt: 1_700_000_003_000, cleanupMs: 100, lastActivityAt: 1_700_000_002_900,
+      deadline: { phase: "execution", startedAt: 1_700_000_001_000, expiresAt: 1_700_000_003_000 },
+      errorKind: "deadline", timeoutPhase: "execution", errorMessage: "Deadline expired",
+      state: { status: "terminal", outcome: "timed_out", exitCode: 1, finishedAt: 1_700_000_003_100 },
+      interruption: { activity: "tool", activeToolCount: 1, currentTool: "a".repeat(256) },
+    }));
+    const bounded = boundDetails({ command: "wait", results });
+    expect(jsonBytes(bounded)).toBeLessThanOrEqual(51200);
+    expect(Check(SubagentDetailsSchema, bounded)).toBe(true);
+    for (const result of bounded.results) expect(result.interruption?.activeToolCount).toBe(1);
+    for (const text of [childReports(results), childStatuses(results)]) {
+      expect(Buffer.byteLength(text)).toBeLessThanOrEqual(51200);
+      for (const result of results) expect(text).toContain(`${result.handle} [timed_out]`);
+      expect(text.match(/reconcile workspace\/external state/g)).toHaveLength(32);
+    }
+    for (const [index, result] of bounded.results.entries()) {
+      if (result.sessionFile) expect(result.sessionFile).toBe(results[index]!.sessionFile!);
+      else expect(result.omittedFields).toContain("sessionFile");
+    }
+    expect(boundDetails({ command: "status", results: [results[0]!] }).results[0]!.sessionFile).toBe(results[0]!.sessionFile);
   });
 
   test("batch truncation adds metadata even when the original budget was not reached", () => {

@@ -112,8 +112,8 @@ function truncationFor(result: ChildResult, output: string) {
 }
 
 export function minimalChildResult(result: ChildResult): ChildResult {
-  const omittedFields = (["prompt", "cwd", "tools"] as const).filter((key) =>
-    result[key].length > 0 || result.omittedFields?.includes(key));
+  const omittedFields = (["prompt", "cwd", "tools", "sessionFile"] as const).filter((key) =>
+    (result[key]?.length ?? 0) > 0 || result.omittedFields?.includes(key));
   return {
     id: result.id,
     ...(result.handle === undefined ? {} : { handle: result.handle }),
@@ -126,7 +126,7 @@ export function minimalChildResult(result: ChildResult): ChildResult {
     ...(result.lastActivityAt === undefined ? {} : { lastActivityAt: result.lastActivityAt }),
     ...(result.activity === undefined ? {} : { activity: result.activity }),
     ...(result.currentTool === undefined ? {} : { currentTool: result.currentTool }),
-    ...(result.sessionFile === undefined ? {} : { sessionFile: result.sessionFile }),
+    ...(result.interruption === undefined ? {} : { interruption: { ...result.interruption } }),
     ...(result.notify === undefined ? {} : { notify: result.notify }),
     prompt: "",
     cwd: "",
@@ -149,7 +149,7 @@ export function boundChildResult(result: ChildResult, maxBytes: number): ChildRe
   }
   const addCandidate = (key: keyof ChildResult, value: unknown): boolean => {
     const next = { ...bounded, [key]: value } as ChildResult;
-    if ((key === "prompt" || key === "cwd" || key === "tools") && (value as string | string[]).length > 0) {
+    if ((key === "prompt" || key === "cwd" || key === "tools" || key === "sessionFile") && (value as string | string[]).length > 0) {
       next.omittedFields = next.omittedFields?.filter((field) => field !== key);
       if (!next.omittedFields?.length) delete next.omittedFields;
     }
@@ -171,6 +171,8 @@ export function boundChildResult(result: ChildResult, maxBytes: number): ChildRe
       else high = middle - 1;
     }
   };
+  // Paths must fit whole: never return a truncated resume target.
+  if (result.sessionFile !== undefined) addCandidate("sessionFile", result.sessionFile);
   // Optional metadata must pay for JSON escaping just like report text.
   addText("errorMessage", result.errorMessage, 512);
   // Reserve task identity and actionable diagnostics before filling the report.
