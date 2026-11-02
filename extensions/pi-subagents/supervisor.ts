@@ -232,8 +232,12 @@ export class RpcChildSupervisor implements ChildSupervisor {
             recordActivity();
           } else if (event.message?.role === "toolResult" && isUsage(event.message.usage)) addUsage(data.usage, event.message.usage);
           break;
+        case "auto_retry_start": case "summarization_retry_scheduled": recordActivity("retry"); break;
+        case "compaction_start": case "summarization_retry_attempt_start": recordActivity("compaction"); break;
+        case "auto_retry_end": recordActivity(); break;
         case "compaction_end":
           if (isUsage(event.result?.usage)) addUsage(data.usage, event.result.usage);
+          recordActivity();
           break;
         case "tool_execution_start":
           if (task.tools.includes(event.toolName)) {

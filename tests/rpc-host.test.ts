@@ -105,6 +105,17 @@ describe("public RPC child host", () => {
     expect(JSON.stringify([updates, result])).not.toContain("PRIVATE_");
   });
 
+  test("observes Pi recovery phases without retaining private retry diagnostics", async () => {
+    const updates: ChildExecutionData[] = [];
+    const result = await run(task(tempDir(), { prompt: "SCENARIO=recovery-activity" }), undefined,
+      (data: ChildExecutionData) => updates.push(data));
+    expect(updates.map(data => data.activity).filter((activity, index, all) => activity !== all[index - 1]))
+      .toEqual(["compaction", "retry", "compaction", undefined, "retry", "model", undefined, "model", "text", undefined]);
+    expect(result).toMatchObject({ outcome: "completed", usage: { turns: 1, totalTokens: 18 } });
+    expect(result.interruption).toBeUndefined();
+    expect(JSON.stringify(updates)).not.toContain("PRIVATE_");
+  });
+
   test("counts background usage and compaction once without adding foreground turns", async () => {
     const result = await run(task(tempDir(), { prompt: "SCENARIO=usage" }));
     expect(result.outcome).toBe("completed");

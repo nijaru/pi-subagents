@@ -5,7 +5,7 @@ import * as path from "node:path";
 type Delta = { content?: string; reasoning_content?: string; tool_calls?: unknown[] };
 
 /** Isolate a real Pi CLI from live providers; only its HTTP endpoint is fake. */
-export function realRpcFixture(respond: (body: any) => Delta | Promise<Delta> = () => ({ content: "OK" })) {
+export function realRpcFixture(respond: (body: any) => Delta | Response | Promise<Delta | Response> = () => ({ content: "OK" })) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rpc-real-"));
   const saved = { ...process.env };
   const requests: any[] = [];
@@ -15,6 +15,7 @@ export function realRpcFixture(respond: (body: any) => Delta | Promise<Delta> = 
       const body = await request.json();
       requests.push(body);
       const delta = await respond(body);
+      if (delta instanceof Response) return delta;
       const chunk = (part: unknown, finish_reason: string | null) => `data: ${JSON.stringify({
         id: "completion", object: "chat.completion.chunk", created: 0, model: "model",
         choices: [{ index: 0, delta: part, finish_reason }],

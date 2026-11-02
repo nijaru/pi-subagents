@@ -71,6 +71,16 @@ function emitTask() {
     }, 20);
     return;
   }
+  if (scenario === "recovery-activity") {
+    send({ type: "compaction_start", reason: "threshold" });
+    send({ type: "summarization_retry_scheduled", attempt: 1, maxAttempts: 3, delayMs: 2, errorMessage: "PRIVATE_COMPACTION_ERROR" });
+    send({ type: "summarization_retry_attempt_start", source: "compaction", reason: "threshold" });
+    send({ type: "summarization_retry_finished" });
+    send({ type: "compaction_end", reason: "threshold", result: { usage }, aborted: false, willRetry: false });
+    send({ type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 2, errorMessage: "PRIVATE_RETRY_ERROR" });
+    send({ type: "turn_start" });
+    send({ type: "auto_retry_end", success: true, attempt: 1 });
+  }
   if (scenario === "usage") {
     send({ type: "entry_appended", entry: { type: "usage", kind: "cache_warm", usage } });
     send({ type: "entry_appended", entry: { type: "usage", kind: "cache_warm", usage: { ...usage, input: -1 } } });

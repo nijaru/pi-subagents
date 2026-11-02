@@ -36,8 +36,8 @@ export const OutputTruncationSchema = Type.Object({
   retainedBytes: Type.Integer({ minimum: 0, description: "Retained UTF-8 bytes, including any truncation marker." }),
 }, { additionalProperties: false });
 
-export const ChildActivitySchema = Type.Enum(["model", "thinking", "text", "tool"] as const, { type: "string",
-  description: "Observed model/token/tool activity. No reasoning text or tool payloads.",
+export const ChildActivitySchema = Type.Enum(["model", "thinking", "text", "tool", "retry", "compaction"] as const, { type: "string",
+  description: "Observed model/token/tool activity, Pi retry backoff, or compaction. No reasoning text or tool payloads.",
 });
 
 const ToolNameSchema = Type.String({ maxLength: 256, pattern: "^[A-Za-z][A-Za-z0-9_.:-]*$" });
@@ -55,7 +55,7 @@ export const ChildResultSchema = Type.Object({
     startedAt: Type.Integer({ minimum: 0, maximum: 8_640_000_000_000_000 }),
     expiresAt: Type.Integer({ minimum: 0, maximum: 8_640_000_000_000_000 }),
   }, { additionalProperties: false, description: "Effective phase deadline in Unix milliseconds, after defaults/environment resolution. Retained after termination; activity never extends it." })),
-  lastActivityAt: Type.Optional(Type.Integer({ minimum: 0, maximum: 8_640_000_000_000_000, description: "Parent-observed Unix milliseconds of the latest model/token/tool activity; retained after termination. Not a stall verdict." })),
+  lastActivityAt: Type.Optional(Type.Integer({ minimum: 0, maximum: 8_640_000_000_000_000, description: "Parent-observed Unix milliseconds of the latest foreground activity event, including Pi retry/compaction; retained after termination. Not a progress or stall verdict." })),
   activity: Type.Optional({ ...ChildActivitySchema, description: "Current observed activity; absent after execution stops." }),
   currentTool: Type.Optional({ ...ToolNameSchema, description: "An observed tool call from the requested allowlist; one name when calls overlap. Name only; no arguments or results. Absent after execution stops." }),
   interruption: Type.Optional(Type.Object({

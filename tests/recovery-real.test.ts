@@ -12,6 +12,51 @@ export default (pi: any) => pi.registerTool({ name: "controlled", label: "contro
   fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ extensions: [extension], steeringMode: "one-at-a-time" }));
 }
 
+test("execution cutoff distinguishes real Pi retry backoff from an idle model", async () => {
+  using f = realRpcFixture(() => new Response(JSON.stringify({ error: { message: "503 overloaded", type: "api_error" } }), { status: 503 }));
+  fs.writeFileSync(path.join(f.dir, "settings.json"), JSON.stringify({ retry: {
+    enabled: true, maxRetries: 1, baseDelayMs: 10_000, maxAgentDelayMs: 10_000,
+    provider: { maxRetries: 0 },
+  } }));
+  const result = await new RpcChildSupervisor().run({
+    task: { id: "retry-backoff", prompt: "Report the answer.", cwd: f.dir, tools: [], model: "fixture/model", executionTimeoutMs: 2_000 },
+    signal: new AbortController().signal,
+  });
+  expect(result).toMatchObject({ outcome: "timed_out", timeoutPhase: "execution", interruption: { activity: "retry", activeToolCount: 0 } });
+  expect(result.usage.turns).toBe(1);
+  expect(f.requests).toHaveLength(1);
+  expect(result.deadline!.expiresAt - result.deadline!.startedAt).toBe(2_000);
+}, 15_000);
+
+test("execution cutoff distinguishes automatic compaction from an idle model", async () => {
+  const release = Promise.withResolvers<{ content: string }>();
+  using f = realRpcFixture(() => {
+    if (f.requests.length > 1) return release.promise;
+    // Report enough provider usage to cross Pi's real threshold after this answer.
+    const chunk = { id: "completion", object: "chat.completion.chunk", created: 0, model: "model",
+      choices: [{ index: 0, delta: { role: "assistant", content: "INITIAL_REPORT" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 120_000, completion_tokens: 4, total_tokens: 120_004 } };
+    return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { "Content-Type": "text/event-stream" } });
+  });
+  fs.writeFileSync(path.join(f.dir, "settings.json"), JSON.stringify({ compaction: { enabled: true, keepRecentTokens: 1 } }));
+  const abort = new AbortController();
+  const pending = new RpcChildSupervisor().run({
+    task: { id: "automatic-compaction", prompt: "Report the answer.", cwd: f.dir, tools: [], model: "fixture/model", executionTimeoutMs: 2_000 },
+    signal: abort.signal,
+  });
+  try {
+    const result = await pending;
+    expect(f.requests).toHaveLength(2);
+    expect(result).toMatchObject({ outcome: "timed_out", timeoutPhase: "execution", interruption: { activity: "compaction", activeToolCount: 0 } });
+    expect(result.output).toBe("INITIAL_REPORT");
+    expect(result.usage.turns).toBe(1);
+  } finally {
+    release.resolve({ content: "COMPACTED" });
+    abort.abort();
+    await pending;
+  }
+}, 15_000);
+
 const call = { tool_calls: [{ index: 0, id: "controlled_call", type: "function", function: { name: "controlled", arguments: "{}" } }] };
 
 test("real steering waits for both the current model response and its tool batch", async () => {
