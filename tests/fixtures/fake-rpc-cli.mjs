@@ -33,7 +33,7 @@ function emitTask() {
   }
   if (scenario === "partial-large") {
     send({ type: "message_start", message: { role: "assistant", content: [] } });
-    for (let i = 0; i < 32; i++) send({ type: "message_update", usage, assistantMessageEvent: { type: "text_delta", delta: "界🙂".repeat(1000) } });
+    for (let i = 0; i < 32; i++) send({ type: "message_update", usage, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "界🙂".repeat(1000) } });
     return;
   }
   if (scenario === "activity" || scenario === "activity-hang") {
@@ -107,7 +107,7 @@ function emitTask() {
   if (scenario === "partial-after" || scenario === "partial-thinking" || scenario === "partial-empty") {
     send({ type: "message_end", message: message("FIRST") });
     send({ type: "message_start", message: { role: "assistant", content: [] } });
-    if (scenario === "partial-after") send({ type: "message_update", usage, assistantMessageEvent: { type: "text_delta", delta: "SECOND" } });
+    if (scenario === "partial-after") send({ type: "message_update", usage, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "SECOND" } });
     if (scenario === "partial-empty") send({ type: "message_end", message: message([{ type: "thinking", thinking: "PRIVATE_REASONING" }], "toolUse") });
     return;
   }
@@ -128,7 +128,7 @@ function emitTask() {
   }
   if (scenario === "slow") {
     send({ type: "message_start", message: { role: "assistant", content: [] } });
-    send({ type: "message_update", usage, assistantMessageEvent: { type: "text_delta", delta: "partial" } });
+    send({ type: "message_update", usage, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "partial" } });
     send({ type: "message_end", message: message("partial") });
     return;
   }
@@ -144,7 +144,7 @@ function emitTask() {
     return;
   }
   send({ type: "message_start", message: { role: "assistant", content: [] } });
-  send({ type: "message_update", usage, assistantMessageEvent: { type: "text_delta", delta: "done" } });
+  send({ type: "message_update", usage, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "done" } });
   send({ type: "message_end", message: message("done") });
   settle();
 }

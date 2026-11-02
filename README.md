@@ -71,7 +71,7 @@ Interrupted execution also retains `interruption`: the observed `activity`, an `
 
 Every armed phase exposes its effective `deadline`: `{ phase, startedAt, expiresAt }`, with Unix millisecond timestamps after defaults and environment settings are resolved. The last deadline remains in terminal details; running and failed text reports show it too. Activity never extends the cutoff. The library does not automatically retry, extend the budget, or send a wrap-up prompt: queued steering cannot interrupt a long model request or tool call.
 
-At startup/execution expiry the child is stopped and its result retains bounded visible assistant text across messages, including unfinished text. Successful results still contain only the final report. Join/wait expiry leaves the child running. `errorKind` distinguishes `startup`, `provider`, `protocol`, `deadline`, `cancelled`, and `cleanup`; `timeoutPhase` names the expired deadline. Reported runtime excludes process-tree cleanup; `cleanupMs` records the excluded portion.
+At startup/execution expiry the child is stopped and its result retains bounded visible assistant text across messages, including unfinished text. Completed text blocks replace their interim deltas even if the whole assistant message never finishes. Successful results still contain only the final report. Join/wait expiry leaves the child running. `errorKind` distinguishes `startup`, `provider`, `protocol`, `deadline`, `cancelled`, and `cleanup`; `timeoutPhase` names the expired deadline. Reported runtime excludes process-tree cleanup; `cleanupMs` records the excluded portion.
 
 ## Child execution
 

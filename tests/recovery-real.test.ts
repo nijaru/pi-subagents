@@ -57,6 +57,36 @@ test("execution cutoff distinguishes automatic compaction from an idle model", a
   }
 }, 15_000);
 
+test("interruption retains authoritative text blocks from the real Responses stream", async () => {
+  using f = realRpcFixture(() => {
+    const item = (id: string, text: string) => ({ id, type: "message", role: "assistant", status: "completed",
+      content: [{ type: "output_text", text, annotations: [] }] });
+    const events = [
+      { type: "response.created", response: { id: "resp_test", model: "model", status: "in_progress", output: [] } },
+      ...[0, 1].flatMap(index => [
+        { type: "response.output_item.added", output_index: index, item: { ...item(`msg_${index}`, ""), status: "in_progress", content: [] } },
+        { type: "response.output_text.delta", output_index: index, content_index: 0, delta: index ? "STALE_TAIL" : "STALE_HEAD" },
+        { type: "response.output_item.done", output_index: index, item: item(`msg_${index}`, index ? "FINAL_TAIL" : "CORRECTED_HEAD") },
+      ]),
+    ];
+    // The provider completes both text blocks, but not the assistant request.
+    return new Response(new ReadableStream({ start(controller) {
+      for (const event of events) controller.enqueue(new TextEncoder().encode(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`));
+    } }), { headers: { "Content-Type": "text/event-stream" } });
+  });
+  const modelsFile = path.join(f.dir, "models.json");
+  const models = JSON.parse(fs.readFileSync(modelsFile, "utf8"));
+  models.providers.fixture.api = "openai-responses";
+  fs.writeFileSync(modelsFile, JSON.stringify(models));
+  const result = await new RpcChildSupervisor().run({
+    task: { id: "authoritative-text", prompt: "Report the answer.", cwd: f.dir, tools: [], model: "fixture/model", executionTimeoutMs: 2_000 },
+    signal: new AbortController().signal,
+  });
+  expect(result.outcome).toBe("timed_out");
+  expect(result.output).toBe("CORRECTED_HEAD\nFINAL_TAIL");
+  expect(result.outputTruncation).toBeUndefined();
+}, 15_000);
+
 const call = { tool_calls: [{ index: 0, id: "controlled_call", type: "function", function: { name: "controlled", arguments: "{}" } }] };
 
 test("real steering waits for both the current model response and its tool batch", async () => {

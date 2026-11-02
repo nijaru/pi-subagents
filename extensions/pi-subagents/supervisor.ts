@@ -188,11 +188,17 @@ export class RpcChildSupervisor implements ChildSupervisor {
           break;
         case "message_update":
           if (isUsage(event.usage)) streamingUsage = { ...event.usage, cost: { ...event.usage.cost } };
+          if (event.assistantMessageEvent?.type === "text_start") transcript.startBlock(event.assistantMessageEvent.contentIndex);
           if (event.assistantMessageEvent?.type === "text_delta") {
-            const delta = event.assistantMessageEvent.delta;
+            const { contentIndex, delta } = event.assistantMessageEvent;
             if (typeof delta !== "string") throw new Error("Child RPC emitted a malformed text delta.");
             assistantOpen = true;
-            transcript.append(delta);
+            transcript.append(contentIndex, delta);
+          }
+          if (event.assistantMessageEvent?.type === "text_end") {
+            const { contentIndex, content } = event.assistantMessageEvent;
+            if (typeof content !== "string") throw new Error("Child RPC emitted malformed completed text.");
+            transcript.completeBlock(contentIndex, content);
           }
           // Classify the wire event, never copy its thinking/argument content.
           switch (event.assistantMessageEvent?.type) {
