@@ -1,7 +1,7 @@
 import { randomInt, randomUUID } from "node:crypto";
-import type { ModelThinkingLevel, Usage } from "@earendil-works/pi-ai";
+import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { ChildResult } from "./types.ts";
-import { addUsage, copyResult, emptyUsage } from "./types.ts";
+import { addUsage, copyResult, emptyUsage, type UsageRecord } from "./types.ts";
 import type { ChildControl, ChildSupervisor, ChildTask } from "./supervisor.ts";
 import { MAX_CONCURRENCY, MAX_DIAGNOSTIC_BYTES, MAX_RETAINED_RUNS } from "./limits.ts";
 import { truncateOutput } from "./bounds.ts";
@@ -59,7 +59,7 @@ export interface StartChild {
 export class SessionChildren {
   private readonly runs = new Map<string, ChildRun>();
   private closed = false;
-  private pendingUsage: Usage | undefined;
+  private pendingUsage: UsageRecord | undefined;
   // Start at a random point so a resumed session cannot immediately reuse a
   // handle still visible in the restored transcript.
   private nextHandle = randomInt(1, 1_000_000);
@@ -220,7 +220,7 @@ export class SessionChildren {
   }
 
   /** Pi custom completion messages cannot carry usage; the next tool result does. */
-  takePendingUsage(): Usage | undefined {
+  takePendingUsage(): UsageRecord | undefined {
     const usage = this.pendingUsage;
     this.pendingUsage = undefined;
     return usage;

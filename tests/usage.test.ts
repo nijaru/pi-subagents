@@ -1,10 +1,9 @@
 import { expect, test } from "bun:test";
-import type { Usage } from "@earendil-works/pi-ai";
 import { Check } from "typebox/value";
 import { UsageSchema } from "../extensions/pi-subagents/result-schema.ts";
-import { addUsage, emptyUsage, isUsage } from "../extensions/pi-subagents/types.ts";
+import { addUsage, emptyUsage, isUsage, type UsageRecord } from "../extensions/pi-subagents/types.ts";
 
-const usage = (totalFromProvider?: boolean): Usage => ({
+const usage = (totalFromProvider?: boolean): UsageRecord => ({
   input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
   cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, total: 0.5, totalFromProvider },
 });

@@ -1,4 +1,4 @@
-import type { Message, ModelThinkingLevel, Usage } from "@earendil-works/pi-ai";
+import type { Message, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Static } from "typebox";
 import type { OutcomeSchema, ChildStateSchema, ChildActivitySchema, UsageSchema, OutputTruncationSchema, ChildResultSchema, SubagentDetailsSchema } from "./result-schema.ts";
 
@@ -7,6 +7,7 @@ export type AgentOutcome = Static<typeof OutcomeSchema>;
 export type ChildState = Static<typeof ChildStateSchema>;
 export type ChildActivity = Static<typeof ChildActivitySchema>;
 export type UsageSummary = Static<typeof UsageSchema>;
+export type UsageRecord = Omit<UsageSummary, "turns">;
 export type OutputTruncation = Static<typeof OutputTruncationSchema>;
 export type ChildResult = Static<typeof ChildResultSchema>;
 
@@ -50,7 +51,7 @@ export function emptyUsage(): UsageSummary {
   };
 }
 
-export function addUsage(target: Usage, usage: Usage): void {
+export function addUsage(target: UsageRecord, usage: UsageRecord): void {
   target.input += usage.input || 0;
   target.output += usage.output || 0;
   target.cacheRead += usage.cacheRead || 0;
@@ -80,7 +81,7 @@ export function isOutputTruncation(value: unknown): value is OutputTruncation {
     && (data.truncated || data.retainedBytes === data.originalBytes);
 }
 
-export function isUsage(value: unknown): value is Usage {
+export function isUsage(value: unknown): value is UsageRecord {
   if (!value || typeof value !== "object") return false;
   const usage = value as Record<string, unknown>;
   const nonnegative = (value: unknown) => isFiniteNumber(value) && value >= 0;

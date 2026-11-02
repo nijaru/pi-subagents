@@ -1,13 +1,13 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import type { AssistantMessage, ModelThinkingLevel, StopReason, Usage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, ModelThinkingLevel, StopReason } from "@earendil-works/pi-ai";
 import { boundedDiagnostic } from "./bounds.ts";
 import { ChildTranscript } from "./transcript.ts";
 import { childEnvironment } from "./env.ts";
 import { RUNNING_PROGRESS_TEXT, processTimeoutMs, startupTimeoutMs } from "./limits.ts";
 import { timeoutSummary, withCredentialHint } from "./reports.ts";
 import { cleanupChild, hasExited, spawnDeathWatchdog } from "./process-tree.ts";
-import { addUsage, copyUsage, emptyUsage, isUsage, textFromMessage, type ChildActivity, type ChildResult } from "./types.ts";
+import { addUsage, copyUsage, emptyUsage, isUsage, textFromMessage, type ChildActivity, type ChildResult, type UsageRecord } from "./types.ts";
 import { PROBE_COMMAND, PROBE_CUSTOM_TYPE, PROBE_DEADLINE_ENV, PROBE_TOKEN_ENV, PROBE_TOOLS_ENV, type ProbeReport } from "./probe-protocol.ts";
 import { acquireSession, getRpcInvocation } from "./launch.ts";
 import { ChildRpc, type ChildEvent } from "./rpc.ts";
@@ -124,7 +124,7 @@ export class RpcChildSupervisor implements ChildSupervisor {
     let assistant: AssistantMessage | undefined;
     const transcript = new ChildTranscript();
     let assistantOpen = false;
-    let streamingUsage: Usage | undefined;
+    let streamingUsage: UsageRecord | undefined;
     // Counts by allowlisted name handle parallel/nested calls without retaining
     // call IDs, arguments, results, or an unbounded history of tool events.
     const activeTools = new Map<string, number>();
