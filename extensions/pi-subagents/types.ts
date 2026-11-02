@@ -42,7 +42,8 @@ export function emptyUsage(): UsageSummary {
     cacheRead: 0,
     cacheWrite: 0,
     totalTokens: 0,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    // Neutral element: the aggregate is billed only if every added record is.
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, totalFromProvider: true },
     turns: 0,
   };
 }
@@ -58,6 +59,7 @@ export function addUsage(target: Usage, usage: Usage): void {
   target.cost.cacheRead += usage.cost?.cacheRead || 0;
   target.cost.cacheWrite += usage.cost?.cacheWrite || 0;
   target.cost.total += usage.cost?.total || 0;
+  target.cost.totalFromProvider = target.cost.totalFromProvider === true && usage.cost.totalFromProvider === true;
   if (usage.cacheWrite1h !== undefined) target.cacheWrite1h = (target.cacheWrite1h || 0) + usage.cacheWrite1h;
   if (usage.reasoning !== undefined) target.reasoning = (target.reasoning || 0) + usage.reasoning;
 }
@@ -85,7 +87,8 @@ export function isUsage(value: unknown): value is Usage {
   const cost = usage.cost;
   if (!cost || typeof cost !== "object") return false;
   return ["input", "output", "cacheRead", "cacheWrite", "total"].every((key) => nonnegative((cost as Record<string, unknown>)[key]))
-    && ["cacheWrite1h", "reasoning"].every((key) => usage[key] === undefined || nonnegative(usage[key]));
+    && ["cacheWrite1h", "reasoning"].every((key) => usage[key] === undefined || nonnegative(usage[key]))
+    && ((cost as Record<string, unknown>).totalFromProvider === undefined || typeof (cost as Record<string, unknown>).totalFromProvider === "boolean");
 }
 
 export function textFromMessage(message: Message): string {

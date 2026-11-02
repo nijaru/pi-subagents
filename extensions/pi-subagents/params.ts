@@ -1,12 +1,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
 import { MAX_PROCESS_TIMEOUT_MS, MAX_RETAINED_RUNS, MAX_STARTUP_TIMEOUT_MS, MAX_TASK_BYTES, MAX_WAIT_MS } from "./limits.ts";
 import { THINKING_LEVELS } from "./types.ts";
 
 export const SubagentParamsSchema = Type.Object({
-  command: StringEnum(["run", "spawn", "status", "wait", "stop", "steer"] as const, {
+  command: Type.Enum(["run", "spawn", "status", "wait", "stop", "steer"] as const, { type: "string",
     description: "run/spawn require prompt: run joins within its join budget (60s default) then continues in background; spawn returns immediately. steer requires id and message. wait requires ids and returns when any finishes. status optionally takes id; stop requires id and cancels/joins cleanup.",
   }),
   prompt: Type.Optional(Type.String({ description: "Self-contained task: scope, relevant evidence, constraints, expected output and checks", minLength: 1, maxLength: MAX_TASK_BYTES })),
@@ -14,7 +13,7 @@ export const SubagentParamsSchema = Type.Object({
     description: "Exact tool allowlist: tools must be active or callable in the parent. Defaults to active coding and known research tools; [] means reasoning only. No nested subagent tool.", maxItems: 64, uniqueItems: true,
   })),
   model: Type.Optional(Type.String({ description: "run/spawn only: exact provider/model-id; omitted inherits the parent model", minLength: 1, maxLength: 512 })),
-  thinking: Type.Optional(StringEnum(THINKING_LEVELS, {
+  thinking: Type.Optional(Type.Enum(THINKING_LEVELS, { type: "string",
     description: "run/spawn only: reasoning effort supported by the selected model. Omitted inherits parent effort for the same model; a different model uses its Pi defaults. Unsupported explicit levels fail before prompting.",
   })),
   cwd: Type.Optional(Type.String({ description: "Child working directory; relative to the parent cwd", minLength: 1, maxLength: 4096 })),
@@ -28,7 +27,7 @@ export const SubagentParamsSchema = Type.Object({
   executionTimeoutMs: Type.Optional(Type.Integer({ description: "run/spawn only: model/tool execution deadline, starting when the task is submitted. Positive integer milliseconds, at most 2 hours; defaults to PI_SUBAGENT_TIMEOUT_MS (30 minutes). Separate from startup, join, and wait budgets. A timed-out result keeps partial output and reports elapsed runtime and the deadline.", minimum: 1, maximum: MAX_PROCESS_TIMEOUT_MS })),
   startupTimeoutMs: Type.Optional(Type.Integer({ description: "run/spawn only: deadline for the RPC process, model selection, tool probe, and MCP readiness before the task starts. Positive integer milliseconds, at most 5 minutes; defaults to PI_SUBAGENT_STARTUP_TIMEOUT_MS (30 seconds).", minimum: 1, maximum: MAX_STARTUP_TIMEOUT_MS })),
   joinTimeoutMs: Type.Optional(Type.Integer({ description: "run only: how long this call waits before returning the running child for background delivery. Does not change the execution deadline. Defaults to PI_SUBAGENT_FOREGROUND_MS (60 seconds).", minimum: 1, maximum: MAX_WAIT_MS })),
-  notify: Type.Optional(StringEnum(["inbox", "turn"] as const, { description: "Completion delivery: inbox (default) advertises unread results on the next tool result; turn additionally attempts an active-boundary readiness announcement. Notices never consume reports; retrieve them with wait." })),
+  notify: Type.Optional(Type.Enum(["inbox", "turn"] as const, { type: "string", description: "Completion delivery: inbox (default) advertises unread results on the next tool result; turn additionally attempts an active-boundary readiness announcement. Notices never consume reports; retrieve them with wait." })),
   persist: Type.Optional(Type.Boolean({ description: "run/spawn only: save the Pi conversation for later inspection/recovery, including after failure; default false. Recommended for long recoverable tasks. Returns sessionFile for resume in the same cwd after the child stops. May contain sensitive content; not a full token trace." })),
   resume: Type.Optional(Type.String({ description: "run/spawn only: existing child session file to continue instead of starting fresh. Mutually exclusive with persist.", minLength: 1, maxLength: 4096 })),
   trustProject: Type.Optional(Type.Boolean({ description: "run/spawn only: pass --approve to the child so project-local resources load without a trust prompt; default false." })),

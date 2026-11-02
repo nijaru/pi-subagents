@@ -1,9 +1,9 @@
-import { StringEnum, type StopReason } from "@earendil-works/pi-ai";
+import type { StopReason } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { THINKING_LEVELS } from "./types.ts";
 
 // Kept off the child execution path: these schemas describe parent-facing data.
-export const OutcomeSchema = StringEnum(["completed", "incomplete", "failed", "cancelled", "timed_out"] as const);
+export const OutcomeSchema = Type.Enum(["completed", "incomplete", "failed", "cancelled", "timed_out"] as const, { type: "string" });
 
 /** Liveness is explicit; an assistant result does not imply process cleanup finished. */
 export const ChildStateSchema = Type.Union([
@@ -12,7 +12,7 @@ export const ChildStateSchema = Type.Union([
     status: Type.Literal("terminal"),
     outcome: OutcomeSchema,
     exitCode: Type.Integer(),
-    stopReason: Type.Optional(StringEnum(["pending", "stop", "length", "toolUse", "error", "aborted", "deferred"] as const satisfies readonly StopReason[])),
+    stopReason: Type.Optional(Type.Enum(["pending", "stop", "length", "toolUse", "error", "aborted", "deferred"] as const satisfies readonly StopReason[], { type: "string" })),
     finishedAt: Type.Number({ minimum: 0 }),
   }, { additionalProperties: false }),
 ]);
@@ -26,7 +26,7 @@ export const UsageSchema = Type.Object({
   totalTokens: Type.Number({ minimum: 0 }),
   cacheWrite1h: Type.Optional(Type.Number({ minimum: 0 })),
   reasoning: Type.Optional(Type.Number({ minimum: 0 })),
-  cost: Type.Object({ ...usageFields, total: Type.Number({ minimum: 0 }) }, { additionalProperties: false }),
+  cost: Type.Object({ ...usageFields, total: Type.Number({ minimum: 0 }), totalFromProvider: Type.Optional(Type.Boolean()) }, { additionalProperties: false }),
   turns: Type.Integer({ minimum: 0 }),
 }, { additionalProperties: false });
 
@@ -36,16 +36,16 @@ export const OutputTruncationSchema = Type.Object({
   retainedBytes: Type.Integer({ minimum: 0, description: "Retained UTF-8 bytes, including any truncation marker." }),
 }, { additionalProperties: false });
 
-export const ChildActivitySchema = StringEnum(["model", "thinking", "text", "tool"] as const, {
+export const ChildActivitySchema = Type.Enum(["model", "thinking", "text", "tool"] as const, { type: "string",
   description: "Current model/token/tool activity while running; absent after execution stops. No reasoning text or tool payloads.",
 });
 
 export const ChildResultSchema = Type.Object({
   id: Type.String(),
   handle: Type.Optional(Type.String({ description: "Short session-scoped handle; preferred in wait/status/stop/steer calls." })),
-  phase: Type.Optional(StringEnum(["starting", "running", "stopping"] as const, { description: "Live execution phase; absent once terminal." })),
-  errorKind: Type.Optional(StringEnum(["startup", "provider", "protocol", "deadline", "cancelled", "cleanup", "unknown"] as const)),
-  timeoutPhase: Type.Optional(StringEnum(["startup", "execution"] as const, { description: "Which deadline expired for a timed_out result." })),
+  phase: Type.Optional(Type.Enum(["starting", "running", "stopping"] as const, { type: "string", description: "Live execution phase; absent once terminal." })),
+  errorKind: Type.Optional(Type.Enum(["startup", "provider", "protocol", "deadline", "cancelled", "cleanup", "unknown"] as const, { type: "string" })),
+  timeoutPhase: Type.Optional(Type.Enum(["startup", "execution"] as const, { type: "string", description: "Which deadline expired for a timed_out result." })),
   cleanupMs: Type.Optional(Type.Integer({ minimum: 0, description: "Process-tree cleanup time excluded from the reported task runtime." })),
   taskFinishedAt: Type.Optional(Type.Number({ minimum: 0, description: "Leader exit or terminal-cause time, before cleanup." })),
   lastActivityAt: Type.Optional(Type.Integer({ minimum: 0, maximum: 8_640_000_000_000_000, description: "Parent-observed Unix milliseconds of the latest model/token/tool activity; retained after termination. Not a stall verdict." })),
@@ -55,7 +55,7 @@ export const ChildResultSchema = Type.Object({
   cwd: Type.String(),
   sessionFile: Type.Optional(Type.String({ description: "Child Pi session path for persist/resume, including failed runs. Startup failure may occur before the file is created." })),
   tools: Type.Array(Type.String()),
-  omittedFields: Type.Optional(Type.Array(StringEnum(["prompt", "cwd", "tools"] as const), {
+  omittedFields: Type.Optional(Type.Array(Type.Enum(["prompt", "cwd", "tools"] as const, { type: "string" }), {
     uniqueItems: true, description: "Context fields omitted to fit the response budget; empty placeholders are not execution values.",
   })),
   output: Type.Optional(Type.String({ description: "Final assistant report, or partial output for an incomplete/failed child." })),
@@ -67,13 +67,13 @@ export const ChildResultSchema = Type.Object({
   stderr: Type.String(),
   usage: UsageSchema,
   model: Type.Optional(Type.String()),
-  thinking: Type.Optional(StringEnum(THINKING_LEVELS, { description: "Effective effort verified at child startup." })),
-  notify: Type.Optional(StringEnum(["inbox", "turn"] as const, { description: "How completion is surfaced: inbox (next tool result) or turn (parent continuation)." })),
+  thinking: Type.Optional(Type.Enum(THINKING_LEVELS, { type: "string", description: "Effective effort verified at child startup." })),
+  notify: Type.Optional(Type.Enum(["inbox", "turn"] as const, { type: "string", description: "How completion is surfaced: inbox (next tool result) or turn (parent continuation)." })),
 }, { additionalProperties: false });
 
 /** One bounded envelope for tool details and structured results; notices carry handles only. */
 export const SubagentDetailsSchema = Type.Object({
-  command: StringEnum(["run", "spawn", "status", "wait", "stop", "steer"] as const),
+  command: Type.Enum(["run", "spawn", "status", "wait", "stop", "steer"] as const, { type: "string" }),
   results: Type.Array(ChildResultSchema),
   waitExpired: Type.Optional(Type.Boolean({ description: "Wait budget expired with no selected child complete; not a child timeout." })),
 }, { additionalProperties: false });

@@ -243,9 +243,16 @@ describe("compact child rendering", () => {
     const oversized = result("run", [{ ...child, output: "x".repeat(200000) }]);
     expect(renderChildResult(oversized, { expanded: true }, theme).render(80).join("\n").length).toBeLessThan(70000);
   });
+  test("fallback output uses the host-injected expansion key", () => {
+    const value = result("wait", []);
+    value.content = [{ type: "text", text: Array(8).fill("diagnostic line").join("\n") }];
+    const renderContext = { ...context({}), keyText: () => "alt+x" };
+    const text = renderChildResult(value, { expanded: false }, theme, renderContext).render(80).join("\n");
+    expect(text).toContain("alt+x to expand");
+  });
   test("readiness notices render safe text, never hidden reports", () => {
     const message = { role: "custom" as const, customType: "subagent-ready", content: "Ready: sa-1\u001b[31m. Use wait.", display: true, timestamp: 0, details: { handles: ["sa-1"] } };
-    const text = renderChildNotice(message, { expanded: false, outputPad: 1 }, theme)!.render(80).join("\n");
+    const text = renderChildNotice(message, { expanded: false, outputPad: 1, keyText: () => "", keyHint: () => "" }, theme)!.render(80).join("\n");
     expect(text).toContain("Ready: sa-1. Use wait.");
     expect(text).not.toContain("\u001b[31m");
   });

@@ -11,6 +11,8 @@ import { failed, isOutputTruncation } from "./types.ts";
 import type { ChildResult, UsageSummary } from "./types.ts";
 
 interface ChildRenderContext {
+  // Pi 1.3/1.4 do not inject keybinding hints.
+  keyText?: typeof keyText;
   expanded: boolean;
   args: { id?: unknown; ids?: unknown };
 }
@@ -129,15 +131,14 @@ export function renderChildCall(args: Record<string, unknown>, theme: Theme, con
   return container;
 }
 
-function renderOutput(text: string, expanded: boolean, theme: Theme): Component {
+function renderOutput(text: string, expanded: boolean, theme: Theme, expandKey = keyText("app.tools.expand")): Component {
   if (expanded) return new Markdown(text, 0, 0, getMarkdownTheme());
   const preview = new Text(text, 0, 0);
   return {
     render(width) {
       const lines = preview.render(width);
       if (lines.length <= 5) return lines;
-      const key = keyText("app.tools.expand");
-      return [...lines.slice(0, 5), truncateToWidth(theme.fg("dim", `… ${key ? `${key} to expand` : "expand for more"}`), width)];
+      return [...lines.slice(0, 5), truncateToWidth(theme.fg("dim", `… ${expandKey ? `${expandKey} to expand` : "expand for more"}`), width)];
     },
     invalidate() { preview.invalidate(); },
   };
@@ -232,7 +233,7 @@ export function renderChildResult(result: AgentToolResult<SubagentDetails>, { ex
   const rendered = renderChildren(result.details, expanded, theme, context?.args ? targetId(context.args) : undefined);
   if (rendered) return rendered;
   const text = result.content[0];
-  return renderOutput(text?.type === "text" && typeof text.text === "string" ? clean(text.text) : "(no output)", expanded, theme);
+  return renderOutput(text?.type === "text" && typeof text.text === "string" ? clean(text.text) : "(no output)", expanded, theme, context?.keyText?.("app.tools.expand"));
 }
 
 export const renderChildNotice: MessageRenderer = (message, { outputPad }) =>
