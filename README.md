@@ -145,7 +145,11 @@ RPC preserves the normal Pi CLI runtime while supporting steering and session co
 
 `0.0.x` is pre-release: tool schema and result shape are not promised across patch releases.
 
-- **Unreleased**: new children save recoverable sessions by default; use `persist: false` for ephemeral work. Results expose the effective phase deadline, and failed/interrupted reports retain bounded visible assistant text across messages rather than only the latest message. Activity now also distinguishes Pi retry backoff and compaction. Hard execution limits are unchanged.
+- **0.0.19**:
+  - **Migration:** children now save recoverable conversations by default, including prompts and tool results; use `persist: false` for ephemeral work.
+  - **Recovery:** results expose effective deadlines and interruption observations. Failed reports retain earlier visible work and authoritative completed text blocks, with truthful Unicode/truncation accounting. Activity distinguishes Pi retry backoff and compaction. Oversized batch details may explicitly omit session paths; inspect an individual child with `status` for its full path.
+  - **Compatibility:** support Pi 1.5 schemas and host keybindings while retaining Pi 1.3 support; preserve provider-billed usage totals and provenance.
+  - Hard execution limits are unchanged. No automatic wrap-up, retry, or budget extension is added.
 - **0.0.13**: replace the custom SDK child bootstrap with Pi's public RPC protocol. Add `steer`, persisted/resumable child sessions (`persist`, `resume`), and opt-in `trustProject`. Remove `jiti`, private Pi imports, and the custom fd-3 child protocol. Add an active-tool probe so missing tools fail before prompting. Wrap prompts and steering to prevent RPC command expansion, exclude all unselected tools from nested calls, preserve orderly child shutdown hooks, ignore oversized `agent_end` history, retain the latest partial report, and expose persisted session paths in model-facing text. Notices announce handles without consuming reports. Persisted sessions have exclusive ownership, startup operations share one deadline, and children inherit the ordinary process environment.
 
 ## Migrating from the SDK child
