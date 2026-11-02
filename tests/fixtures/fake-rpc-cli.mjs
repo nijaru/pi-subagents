@@ -94,10 +94,11 @@ function emitTask() {
     settle();
     return;
   }
-  if (scenario === "partial-after" || scenario === "partial-thinking") {
+  if (scenario === "partial-after" || scenario === "partial-thinking" || scenario === "partial-empty") {
     send({ type: "message_end", message: message("FIRST") });
     send({ type: "message_start", message: { role: "assistant", content: [] } });
     if (scenario === "partial-after") send({ type: "message_update", usage, assistantMessageEvent: { type: "text_delta", delta: "SECOND" } });
+    if (scenario === "partial-empty") send({ type: "message_end", message: message([{ type: "thinking", thinking: "PRIVATE_REASONING" }], "toolUse") });
     return;
   }
   if (scenario === "extension-error") {

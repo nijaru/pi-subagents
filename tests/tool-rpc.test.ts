@@ -39,7 +39,7 @@ function host() {
 }
 beforeEach(() => {
   process.env.PI_SUBAGENT_CLI = path.resolve(import.meta.dir, "fixtures/fake-rpc-cli.mjs");
-  delete process.env.PI_SUBAGENT_SESSION_DIR;
+  process.env.PI_SUBAGENT_SESSION_DIR = path.join(tempDir(), "sessions");
   delete process.env.PI_SUBAGENT_DEPTH;
 });
 afterEach(async () => {
@@ -58,6 +58,8 @@ describe("RPC-backed subagent tool", () => {
     expect(child.output).toBe("done");
     expect(child.model).toBe("parent/model");
     expect(child.thinking).toBe("high");
+    expect(child.sessionFile).toContain("sessions");
+    expect(child.deadline.phase).toBe("execution");
     expect(value.isError).toBe(false);
     expect(value.structuredContent).toEqual(value.details);
     const capture = JSON.parse(fs.readFileSync(path.join(fs.realpathSync.native(h.cwd), ".fake-rpc-capture.json"), "utf8"));
@@ -110,6 +112,7 @@ describe("RPC-backed subagent tool", () => {
       expect(response.structuredContent).toEqual(response.details);
       expect(response.content[0].text).toContain(`session: ${child.sessionFile}`);
       expect(response.content[0].text).toContain("last activity:");
+      expect(response.content[0].text).toContain("execution deadline:");
       expect(JSON.stringify(response)).not.toContain("PRIVATE_");
     }
   });

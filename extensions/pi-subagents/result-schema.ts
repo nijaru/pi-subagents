@@ -48,6 +48,11 @@ export const ChildResultSchema = Type.Object({
   timeoutPhase: Type.Optional(Type.Enum(["startup", "execution"] as const, { type: "string", description: "Which deadline expired for a timed_out result." })),
   cleanupMs: Type.Optional(Type.Integer({ minimum: 0, description: "Process-tree cleanup time excluded from the reported task runtime." })),
   taskFinishedAt: Type.Optional(Type.Number({ minimum: 0, description: "Leader exit or terminal-cause time, before cleanup." })),
+  deadline: Type.Optional(Type.Object({
+    phase: Type.Enum(["startup", "execution"] as const, { type: "string" }),
+    startedAt: Type.Integer({ minimum: 0, maximum: 8_640_000_000_000_000 }),
+    expiresAt: Type.Integer({ minimum: 0, maximum: 8_640_000_000_000_000 }),
+  }, { additionalProperties: false, description: "Effective phase deadline in Unix milliseconds, after defaults/environment resolution. Retained after termination; activity never extends it." })),
   lastActivityAt: Type.Optional(Type.Integer({ minimum: 0, maximum: 8_640_000_000_000_000, description: "Parent-observed Unix milliseconds of the latest model/token/tool activity; retained after termination. Not a stall verdict." })),
   activity: Type.Optional(ChildActivitySchema),
   currentTool: Type.Optional(Type.String({ maxLength: 256, pattern: "^[A-Za-z][A-Za-z0-9_.:-]*$", description: "An executing tool from the requested allowlist; one name when calls overlap. Name only; no arguments or results. Absent after execution stops." })),
@@ -58,7 +63,7 @@ export const ChildResultSchema = Type.Object({
   omittedFields: Type.Optional(Type.Array(Type.Enum(["prompt", "cwd", "tools"] as const, { type: "string" }), {
     uniqueItems: true, description: "Context fields omitted to fit the response budget; empty placeholders are not execution values.",
   })),
-  output: Type.Optional(Type.String({ description: "Final assistant report, or partial output for an incomplete/failed child." })),
+  output: Type.Optional(Type.String({ description: "Final assistant report on success; bounded visible assistant-text history on failure or interruption. Not a complete execution trace." })),
   outputTruncation: Type.Optional(OutputTruncationSchema),
   stdout: Type.Optional(Type.String({ description: "Diagnostic stdout; never the child protocol." })),
   startedAt: Type.Optional(Type.Number({ minimum: 0 })),

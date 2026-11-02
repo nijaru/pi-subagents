@@ -50,11 +50,11 @@ test("missing tools exhaust startup without submitting model work", async () => 
   expect(f.requests).toEqual([]);
 }, 20_000);
 
-test("failed persisted sessions recover their history only in the original workspace", async () => {
+test("failed default-persisted sessions recover their history only in the original workspace", async () => {
   using f = realRpcFixture((body) => ({ content: JSON.stringify(body.messages).includes("SECOND_MARKER") ? "OK" : "" }));
   const supervisor = new RpcChildSupervisor();
   const first = await supervisor.run({
-    task: { id: "persisted", prompt: "FIRST_MARKER", cwd: f.dir, tools: [], model: "fixture/model", persist: true, executionTimeoutMs: 10_000 },
+    task: { id: "persisted", prompt: "FIRST_MARKER", cwd: f.dir, tools: [], model: "fixture/model", executionTimeoutMs: 10_000 },
     signal: new AbortController().signal,
   });
   expect(first.outcome).toBe("failed");
@@ -78,6 +78,41 @@ test("failed persisted sessions recover their history only in the original works
   expect(JSON.stringify(f.requests[1].messages)).toContain("FIRST_MARKER");
   expect(JSON.stringify(f.requests[1].messages)).toContain("SECOND_MARKER");
   expect(JSON.stringify(f.requests[1].messages)).not.toContain("subagent-probe");
+}, 30_000);
+
+test("a timed-out default session resumes completed work without restarting its tool", async () => {
+  const blocked = Promise.withResolvers<{ content: string }>();
+  using f = realRpcFixture((body) => {
+    if (JSON.stringify(body.messages).includes("SECOND_MARKER")) return { content: "RESUMED" };
+    if (body.messages.some((message: any) => message.role === "tool")) return blocked.promise;
+    return { content: "EARLIER_FINDING", tool_calls: [{ index: 0, id: "read_call", type: "function", function: { name: "read", arguments: JSON.stringify({ path: "fixture.txt" }) } }] };
+  });
+  fs.writeFileSync(path.join(f.dir, "fixture.txt"), "COMPLETED_TOOL_RESULT");
+  const supervisor = new RpcChildSupervisor();
+  let first;
+  try {
+    first = await supervisor.run({
+      task: { id: "deadline-recovery", prompt: "FIRST_MARKER", cwd: f.dir, tools: ["read"], model: "fixture/model", executionTimeoutMs: 5_000 },
+      signal: new AbortController().signal,
+    });
+  } finally { blocked.resolve({ content: "TOO_LATE" }); }
+  expect(first.outcome).toBe("timed_out");
+  expect(first.timeoutPhase).toBe("execution");
+  expect(first.output).toBe("EARLIER_FINDING");
+  expect(fs.existsSync(first.sessionFile!)).toBe(true);
+  expect(f.requests).toHaveLength(2);
+  // A changed file makes replaying the completed read observable.
+  fs.writeFileSync(path.join(f.dir, "fixture.txt"), "CHANGED_AFTER_TIMEOUT");
+  const resumed = await supervisor.run({
+    task: { id: "deadline-resumed", prompt: "SECOND_MARKER", cwd: f.dir, tools: ["read"], model: "fixture/model", resume: first.sessionFile, executionTimeoutMs: 10_000 },
+    signal: new AbortController().signal,
+  });
+  expect(resumed.outcome).toBe("completed");
+  expect(resumed.output).toBe("RESUMED");
+  expect(f.requests).toHaveLength(3);
+  const replay = JSON.stringify(f.requests[2].messages);
+  for (const text of ["FIRST_MARKER", "EARLIER_FINDING", "COMPLETED_TOOL_RESULT", "SECOND_MARKER"]) expect(replay).toContain(text);
+  expect(replay).not.toContain("CHANGED_AFTER_TIMEOUT");
 }, 30_000);
 
 test("real RPC child finishes async session_shutdown hooks on normal completion", async () => {

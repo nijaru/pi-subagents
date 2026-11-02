@@ -51,6 +51,13 @@ export function runtimeLabel(result: ChildResult): string {
   return duration ? `${duration}${isRunning(result) ? " elapsed" : ""}` : "";
 }
 
+/** Absolute deadlines remain meaningful when a retained snapshot is read later. */
+export function deadlineSummary(result: ChildResult): string {
+  const deadline = result.deadline;
+  if (!deadline || (!isRunning(result) && !failed(result))) return "";
+  return `${deadline.phase} deadline: ${new Date(deadline.expiresAt).toISOString()} · budget ${formatElapsed(deadline.expiresAt - deadline.startedAt)}`;
+}
+
 /** Last observed activity stays truthful in old snapshots; successful reports omit it. */
 export function lastActivitySummary(result: ChildResult): string {
   if (result.lastActivityAt === undefined || (!isRunning(result) && !failed(result))) return "";
@@ -97,8 +104,8 @@ export function childSummary(result: ChildResult, includePrompt = true): string 
   const model = result.model ? `\nmodel: ${truncateOutput(result.model, 512)}${result.thinking ? ` · thinking: ${result.thinking}` : ""}` : "";
   const session = result.sessionFile ? `\nsession: ${truncateOutput(result.sessionFile, 1024)}` : "";
   const handle = result.handle ?? result.id;
-  const activity = activitySummary(result);
-  const head = `${handle} [${status}]${duration ? ` · ${duration}` : ""}${model}${session}${activity ? `\n${activity}` : ""}`;
+  const observations = [deadlineSummary(result), activitySummary(result)].filter(Boolean).join("\n");
+  const head = `${handle} [${status}]${duration ? ` · ${duration}` : ""}${model}${session}${observations ? `\n${observations}` : ""}`;
   return includePrompt ? `${head}\n${truncateOutput(result.prompt, 256)}` : head;
 }
 
@@ -109,7 +116,7 @@ export function childReports(results: ChildResult[], { includePrompt = true, max
   const heads = results.map((result) => {
     const head = childSummary(result, includePrompt);
     return !isRunning(result) && result.outputTruncation?.truncated
-      ? `${head}\nChild report truncated: ${result.outputTruncation.retainedBytes}/${result.outputTruncation.originalBytes} UTF-8 bytes retained; discarded text cannot be retrieved.`
+      ? `${head}\nChild report truncated: ${result.outputTruncation.retainedBytes}/${result.outputTruncation.originalBytes} UTF-8 bytes retained in this report; saved sessions may retain completed messages.`
       : head;
   });
   const outputs = results.map((result) => isRunning(result) ? "" : resultText(result));

@@ -1,9 +1,10 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { AssistantMessage, ModelThinkingLevel, StopReason, Usage } from "@earendil-works/pi-ai";
-import { boundedDiagnostic, truncateOutput, utf8Prefix } from "./bounds.ts";
+import { boundedDiagnostic } from "./bounds.ts";
+import { ChildTranscript } from "./transcript.ts";
 import { childEnvironment } from "./env.ts";
-import { MAX_OUTPUT_BYTES, RUNNING_PROGRESS_TEXT, processTimeoutMs, startupTimeoutMs } from "./limits.ts";
+import { RUNNING_PROGRESS_TEXT, processTimeoutMs, startupTimeoutMs } from "./limits.ts";
 import { timeoutSummary, withCredentialHint } from "./reports.ts";
 import { cleanupChild, hasExited, spawnDeathWatchdog } from "./process-tree.ts";
 import { addUsage, copyUsage, emptyUsage, isUsage, textFromMessage, type ChildActivity, type ChildResult } from "./types.ts";
@@ -29,7 +30,7 @@ export interface ChildTask {
 
 /** Execution facts; the session registry owns handles, admission and delivery. */
 export type ChildExecutionData = Pick<ChildResult,
-  "startedAt" | "taskFinishedAt" | "lastActivityAt" | "activity" | "currentTool" | "phase" | "model" | "thinking" | "usage" | "output" | "outputTruncation" | "stdout" | "stderr" | "errorMessage" | "sessionFile"
+  "startedAt" | "taskFinishedAt" | "deadline" | "lastActivityAt" | "activity" | "currentTool" | "phase" | "model" | "thinking" | "usage" | "output" | "outputTruncation" | "stdout" | "stderr" | "errorMessage" | "sessionFile"
 >;
 export interface ChildControl { steer(message: string, signal?: AbortSignal): Promise<void>; }
 export interface ChildRunRequest {
@@ -89,7 +90,7 @@ export class RpcChildSupervisor implements ChildSupervisor {
     const startedAt = Date.now();
     const startupBudget = task.startupTimeoutMs ?? startupTimeoutMs();
     const data: ChildExecutionData = { phase: "starting", startedAt, stderr: "", usage: emptyUsage() };
-    const snapshot = (): ChildExecutionData => ({ ...data, usage: copyUsage(data.usage), outputTruncation: data.outputTruncation ? { ...data.outputTruncation } : undefined });
+    const snapshot = (): ChildExecutionData => ({ ...data, deadline: data.deadline ? { ...data.deadline } : undefined, usage: copyUsage(data.usage), outputTruncation: data.outputTruncation ? { ...data.outputTruncation } : undefined });
     let lastPublish = 0;
     const publish = (progress?: string) => {
       if (progress !== undefined) lastPublish = Date.now();
@@ -121,8 +122,7 @@ export class RpcChildSupervisor implements ChildSupervisor {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let watchdog: ChildProcess | undefined;
     let assistant: AssistantMessage | undefined;
-    let streaming = "";
-    let streamingBytes = 0;
+    const transcript = new ChildTranscript();
     let assistantOpen = false;
     let streamingUsage: Usage | undefined;
     // Counts by allowlisted name handle parallel/nested calls without retaining
@@ -146,18 +146,11 @@ export class RpcChildSupervisor implements ChildSupervisor {
     const fail = (error: Error) => stop({ kind: "failure", startup: phase === "starting", message: boundedDiagnostic(error.message) ?? "Child RPC failed." });
     const armDeadline = (which: "startup" | "execution", start: number, budget: number) => {
       if (timer) clearTimeout(timer);
-      timer = setTimeout(() => stop({ kind: "deadline", phase: which, budget, elapsed: Date.now() - start }), Math.max(1, start + budget - Date.now()));
+      data.deadline = { phase: which, startedAt: start, expiresAt: start + budget };
+      timer = setTimeout(() => stop({ kind: "deadline", phase: which, budget, elapsed: Date.now() - start }), Math.max(1, data.deadline.expiresAt - Date.now()));
       timer.unref?.();
     };
-    const updateOutput = () => {
-      const current = assistantOpen && streamingBytes > 0;
-      const text = current ? streaming : assistant ? textFromMessage(assistant) : streaming;
-      const bytes = current ? streamingBytes : Buffer.byteLength(text);
-      data.output = truncateOutput(text, MAX_OUTPUT_BYTES, bytes);
-      data.outputTruncation = bytes > Buffer.byteLength(data.output) ? {
-        truncated: true, originalBytes: bytes, retainedBytes: Buffer.byteLength(data.output),
-      } : undefined;
-    };
+    const updateOutput = (includeHistory = false) => Object.assign(data, transcript.snapshot(includeHistory));
     const recordActivity = (kind?: ChildActivity) => {
       const previousActivity = data.activity, previousTool = data.currentTool;
       const now = Date.now();
@@ -183,7 +176,7 @@ export class RpcChildSupervisor implements ChildSupervisor {
         case "turn_start": recordActivity("model"); break;
         case "message_start":
           if (event.message?.role === "assistant") {
-            streaming = ""; streamingBytes = 0; streamingUsage = undefined; assistantOpen = true;
+            transcript.start(); streamingUsage = undefined; assistantOpen = true;
             recordActivity("model");
           }
           break;
@@ -193,8 +186,7 @@ export class RpcChildSupervisor implements ChildSupervisor {
             const delta = event.assistantMessageEvent.delta;
             if (typeof delta !== "string") throw new Error("Child RPC emitted a malformed text delta.");
             assistantOpen = true;
-            streamingBytes += Buffer.byteLength(delta);
-            streaming = utf8Prefix(streaming + delta, MAX_OUTPUT_BYTES * 2);
+            transcript.append(delta);
           }
           // Classify the wire event, never copy its thinking/argument content.
           switch (event.assistantMessageEvent?.type) {
@@ -224,6 +216,7 @@ export class RpcChildSupervisor implements ChildSupervisor {
           if (event.message?.role === "assistant") {
             assistantOpen = false;
             assistant = event.message;
+            transcript.finish(textFromMessage(assistant));
             data.usage.turns++;
             if (isUsage(assistant.usage)) addUsage(data.usage, assistant.usage);
             else if (streamingUsage) addUsage(data.usage, streamingUsage);
@@ -342,6 +335,7 @@ export class RpcChildSupervisor implements ChildSupervisor {
       outcome.errorKind = "cleanup";
       outcome.errorMessage = [outcome.errorMessage, cleanup.error, !hasExited(child) && data.sessionFile ? "Session ownership lock retained." : undefined].filter(Boolean).join("\n");
     }
+    if (outcome.outcome !== "completed") updateOutput(true);
     return { ...snapshot(), ...outcome };
   }
 }

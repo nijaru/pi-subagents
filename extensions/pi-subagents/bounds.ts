@@ -122,6 +122,7 @@ export function minimalChildResult(result: ChildResult): ChildResult {
     ...(result.timeoutPhase === undefined ? {} : { timeoutPhase: result.timeoutPhase }),
     ...(result.cleanupMs === undefined ? {} : { cleanupMs: result.cleanupMs }),
     ...(result.taskFinishedAt === undefined ? {} : { taskFinishedAt: result.taskFinishedAt }),
+    ...(result.deadline === undefined ? {} : { deadline: { ...result.deadline } }),
     ...(result.lastActivityAt === undefined ? {} : { lastActivityAt: result.lastActivityAt }),
     ...(result.activity === undefined ? {} : { activity: result.activity }),
     ...(result.currentTool === undefined ? {} : { currentTool: result.currentTool }),

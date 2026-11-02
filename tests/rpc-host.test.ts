@@ -12,7 +12,7 @@ function tempDir(): string {
   return dir;
 }
 function task(cwd: string, extra: Partial<ChildTask> = {}): ChildTask {
-  return { id: "run-1", prompt: "inspect", cwd, tools: ["read"], model: "fixture/model", thinking: "high", ...extra };
+  return { id: "run-1", prompt: "inspect", cwd, tools: ["read"], model: "fixture/model", thinking: "high", persist: false, ...extra };
 }
 function run(task: ChildTask, signal = new AbortController().signal, onUpdate?: any, onControl?: (control: ChildControl) => void) {
   return new RpcChildSupervisor().run({ task, signal, onUpdate, onControl });
@@ -100,6 +100,23 @@ describe("public RPC child host", () => {
     });
   });
 
+  test("saves sessions by default and exposes the effective phase deadline", async () => {
+    const sessionDir = path.join(tempDir(), "sessions");
+    process.env.PI_SUBAGENT_SESSION_DIR = sessionDir;
+    const updates: ChildExecutionData[] = [];
+    const result = await run(task(tempDir(), { persist: undefined, executionTimeoutMs: 1_000, startupTimeoutMs: 2_000 }), undefined,
+      (data: ChildExecutionData) => updates.push(data));
+    expect(result.sessionFile).toBe(path.join(fs.realpathSync.native(path.dirname(sessionDir)), "sessions", "run-1.jsonl"));
+    const starting = updates.find(data => data.deadline?.phase === "startup")!;
+    const running = updates.find(data => data.phase === "running")!;
+    expect(starting.deadline!.expiresAt - starting.deadline!.startedAt).toBe(2_000);
+    expect(running.deadline!.expiresAt - running.deadline!.startedAt).toBe(1_000);
+    expect(result.deadline).toEqual(running.deadline);
+    expect(result.deadline!.startedAt).toBeGreaterThanOrEqual(starting.deadline!.startedAt);
+    running.deadline!.expiresAt = 0;
+    expect(result.deadline!.expiresAt).toBeGreaterThan(0);
+  });
+
   test("keeps persisted sessions when requested", async () => {
     const dir = tempDir();
     const sessionDir = path.join(tempDir(), "sessions");
@@ -119,6 +136,14 @@ describe("public RPC child host", () => {
     expect(result.timeoutPhase).toBe("execution");
     expect(result.output).toBe("partial");
     expect(result.errorMessage).toContain("Subagent timed out during execution");
+  });
+
+  test("reports the environment-resolved execution deadline without extending it on activity", async () => {
+    process.env.PI_SUBAGENT_TIMEOUT_MS = "100";
+    const result = await run(task(tempDir(), { prompt: "SCENARIO=slow" }));
+    expect(result.outcome).toBe("timed_out");
+    expect(result.deadline!.expiresAt - result.deadline!.startedAt).toBe(100);
+    expect(result.taskFinishedAt).toBeGreaterThanOrEqual(result.deadline!.expiresAt);
   });
 
   test("times out startup before get_state", async () => {
@@ -231,7 +256,7 @@ test("wraps the task prompt so leading slash commands stay literal", async () =>
   expect(fs.readFileSync(path.join(fs.realpathSync.native(dir), ".fake-rpc-prompt"), "utf8")).toBe("Task:\n\n/capture hello");
 });
 
-test.each([["partial-after", "SECOND"], ["partial-thinking", "FIRST"]])("interrupted %s retains the latest available text", async (scenario, expected) => {
+test.each([["partial-after", "FIRST\n\nSECOND"], ["partial-thinking", "FIRST"], ["partial-empty", "FIRST"]])("interrupted %s retains earlier work and any open text", async (scenario, expected) => {
   const dir = tempDir();
   const result = await run(task(dir, { prompt: `SCENARIO=${scenario}`, executionTimeoutMs: 100 }));
   expect(result.outcome).toBe("timed_out");

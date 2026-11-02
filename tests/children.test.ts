@@ -50,6 +50,7 @@ describe("session ownership", () => {
       result.tools.push("write");
       result.output = "rewritten";
       result.lastActivityAt = 999;
+      if (result.deadline) result.deadline.expiresAt = 999;
       result.activity = "thinking";
       result.currentTool = "write";
       result.usage.input = 999;
@@ -62,6 +63,7 @@ describe("session ownership", () => {
     const data = c.executions[0]!;
     data.output = "done";
     data.lastActivityAt = 10;
+    data.deadline = { phase: "execution", startedAt: 1, expiresAt: 11 };
     data.activity = "tool";
     data.currentTool = "read";
     data.usage.input = 5;
@@ -70,11 +72,13 @@ describe("session ownership", () => {
     expect(c.children.snapshot(run)).toMatchObject({
       prompt: "original task", tools: ["read"], output: "done", state: { status: "running" },
       lastActivityAt: 10, activity: "tool", currentTool: "read",
+      deadline: { phase: "execution", startedAt: 1, expiresAt: 11 },
       usage: { input: 5, cost: { total: 1 } },
     });
     data.output = "later backend update";
     data.lastActivityAt = 12;
-    expect(c.children.snapshot(run)).toMatchObject({ output: "done", lastActivityAt: 10 });
+    data.deadline.expiresAt = 12;
+    expect(c.children.snapshot(run)).toMatchObject({ output: "done", lastActivityAt: 10, deadline: { expiresAt: 11 } });
     c.gates[0]!.resolve();
     await run.promise;
     data.usage.input = 999;

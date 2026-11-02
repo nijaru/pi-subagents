@@ -18,7 +18,7 @@ function child(id = "child-1"): ChildResult {
 
 describe("serialized result bounds", () => {
   test("session and deadline metadata survive both result envelopes", () => {
-    const metadata = { lastActivityAt: 2, sessionFile: "/tmp/session.jsonl", taskFinishedAt: 3, cleanupMs: 1, errorKind: "deadline" as const, timeoutPhase: "startup" as const };
+    const metadata = { deadline: { phase: "execution" as const, startedAt: 1, expiresAt: 3 }, lastActivityAt: 2, sessionFile: "/tmp/session.jsonl", taskFinishedAt: 3, cleanupMs: 1, errorKind: "deadline" as const, timeoutPhase: "startup" as const };
     const result = { ...child(), ...metadata,
       state: { status: "terminal", outcome: "timed_out", exitCode: 1, finishedAt: 4 } as const };
     expect(minimalChildResult(result)).toMatchObject(metadata);
@@ -28,7 +28,7 @@ describe("serialized result bounds", () => {
   });
 
   test("live activity pays for space in minimal and 32-child envelopes without stale truncation counts", () => {
-    const metadata = { lastActivityAt: 1_700_000_000_000, activity: "tool" as const, currentTool: "a".repeat(256) };
+    const metadata = { deadline: { phase: "execution" as const, startedAt: 1_700_000_000_000, expiresAt: 1_700_001_800_000 }, lastActivityAt: 1_700_000_000_000, activity: "tool" as const, currentTool: "a".repeat(256) };
     const results = Array.from({ length: 32 }, (_, index) => ({ ...child(`child-${index}`), ...metadata, state: { status: "running" } as const }));
     const minimal = minimalChildResult(results[0]!);
     expect(minimal).toMatchObject(metadata);

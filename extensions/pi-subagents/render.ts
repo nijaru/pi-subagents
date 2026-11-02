@@ -3,7 +3,7 @@ import { getMarkdownTheme, keyText } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { truncateHeadTail, truncateOutput } from "./bounds.ts";
 import { MAX_OUTPUT_BYTES, MAX_RETAINED_RUNS } from "./limits.ts";
-import { activitySummary, formatElapsed, isTimeoutSummary, lastActivitySummary, resultText, runtimeLabel } from "./reports.ts";
+import { activitySummary, deadlineSummary, formatElapsed, isTimeoutSummary, lastActivitySummary, resultText, runtimeLabel } from "./reports.ts";
 import type { SubagentDetails } from "./types.ts";
 import { Check } from "typebox/value";
 import { ChildResultSchema } from "./result-schema.ts";
@@ -184,6 +184,8 @@ function renderChildren(details: unknown, expanded: boolean, theme: Theme, targe
       // The heading already carries live activity; expansion adds only the last time.
       const activity = active && child.activity ? lastActivitySummary(child) : activitySummary(child);
       if (activity) container.addChild(new Text(theme.fg("dim", clean(activity, 512)), 0, 0));
+      const deadline = deadlineSummary(child);
+      if (deadline) container.addChild(new Text(theme.fg("dim", deadline), 0, 0));
       // Status/wait/stop rows need task labels; run/spawn/steer payloads are in their call header.
       if (data?.command !== "run" && data?.command !== "spawn" && data?.command !== "steer") {
         container.addChild(new Text(theme.fg("dim", child.omittedFields?.includes("prompt") ? "Task prompt omitted to fit the response budget." : clean(child.prompt, 8192)), 0, 0));

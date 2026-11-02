@@ -71,7 +71,7 @@ export function getRpcInvocation(task: ChildTask): RpcInvocation {
     if (fs.realpathSync.native(savedCwd) !== fs.realpathSync.native(task.cwd)) {
       throw new Error(`Session workspace ${savedCwd} does not match requested cwd ${task.cwd}; resume in its original directory or start a new session.`);
     }
-  } else if (task.persist) {
+  } else if (task.persist !== false) {
     const root = process.env.PI_SUBAGENT_SESSION_DIR
       ? path.resolve(process.env.PI_SUBAGENT_SESSION_DIR)
       : path.join(getAgentDir(), "subagents", "sessions");

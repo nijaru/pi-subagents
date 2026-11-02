@@ -30,6 +30,7 @@ Stay on `0.0.x`: bump only the patch component when preparing an authorized rele
 - `params.ts`: command/tool policy, tool selection, resume/persist validation, and cwd resolution.
 - `reports.ts`: bounded model-facing summaries shared by joins and notices, including persisted session paths.
 - `result-schema.ts`, `types.ts`: parent-facing schema, schema-derived types, snapshots, usage, and validators.
+- `transcript.ts`: bounded visible assistant-text history; successful results use the final report, failures retain partial work across messages.
 - `bounds.ts`, `limits.ts`, `render.ts`: output/resource bounds and TUI rendering.
 - `tests/`: deterministic fake-RPC lifecycle tests plus a real Pi CLI/public-protocol integration test with a local mock provider.
 
