@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
-import { ChildRpc, type ChildEvent } from "../extensions/pi-subagents/rpc.ts";
+import { ChildRpc, MAX_RPC_PENDING, MAX_RPC_WRITE_BYTES, type ChildEvent } from "../extensions/pi-subagents/rpc.ts";
 import { MAX_PROTOCOL_LINE_BYTES, MAX_STDERR_BYTES } from "../extensions/pi-subagents/limits.ts";
 
 function fixture() {
@@ -44,6 +44,47 @@ test("correlates out-of-order responses and removes cancelled command waits", as
     expect((await one).data.sessionId).toBe("first");
     expect((await two).data.sessionId).toBe("second");
     expect(f.failures).toEqual([]);
+  } finally { f.close(); }
+});
+
+test("bounds outstanding commands without dropping existing response owners", async () => {
+  const f = fixture();
+  try {
+    const pending = Array.from({ length: MAX_RPC_PENDING }, () => f.rpc.request({ type: "get_state" }));
+    await expect(f.rpc.request({ type: "get_state" })).rejects.toMatchObject({ acceptance: "not_sent" });
+    expect(f.commands).toHaveLength(MAX_RPC_PENDING);
+    for (const command of f.commands) f.send({ type: "response", id: command.id, command: "get_state", success: true, data: { sessionId: command.id } });
+    expect(await Promise.all(pending)).toHaveLength(MAX_RPC_PENDING);
+  } finally { f.close(); }
+});
+
+test("abandoned response waits cannot bypass backpressured write budgets", async () => {
+  const stdin = new Writable({ write(_chunk, _encoding, _callback) { /* Keep the write buffered. */ } });
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const rpc = new ChildRpc({ stdin, stdout, stderr } as unknown as ChildProcess, () => {}, () => {});
+  try {
+    const signal = new AbortController();
+    const pending = rpc.request({ type: "steer", message: "x".repeat(MAX_RPC_WRITE_BYTES - 256) }, 1000, signal.signal);
+    signal.abort();
+    await expect(pending).rejects.toMatchObject({ acceptance: "unknown" });
+    await expect(rpc.request({ type: "steer", message: "x".repeat(512) })).rejects.toMatchObject({ acceptance: "not_sent" });
+  } finally { rpc.close(); stdin.destroy(); stdout.destroy(); stderr.destroy(); }
+});
+
+test("a lost steering acknowledgment reports uncertainty without resending applied work", async () => {
+  const f = fixture();
+  try {
+    const signal = new AbortController();
+    let applied = 0;
+    f.stdin.on("data", () => { applied++; signal.abort(); });
+    await expect(f.rpc.request({ type: "steer", message: "change focus" }, 1000, signal.signal))
+      .rejects.toMatchObject({ acceptance: "unknown", message: expect.stringContaining("Do not resend automatically") });
+    expect(applied).toBe(1);
+    expect(f.commands).toHaveLength(1);
+    await expect(f.rpc.request({ type: "steer", message: "must not send" }, 1000, signal.signal))
+      .rejects.toMatchObject({ acceptance: "not_sent" });
+    expect(f.commands).toHaveLength(1);
   } finally { f.close(); }
 });
 

@@ -37,7 +37,7 @@ Every child gets a short session-scoped handle (`sa-<n>`). `wait`, `status`, `st
 {"command":"wait","ids":["sa-4821"]}
 ```
 
-`run` is the synchronous convenience: it starts and joins. `spawn` is the background form. A `run` whose join expires returns a running handle; it does not stop the child. Cancelling a `run` call cancels its child; cancelling a `wait` leaves children running.
+`run` is the synchronous convenience: it starts and joins. `spawn` is the background form. A `run` whose join expires returns a running handle; it does not stop the child. Cancelling a `run` call cancels its child and joins cleanup, even beyond the join budget; cancelling a `wait` leaves children running.
 
 Task prompts are wrapped in a `Task:` envelope and steering messages in a `Steering instruction:` envelope before they reach RPC. This prevents RPC from interpreting a leading `/command`, `/skill:...`, or `/template` as a child command. The task content itself is otherwise unchanged.
 
@@ -75,8 +75,8 @@ At startup/execution expiry the child is stopped and its result retains bounded 
 - **Public RPC boundary.** The child is spawned as `pi --mode rpc`; the parent speaks only the documented JSONL protocol. No `jiti`, no SDK bootstrap, and no private Pi module imports.
 - **Exact startup checks.** After session restoration and extension startup, the parent explicitly sets the requested model, then effort, through RPC. Unsupported explicit effort fails before model work. A private readiness command and typed custom session entry verify the active tool set; a final `get_state` verifies the effective model and explicit effort before the task is submitted. The child probe also blocks calls outside the allowlist. Tool registration shares the caller's startup deadline, with no separate ten-second cap. Missing tools exhaust startup without submitting the task.
 - **Full Pi configuration.** The child loads its own settings, extensions, skills, MCP servers, and project instructions. A fresh conversation does not mean an empty system prompt.
-- **Isolation.** Each child runs in its own detached process group. A detached watchdog terminates the group if the parent dies without running shutdown hooks. Normal completion closes child stdin and waits for orderly Pi shutdown before ending the watchdog and sweeping descendants; cancellation and timeouts stop the tree promptly. The concurrency slot is held until cleanup finishes.
-- **Steering.** Steering messages use the RPC `steer` command and are delivered after the current assistant turn's tool calls. A call made during startup joins the same readiness outcome; it does not introduce another timeout. Cancelling the call stops waiting, not the child. Once sent, a queued instruction cannot be recalled through this tool. Queue acceptance does not mean delivery: a deadline can stop the child first, and undelivered steering is not restored by resuming a saved conversation.
+- **Isolation.** Each child runs in its own detached process group. A detached watchdog terminates the group if the parent dies without running shutdown hooks. Normal completion closes child stdin and waits for orderly Pi shutdown before ending the watchdog and sweeping descendants; cancellation and timeouts stop the tree promptly. The concurrency slot is held through confirmed cleanup; an unconfirmed cleanup keeps it reserved.
+- **Steering.** Steering messages use the RPC `steer` command and are delivered after the current assistant turn's tool calls. A call made during startup joins the same readiness outcome; it does not introduce another timeout. Cancelling the call stops waiting, not the child. Once sent, an instruction cannot be recalled through this tool. A cancelled or lost acknowledgment has unknown acceptance: the instruction may already have taken effect, so do not resend automatically. Queue acceptance does not mean delivery: a deadline can stop the child first, and undelivered steering is not restored by resuming a saved conversation.
 - **Persistence.** New children save their session by default; `persist: false` disables retention. The session is stored under the agent directory (`~/.pi/agent/subagents/sessions/<id>.jsonl` by default) and returns `sessionFile`. `resume: "sa-4821"` continues a stopped child's saved conversation with a new handle and defaults to its original `cwd`. `resume: "<path>"` supports recovery after handles are cleared or the parent restarts. Explicit paths require the session's original `cwd`; a mismatched workspace or the active parent session is rejected before launch. Relative resume paths resolve against the parent cwd. The path appears in the model-facing `run`/`spawn`/`wait`/`status` text as well as details, including on failure. After the child stops, continue with a focused prompt. Resume follows normal launch rules for tools, model, effort, and trust; it does not inherit those options from the old handle. `persist` and `resume` cannot be supplied together. Inspect saved history and any external tool effects before resuming failed mutating work; a saved conversation does not roll those effects back. A tool can apply a mutation and be interrupted before its result is saved. Pi may supply a synthetic missing-result error on resume to satisfy provider message ordering; this does not establish whether the operation happened. Saved Pi conversations may contain sensitive prompts and tool results and are not full token traces; failed startup can return a path before any session file exists.
 - **Trust.** RPC mode cannot show Pi's project-trust prompt. Project-local resources are skipped unless a saved decision applies or the call sets `trustProject: true`, which passes `--approve` to the child. Parent permission state is not inherited.
 
@@ -88,7 +88,9 @@ The child is a full Pi process, so extensions and a child with shell access can 
 
 Persisted and resumed sessions have an exclusive, cooperative `<sessionFile>.subagent-lock` held from before launch through cleanup. Competing subagent parents reject contention rather than queueing. These locks do not protect against an ordinary Pi process opening the same file; do not open a session elsewhere while a child owns it.
 
-Normal completion, cancellation, and failed startup release ownership after the child exits. A hard parent crash or unconfirmed cleanup leaves the lock in place. Locks never expire automatically: verify that the old child has stopped before manually removing an orphaned lock. The lock records the parent PID and child run ID. This conservative recovery avoids allowing two writers while an old child is still alive.
+Normal completion, cancellation, and failed startup release ownership only after confirmed cleanup; leader exit alone is insufficient. A hard parent crash or unconfirmed cleanup leaves the lock in place. Confirmation covers the managed root group and captured descendants, not all possible external effects. If the leader exits before its descendant tree can be observed, cleanup is unconfirmed rather than assumed safe. Locks never expire automatically: verify that the old child has stopped before manually removing an orphaned lock. The lock records the parent PID and child run ID. This conservative recovery avoids allowing two writers while an old child is still alive.
+
+Terminal reports expose `cleanup.status`: `confirmed` or `unconfirmed`. Unconfirmed cleanup retains the admission slot and any session lease, even after the report is collected. Such handles cannot be resumed, cleared, or evicted in that parent session. `cleanup.taskOutcome` preserves the outcome before cleanup; a completed task becomes a failed execution if cleanup cannot be confirmed, while timeout/provider causes remain primary. Reconcile process and workspace state before recovery; a new parent session clears handle reservations, not orphaned lock files.
 
 ## Tools and context
 
@@ -104,7 +106,7 @@ Explicit tools must be active or callable in the parent and are passed to the ch
 
 | Resource | Limit |
 | --- | --- |
-| Active children | 4 per parent session; excess starts are rejected |
+| Admission slots | 4 per parent session, including cleanup-unconfirmed children; excess starts are rejected |
 | Retained handles | 32; oldest completed, read handles are evicted first; unread results are never evicted |
 | Startup | 30 seconds by default, up to 5 minutes |
 | Execution | 30 minutes by default, up to 2 hours |
@@ -113,7 +115,7 @@ Explicit tools must be active or callable in the parent and are passed to the ch
 | Tool response and details | 50 KiB each |
 | Child stderr | 50 KiB, keeping both ends |
 
-Child reports remain bounded in memory; they are not spilled to disk. `outputTruncation` records shortened UTF-8 output. A persisted session is separate from that report.
+Child reports remain bounded in memory; they are not spilled to disk. Text, structured results, and renderer details derive from the same budgeted report view. `outputTruncation` records shortened UTF-8 output. Launch metadata omitted for space is absent and listed in `omittedFields`, not replaced with empty values. Session paths are whole or absent; inspect one child with `status` for an omitted path. A persisted session is separate from that report.
 
 ## Usage
 
@@ -152,6 +154,10 @@ RPC preserves the normal Pi CLI runtime while supporting steering and session co
 ## Migration
 
 ### Unreleased
+
+- Result consumers must stop reading synthetic `state.exitCode` and unused `stdout`; use `state.outcome`, `errorKind`, and `stderr`. Optional `cleanup` describes resource disposition separately from the task outcome.
+- Budget-omitted `prompt`, `cwd`, and `tools` are now absent rather than empty placeholders. `omittedFields` identifies omitted launch metadata or session paths. Model text and structured results use the same report excerpt.
+- Cleanup-unconfirmed children retain admission and session ownership even after collection. They are not resumable or eligible for clearing/eviction in that parent session.
 
 - Remove `notify` from calls. All unread completions now use active-boundary announcements with inbox fallback, without waking idle parents. Notices still require `wait` to collect reports.
 - Successful `output` may contain several completed answers from one execution, separated by blank lines, rather than only the last answer after steering. It remains bounded; inspect `outputTruncation` for loss.

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { RpcChildSupervisor, type ChildControl } from "../extensions/pi-subagents/supervisor.ts";
+import { runChild, type ExecutionControl } from "./fixtures/run-child.ts";
 import { realRpcFixture } from "./fixtures/real-rpc.ts";
 
 function installTool(dir: string, execute: string) {
@@ -18,7 +18,7 @@ test("execution cutoff distinguishes real Pi retry backoff from an idle model", 
     enabled: true, maxRetries: 1, baseDelayMs: 10_000, maxAgentDelayMs: 10_000,
     provider: { maxRetries: 0 },
   } }));
-  const result = await new RpcChildSupervisor().run({
+  const result = await runChild({
     task: { id: "retry-backoff", prompt: "Report the answer.", cwd: f.dir, tools: [], model: "fixture/model", executionTimeoutMs: 2_000 },
     signal: new AbortController().signal,
   });
@@ -40,7 +40,7 @@ test("execution cutoff distinguishes automatic compaction from an idle model", a
   });
   fs.writeFileSync(path.join(f.dir, "settings.json"), JSON.stringify({ compaction: { enabled: true, keepRecentTokens: 1 } }));
   const abort = new AbortController();
-  const pending = new RpcChildSupervisor().run({
+  const pending = runChild({
     task: { id: "automatic-compaction", prompt: "Report the answer.", cwd: f.dir, tools: [], model: "fixture/model", executionTimeoutMs: 2_000 },
     signal: abort.signal,
   });
@@ -78,7 +78,7 @@ test("interruption retains authoritative text blocks from the real Responses str
   const models = JSON.parse(fs.readFileSync(modelsFile, "utf8"));
   models.providers.fixture.api = "openai-responses";
   fs.writeFileSync(modelsFile, JSON.stringify(models));
-  const result = await new RpcChildSupervisor().run({
+  const result = await runChild({
     task: { id: "authoritative-text", prompt: "Report the answer.", cwd: f.dir, tools: [], model: "fixture/model", executionTimeoutMs: 2_000 },
     signal: new AbortController().signal,
   });
@@ -92,7 +92,7 @@ const call = { tool_calls: [{ index: 0, id: "controlled_call", type: "function",
 test("real steering waits for both the current model response and its tool batch", async () => {
   const requested = Promise.withResolvers<void>();
   const response = Promise.withResolvers<typeof call>();
-  const ready = Promise.withResolvers<ChildControl>();
+  const ready = Promise.withResolvers<ExecutionControl>();
   const toolStarted = Promise.withResolvers<void>();
   using f = realRpcFixture((body) => {
     if (body.messages.some((message: any) => message.role === "tool")) return { content: "STEERED" };
@@ -101,10 +101,10 @@ test("real steering waits for both the current model response and its tool batch
   });
   installTool(f.dir, `fs.writeFileSync("effect", "applied"); while (!fs.existsSync("release")) await delay(10); return { content: [{ type: "text", text: "TOOL_FINISHED" }] };`);
   const abort = new AbortController();
-  const run = new RpcChildSupervisor().run({
+  const run = runChild({
     task: { id: "steer-boundaries", prompt: "Perform the controlled operation.", cwd: f.dir, tools: ["controlled"], model: "fixture/model", executionTimeoutMs: 10_000 },
     signal: abort.signal,
-    onControl: ready.resolve,
+    onReady: ready.resolve,
     onUpdate: (data) => { if (data.currentTool === "controlled") toolStarted.resolve(); },
   });
   try {
@@ -138,13 +138,13 @@ test("timeout can leave an applied mutation without a saved tool result; resume 
   // Deliberately ignore cancellation after the side effect, like an external
   // service that has committed a request before the client receives its reply.
   installTool(f.dir, `fs.appendFileSync("effect", "applied\\n"); await delay(60_000); return { content: [{ type: "text", text: "TOOL_FINISHED" }] };`);
-  const supervisor = new RpcChildSupervisor();
-  const ready = Promise.withResolvers<ChildControl>();
+  const run = runChild;
+  const ready = Promise.withResolvers<ExecutionControl>();
   const toolStarted = Promise.withResolvers<void>();
-  const pending = supervisor.run({
+  const pending = run({
     task: { id: "uncertain-effect", prompt: "Perform the controlled operation.", cwd: f.dir, tools: ["controlled"], model: "fixture/model", executionTimeoutMs: 3_000 },
     signal: new AbortController().signal,
-    onControl: ready.resolve,
+    onReady: ready.resolve,
     onUpdate: (data) => { if (data.currentTool === "controlled") toolStarted.resolve(); },
   });
   await toolStarted.promise;
@@ -158,7 +158,7 @@ test("timeout can leave an applied mutation without a saved tool result; resume 
   expect(entries.some((entry) => entry.message?.role === "assistant" && entry.message.content.some((block: any) => block.type === "toolCall" && block.name === "controlled"))).toBe(true);
   expect(entries.some((entry) => entry.message?.role === "toolResult")).toBe(false);
   expect(JSON.stringify(entries)).not.toContain("WRAP_UP_MARKER");
-  const resumed = await supervisor.run({
+  const resumed = await run({
     task: { id: "reconcile-effect", prompt: "RECOVERY_MARKER: inspect the existing effect before deciding whether to retry.", cwd: f.dir, tools: ["controlled"], model: "fixture/model", resume: first.sessionFile, executionTimeoutMs: 10_000 },
     signal: new AbortController().signal,
   });

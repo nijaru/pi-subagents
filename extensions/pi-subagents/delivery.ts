@@ -7,21 +7,40 @@ export class CompletionDelivery {
   private closed = false;
   // Latched for the external run: successful automatic retries do not rearm it.
   private suppressDelivery = false;
+  private readonly attempted = new Set<string>();
+  private readonly advertised = new Set<string>();
 
   constructor(private readonly children: SessionChildren) {}
 
   bind(ctx: ExtensionContext): void { this.ctx = ctx; }
 
+  private prune(): void {
+    for (const set of [this.attempted, this.advertised]) {
+      for (const id of set) if (!this.children.has(id)) set.delete(id);
+    }
+  }
+
   refreshStatus(): void {
     if (this.closed) return;
-    const count = this.children.unreadCompletionCount();
+    this.prune();
+    const count = this.children.unread().length;
     try { this.ctx?.ui?.setStatus("subagents", count ? `${count} unread child result${count === 1 ? "" : "s"}` : undefined); } catch { /* Display is best effort. */ }
   }
 
   started(ctx: ExtensionContext): void {
     this.bind(ctx);
     this.suppressDelivery = false;
-    this.children.resetContinuationNotices();
+    this.attempted.clear();
+  }
+
+  turnStarted(): void { this.advertised.clear(); }
+
+  inbox() {
+    if (this.closed) return [];
+    this.prune();
+    const results = this.children.unread().filter((result) => !this.advertised.has(result.id));
+    for (const result of results) this.advertised.add(result.id);
+    return results;
   }
 
   ended(event: AgentEndEvent, ctx: ExtensionContext): void {
@@ -35,12 +54,13 @@ export class CompletionDelivery {
     this.bind(ctx);
     this.suppressDelivery ||= event.outcome !== "completed" || ctx.signal?.aborted === true;
     if (this.suppressDelivery) return;
-    const results = this.children.pendingCompletions();
+    this.prune();
+    const results = this.children.unread().filter((result) => !this.attempted.has(result.id));
     if (!results.length) return;
     // One attempt per child per parent run avoids continuation loops even if a
     // later extension drops this draft. Reports remain unread, discoverable in
     // the inbox/status, and eligible again on the next parent run.
-    this.children.offerCompletions(results.map((result) => result.id));
+    for (const result of results) this.attempted.add(result.id);
     const handles = results.map((result) => result.handle ?? result.id);
     return {
       entries: [...event.entries, {
@@ -61,6 +81,8 @@ export class CompletionDelivery {
 
   close(): void {
     this.closed = true;
+    this.attempted.clear();
+    this.advertised.clear();
     try { this.ctx?.ui?.setStatus("subagents", undefined); } catch { /* Host may already be gone. */ }
   }
 }

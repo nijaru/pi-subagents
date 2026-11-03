@@ -2,21 +2,24 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
-function descendantPids(pid: number): number[] {
+function descendantPids(pid: number): number[] | undefined {
   if (process.platform === "win32") return [];
   const snapshot = spawnSync("ps", ["-eo", "pid=,ppid="], { encoding: "utf8", timeout: 1000 });
-  if (snapshot.status !== 0 || typeof snapshot.stdout !== "string") return [];
+  if (snapshot.status !== 0 || typeof snapshot.stdout !== "string") return undefined;
   const children = new Map<number, number[]>();
+  let foundRoot = false;
   for (const line of snapshot.stdout.split("\n")) {
     const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
     if (!match) continue;
     const childPid = Number(match[1]);
+    if (childPid === pid) foundRoot = true;
     const parentPid = Number(match[2]);
     if (!Number.isSafeInteger(childPid) || !Number.isSafeInteger(parentPid)) continue;
     const siblings = children.get(parentPid) ?? [];
     siblings.push(childPid);
     children.set(parentPid, siblings);
   }
+  if (!foundRoot) return undefined;
   const result: number[] = [];
   const visit = (parentPid: number) => {
     for (const childPid of children.get(parentPid) ?? []) {
@@ -28,36 +31,9 @@ function descendantPids(pid: number): number[] {
   return result;
 }
 
-/**
- * Terminate a child and its descendants without killing an ancestor group.
- *
- * Keep the first descendant snapshot until the SIGKILL escalation. A process
- * can exit after SIGTERM while its descendants become reparented, so a
- * later `ps` snapshot rooted at the leader would otherwise miss them.
- */
-const terminatedProcessDescendants = new WeakMap<ChildProcess, Set<number>>();
-
-function rememberDescendants(child: ChildProcess): void {
-  if (process.platform === "win32" || !child.pid || hasExited(child)) return;
-  const tracked = terminatedProcessDescendants.get(child) ?? new Set<number>();
-  for (const pid of descendantPids(child.pid)) tracked.add(pid);
-  terminatedProcessDescendants.set(child, tracked);
-}
-
-export function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
-  if (process.platform !== "win32" && child.pid) {
-    rememberDescendants(child);
-    const tracked = terminatedProcessDescendants.get(child) ?? new Set<number>();
-    for (const pid of tracked) {
-      try {
-        process.kill(pid, signal);
-      } catch {
-        // The process may have exited between the snapshot and the signal.
-      }
-    }
-    if (signal === "SIGKILL") terminatedProcessDescendants.delete(child);
-  }
-  terminateProcessGroup(child, signal);
+function processExists(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
 }
 
 function terminateProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
@@ -143,8 +119,8 @@ export async function spawnDeathWatchdog(child: ChildProcess, command: string): 
 }
 
 /** Sweep only the detached root group after its leader exits. */
-export async function sweepRootProcessGroup(child: ChildProcess, signal?: AbortSignal): Promise<void> {
-  if (!child.pid) return;
+export async function sweepRootProcessGroup(child: ChildProcess, signal?: AbortSignal): Promise<boolean> {
+  if (!child.pid) return true;
   if (process.platform === "win32") {
     await new Promise<void>((resolve) => {
       const tree = spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore" });
@@ -152,36 +128,33 @@ export async function sweepRootProcessGroup(child: ChildProcess, signal?: AbortS
       tree.once("close", () => resolve());
     });
     await delay(100);
-    return;
+    // Windows has no process-group query equivalent; taskkill is best effort.
+    return hasExited(child);
   }
   try {
     process.kill(-child.pid, "SIGTERM");
-  } catch {
-    // No surviving group; importantly, do not signal a potentially reused
-    // direct-child PID after the leader has already exited.
-    return;
+  } catch (error) {
+    // A group containing only newly orphaned zombies can transiently return
+    // EPERM on macOS. Only ESRCH confirms absence; otherwise query and wait.
+    // Never fall back to a potentially reused direct-child PID here.
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
   }
-  const groupExists = () => {
-    try {
-      process.kill(-child.pid!, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  };
+  const groupExists = () => processExists(-child.pid!);
   const waitForGroupExit = async (timeoutMs: number): Promise<void> => {
     const deadline = Date.now() + timeoutMs;
     while (!signal?.aborted && groupExists() && Date.now() < deadline) await delay(25);
   };
   // Preserve the previous graceful-cleanup window before forcing the group.
   await waitForGroupExit(5000);
-  if (signal?.aborted || !groupExists()) return;
+  if (signal?.aborted) return false;
+  if (!groupExists()) return true;
   try {
     process.kill(-child.pid, "SIGKILL");
-  } catch {
-    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
   }
   await waitForGroupExit(1000);
+  return !signal?.aborted && !groupExists();
 }
 
 export function hasExited(child: ChildProcess): boolean {
@@ -201,11 +174,30 @@ function waitForExit(child: ChildProcess, timeoutMs: number): Promise<void> {
 /** One cleanup owner; its outer deadline is independent of task/startup timers. */
 export async function cleanupChild(child: ChildProcess, watchdog: ChildProcess | undefined, orderly: boolean): Promise<{ leaderExited: boolean; error?: string }> {
   const controller = new AbortController();
+  // This cleanup transaction owns the snapshot through confirmation. Detached
+  // descendants can be reparented when the leader exits, so do not rediscover
+  // them only at escalation or forget them immediately after posting SIGKILL.
+  const descendants = new Set<number>();
+  let observedTree = process.platform === "win32" || !child.pid;
+  const remember = () => {
+    if (process.platform === "win32" || !child.pid || hasExited(child)) return;
+    const snapshot = descendantPids(child.pid);
+    if (snapshot === undefined) return;
+    observedTree = true;
+    for (const pid of snapshot) descendants.add(pid);
+  };
+  const terminate = (signal: NodeJS.Signals) => {
+    remember();
+    for (const pid of descendants) {
+      try { process.kill(pid, signal); } catch { /* Confirm absence below. */ }
+    }
+    terminateProcessGroup(child, signal);
+  };
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<string>((resolve) => {
     timer = setTimeout(() => {
       controller.abort();
-      try { terminateProcessTree(child, "SIGKILL"); } catch { /* Retain unconfirmed ownership below. */ }
+      try { terminate("SIGKILL"); } catch { /* Retain unconfirmed ownership below. */ }
       resolve("Child process cleanup exceeded its 16-second deadline.");
     }, 16_000);
   });
@@ -213,24 +205,30 @@ export async function cleanupChild(child: ChildProcess, watchdog: ChildProcess |
     if (orderly) {
       // Preserve detached descendants while they still have a discoverable
       // parent, before EOF can make the leader exit and reparent them.
-      rememberDescendants(child);
+      remember();
       child.stdin?.end();
       await waitForExit(child, 3_000);
     }
     if (!orderly || !hasExited(child)) {
       if (controller.signal.aborted) return;
-      terminateProcessTree(child, "SIGTERM");
+      terminate("SIGTERM");
       child.stdin?.end();
       await waitForExit(child, 3_000);
       if (controller.signal.aborted) return;
       // Escalate the saved descendant snapshot even if the leader has exited.
-      terminateProcessTree(child, "SIGKILL");
+      terminate("SIGKILL");
       await waitForExit(child, 1_000);
     }
     if (controller.signal.aborted) return;
-    if (orderly) terminateProcessTree(child, "SIGTERM");
-    await sweepRootProcessGroup(child, controller.signal);
-    if (!controller.signal.aborted) terminateProcessTree(child, "SIGKILL");
+    if (orderly) terminate("SIGTERM");
+    const groupExited = await sweepRootProcessGroup(child, controller.signal);
+    if (!controller.signal.aborted) terminate("SIGKILL");
+    if (!groupExited) return "Child process-group cleanup could not be confirmed.";
+    const descendantsAlive = () => [...descendants].some(processExists);
+    const expiresAt = Date.now() + 1_000;
+    while (!controller.signal.aborted && descendantsAlive() && Date.now() < expiresAt) await delay(25);
+    if (controller.signal.aborted || descendantsAlive()) return "Child descendant cleanup could not be confirmed.";
+    if (!observedTree) return "Child exited before its descendants could be observed; escaped-descendant cleanup is unconfirmed.";
     return hasExited(child) ? undefined : "Child process exit could not be confirmed after cleanup.";
   };
   try {
@@ -238,7 +236,7 @@ export async function cleanupChild(child: ChildProcess, watchdog: ChildProcess |
     return { leaderExited: hasExited(child), ...(error ? { error } : {}) };
   } catch (error) {
     controller.abort();
-    try { terminateProcessTree(child, "SIGKILL"); } catch { /* Best effort; report unconfirmed cleanup. */ }
+    try { terminate("SIGKILL"); } catch { /* Best effort; report unconfirmed cleanup. */ }
     await waitForExit(child, 1_000);
     return { leaderExited: hasExited(child), error: `Child process cleanup failed: ${error instanceof Error ? error.message : error}` };
   } finally {

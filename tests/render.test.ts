@@ -12,14 +12,14 @@ import { emptyUsage, type ChildResult, type SubagentDetails } from "../extension
 const theme = { fg: (_: string, text: string) => text, bg: (_: string, text: string) => text, bold: (text: string) => text } as Theme;
 const child: ChildResult = {
   id: "900c096e-a585-4c0f-9089-25ada5a73466", prompt: "Read the package version.", cwd: "/project", tools: ["read"],
-  output: "pi-subagents 0.1.0", state: { status: "terminal", outcome: "completed", exitCode: 0, stopReason: "stop", finishedAt: 8000 }, startedAt: 0,
+  output: "pi-subagents 0.1.0", state: { status: "terminal", outcome: "completed", stopReason: "stop", finishedAt: 8000 }, startedAt: 0,
   stderr: "", usage: { ...emptyUsage(), turns: 2 }, model: "test/model",
 };
 test("status includes a terminal failure cause and bounded partial output", () => {
   const failedChild: ChildResult = {
     ...child,
     output: "partial report",
-    state: { status: "terminal", outcome: "failed", exitCode: 1, stopReason: "error", finishedAt: 8000 },
+    state: { status: "terminal", outcome: "failed", stopReason: "error", finishedAt: 8000 },
     errorMessage: "child failed for a concrete reason",
   };
   const text = childStatus(failedChild);
@@ -49,7 +49,7 @@ describe("compact child rendering", () => {
     row.setExpanded(true);
     const full = stripTerminalControls(row.render(80).join("\n"));
     expect(full.match(new RegExp(child.id, "g"))).toHaveLength(1);
-    for (const value of [child.prompt, child.output!, "cwd: /project", "tools: read", "2 turns", "test/model"]) expect(full).toContain(value);
+    for (const value of [child.prompt!, child.output!, "cwd: /project", "tools: read", "2 turns", "test/model"]) expect(full).toContain(value);
     row.setExpanded(false);
     expect(row.render(40).map((line) => stripTerminalControls(line).trim()).filter(Boolean)).toEqual(compact);
   });
@@ -76,7 +76,7 @@ describe("compact child rendering", () => {
     ]);
   });
   test("omitted launch context is not rendered as a reasoning-only task", () => {
-    const omitted = { ...child, cwd: "", tools: [], omittedFields: ["cwd", "tools"] as const };
+    const omitted = { ...child, cwd: undefined, tools: undefined, omittedFields: ["cwd", "tools"] as const };
     const text = lines("wait", { command: "wait", ids: [child.id] }, true, [{ ...omitted, omittedFields: [...omitted.omittedFields] }]).join("\n");
     expect(text).toContain("cwd: not retained (response budget)");
     expect(text).toContain("tools: not retained (response budget)");
@@ -128,14 +128,14 @@ describe("compact child rendering", () => {
   test("expanded failure reports include an embedded diagnostic once and keep partial output", () => {
     const failedChild: ChildResult = { ...child, output: "partial report", stderr: "UNIQUE_STDERR_DIAGNOSTIC",
       errorMessage: "Child produced no terminal assistant output; a final response is required.",
-      state: { status: "terminal", outcome: "failed", exitCode: 1, stopReason: "error", finishedAt: 8000 } };
+      state: { status: "terminal", outcome: "failed", stopReason: "error", finishedAt: 8000 } };
     const text = lines("wait", { command: "wait", ids: [child.id] }, true, [failedChild], 120).join("\n");
     expect(text.match(/UNIQUE_STDERR_DIAGNOSTIC/g)).toHaveLength(1);
     expect(text).toContain("partial report");
   });
   test("generic cancellation diagnostics are not repeated in compact rows", () => {
     const cancelled: ChildResult = { ...child, stderr: "",
-      state: { status: "terminal", outcome: "cancelled", exitCode: 1, stopReason: "aborted", finishedAt: 8000 },
+      state: { status: "terminal", outcome: "cancelled", stopReason: "aborted", finishedAt: 8000 },
       errorMessage: "Subagent cancelled." };
     const generic = lines("stop", { command: "stop", id: child.id }, false, [cancelled]).join("\n");
     expect(generic).toContain("cancelled");
@@ -154,7 +154,7 @@ describe("compact child rendering", () => {
   });
   test("failed, timed-out and cancelled children remain distinguishable", () => {
     for (const termination of ["failed", "timed_out", "cancelled"] as const) {
-      const failed = { ...child, state: { status: "terminal", outcome: termination, exitCode: 1, finishedAt: 8000 } as const, errorMessage: "Reason for stopping" };
+      const failed = { ...child, state: { status: "terminal", outcome: termination, finishedAt: 8000 } as const, errorMessage: "Reason for stopping" };
       const text = lines("stop", { command: "stop", id: child.id }, false, [failed]).join("\n");
       expect(text).toContain(termination.replaceAll("_", " "));
       expect(text).toContain("Reason for stopping");
@@ -163,12 +163,12 @@ describe("compact child rendering", () => {
   });
   test("incomplete output and diagnostic streams remain visible on expansion", () => {
     const incomplete: ChildResult = { ...child,
-      state: { status: "terminal", outcome: "incomplete", stopReason: "length", exitCode: 0, finishedAt: 8000 },
-      errorMessage: "Model output limit reached", stdout: "diagnostic stdout", stderr: "diagnostic stderr",
+      state: { status: "terminal", outcome: "incomplete", stopReason: "length", finishedAt: 8000 },
+      errorMessage: "Model output limit reached", stderr: "diagnostic stderr",
       outputTruncation: { truncated: true, originalBytes: 1000, retainedBytes: Buffer.byteLength(child.output!) },
     };
     const text = lines("wait", { command: "wait", ids: [child.id] }, true, [incomplete]).join("\n");
-    for (const label of ["! incomplete", child.output!, "Model output limit reached", "Output shortened", "diagnostic stdout", "diagnostic stderr"]) expect(text).toContain(label);
+    for (const label of ["! incomplete", child.output!, "Model output limit reached", "Output shortened", "diagnostic stderr"]) expect(text).toContain(label);
   });
 
   test("activity is visible without private payloads and last activity survives failure rendering", () => {
@@ -178,7 +178,7 @@ describe("compact child rendering", () => {
     expect(lines("status", { command: "status", id: child.id }, false, [active]).join("\n")).toContain("running · tool: read");
     expect(lines("status", { command: "status", id: child.id }, false, [{ ...active, activity: "thinking", currentTool: undefined }]).join("\n")).toContain("running · thinking");
     const failed: ChildResult = { ...child, lastActivityAt, sessionFile: "/tmp/recover.jsonl",
-      state: { status: "terminal", outcome: "failed", exitCode: 1, finishedAt: 8000 }, errorMessage: "provider failed" };
+      state: { status: "terminal", outcome: "failed", finishedAt: 8000 }, errorMessage: "provider failed" };
     const expanded = lines("status", { command: "status", id: child.id }, true, [failed], 120).join("\n");
     expect(expanded).toContain("last activity: 2023-11-14T22:13:20.000Z");
     expect(expanded).toContain("session: /tmp/recover.jsonl");
@@ -193,7 +193,7 @@ describe("compact child rendering", () => {
   });
 
   test("interrupted tools show observational recovery evidence in text and expanded rendering", () => {
-    const interrupted: ChildResult = { ...child, state: { status: "terminal", outcome: "timed_out", exitCode: 1, finishedAt: 8000 },
+    const interrupted: ChildResult = { ...child, state: { status: "terminal", outcome: "timed_out", finishedAt: 8000 },
       interruption: { activity: "tool", activeToolCount: 2, currentTool: "bash" } };
     for (const text of [childStatus(interrupted), lines("wait", { command: "wait" }, true, [interrupted], 120).join("\n")]) {
       expect(text).toContain("at interruption: tool");
@@ -236,7 +236,7 @@ describe("compact child rendering", () => {
   });
   test("timeout report shows runtime without repeating the generic cause", () => {
     const timedOut: ChildResult = { ...child, output: undefined,
-      state: { status: "terminal", outcome: "timed_out", exitCode: 1, finishedAt: 1_800_000 },
+      state: { status: "terminal", outcome: "timed_out", finishedAt: 1_800_000 },
       errorMessage: timeoutSummary(1_800_000, 1_800_000),
     };
     const value = result("wait", [timedOut]);

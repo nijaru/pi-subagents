@@ -1,9 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
+import { spawn } from "node:child_process";
+import { cleanupChild, spawnDeathWatchdog } from "../extensions/pi-subagents/process-tree.ts";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getRpcInvocation } from "../extensions/pi-subagents/launch.ts";
-import { RpcChildSupervisor, type ChildControl, type ChildExecutionData, type ChildTask } from "../extensions/pi-subagents/supervisor.ts";
+import { runChild, type ExecutionUpdate, type ExecutionControl } from "./fixtures/run-child.ts";
+import type { ChildTask } from "../extensions/pi-subagents/execution.ts";
 
 const directories: string[] = [];
 function tempDir(): string {
@@ -14,8 +17,8 @@ function tempDir(): string {
 function task(cwd: string, extra: Partial<ChildTask> = {}): ChildTask {
   return { id: "run-1", prompt: "inspect", cwd, tools: ["read"], model: "fixture/model", thinking: "high", persist: false, ...extra };
 }
-function run(task: ChildTask, signal = new AbortController().signal, onUpdate?: any, onControl?: (control: ChildControl) => void) {
-  return new RpcChildSupervisor().run({ task, signal, onUpdate, onControl });
+function run(task: ChildTask, signal = new AbortController().signal, onUpdate?: any, onControl?: (control: ExecutionControl) => void) {
+  return runChild({ task, signal, onUpdate, onReady: onControl });
 }
 const saved = { ...process.env };
 beforeEach(() => {
@@ -65,10 +68,10 @@ describe("public RPC child host", () => {
   });
 
   test("observes thinking and overlapping tool lifecycles without retaining private payloads", async () => {
-    const updates: ChildExecutionData[] = [];
+    const updates: ExecutionUpdate[] = [];
     const progress: string[] = [];
     const result = await run(task(tempDir(), { prompt: "SCENARIO=activity", tools: ["read", "bash"] }), undefined,
-      (data: ChildExecutionData, text?: string) => { updates.push(data); if (text) progress.push(text); });
+      (data: ExecutionUpdate, text?: string) => { updates.push(data); if (text) progress.push(text); });
     const model = updates.find((data) => data.activity === "model")!;
     const thinking = updates.filter((data) => data.activity === "thinking");
     expect(thinking.length).toBeGreaterThan(0);
@@ -97,7 +100,7 @@ describe("public RPC child host", () => {
   test("interruption freezes overlapping tool counts without lending mutable snapshots", async () => {
     const controller = new AbortController();
     const result = await run(task(tempDir(), { prompt: "SCENARIO=activity", tools: ["read", "bash"] }), controller.signal,
-      (data: ChildExecutionData) => {
+      (data: ExecutionUpdate) => {
         if (data.currentTool === "bash") controller.abort();
         if (data.interruption) data.interruption.activeToolCount = 99;
       });
@@ -108,9 +111,9 @@ describe("public RPC child host", () => {
   });
 
   test("warming and cleanup do not hide a stalled tool's last activity", async () => {
-    const updates: ChildExecutionData[] = [];
+    const updates: ExecutionUpdate[] = [];
     const result = await run(task(tempDir(), { prompt: "SCENARIO=activity-hang", executionTimeoutMs: 150 }), undefined,
-      (data: ChildExecutionData) => updates.push(data));
+      (data: ExecutionUpdate) => updates.push(data));
     const tool = updates.find((data) => data.currentTool === "read")!;
     expect(tool.activity).toBe("tool");
     expect(result).toMatchObject({ outcome: "timed_out", timeoutPhase: "execution", lastActivityAt: tool.lastActivityAt });
@@ -122,9 +125,9 @@ describe("public RPC child host", () => {
   });
 
   test("observes Pi recovery phases without retaining private retry diagnostics", async () => {
-    const updates: ChildExecutionData[] = [];
+    const updates: ExecutionUpdate[] = [];
     const result = await run(task(tempDir(), { prompt: "SCENARIO=recovery-activity" }), undefined,
-      (data: ChildExecutionData) => updates.push(data));
+      (data: ExecutionUpdate) => updates.push(data));
     expect(updates.map(data => data.activity).filter((activity, index, all) => activity !== all[index - 1]))
       .toEqual(["compaction", "retry", "compaction", undefined, "retry", "model", undefined, "model", "text", undefined]);
     expect(result).toMatchObject({ outcome: "completed", usage: { turns: 1, totalTokens: 18 } });
@@ -144,9 +147,9 @@ describe("public RPC child host", () => {
   test("saves sessions by default and exposes the effective phase deadline", async () => {
     const sessionDir = path.join(tempDir(), "sessions");
     process.env.PI_SUBAGENT_SESSION_DIR = sessionDir;
-    const updates: ChildExecutionData[] = [];
+    const updates: ExecutionUpdate[] = [];
     const result = await run(task(tempDir(), { persist: undefined, executionTimeoutMs: 1_000, startupTimeoutMs: 2_000 }), undefined,
-      (data: ChildExecutionData) => updates.push(data));
+      (data: ExecutionUpdate) => updates.push(data));
     expect(result.sessionFile).toBe(path.join(fs.realpathSync.native(path.dirname(sessionDir)), "sessions", "run-1.jsonl"));
     const starting = updates.find(data => data.deadline?.phase === "startup")!;
     const running = updates.find(data => data.phase === "running")!;
@@ -205,7 +208,7 @@ describe("public RPC child host", () => {
 
   test("queues steering through the RPC control", async () => {
     const dir = tempDir();
-    let control: ChildControl | undefined;
+    let control: ExecutionControl | undefined;
     const pending = run(task(dir, { prompt: "SCENARIO=steer" }), undefined, undefined, (value) => { control = value; });
     while (!control) await Bun.sleep(5);
     await control.steer("focus");
@@ -217,11 +220,9 @@ describe("public RPC child host", () => {
   test("sweeps descendants before settling a completed task", async () => {
     const dir = tempDir();
     const result = await run(task(dir, { prompt: "SCENARIO=descendant" }));
-    expect(result.outcome).toBe("completed");
+    expect(result).toMatchObject({ outcome: "completed", cleanup: { status: "confirmed" } });
     const pid = Number(fs.readFileSync(path.join(dir, "descendant.pid"), "utf8"));
     const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
-    const deadline = Date.now() + 2_000;
-    while (alive() && Date.now() < deadline) await Bun.sleep(25);
     expect(alive()).toBe(false);
   });
 
@@ -232,8 +233,6 @@ describe("public RPC child host", () => {
     const pid = Number(fs.readFileSync(path.join(dir, "detached.pid"), "utf8"));
     try {
       const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
-      const deadline = Date.now() + 2_000;
-      while (alive() && Date.now() < deadline) await Bun.sleep(25);
       expect(alive()).toBe(false);
     } finally { try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ } }
   });
@@ -333,6 +332,37 @@ test("fails before prompting when the probe command is unavailable", async () =>
   expect(result.errorKind).toBe("startup");
   expect(result.errorMessage).toContain("probe extension is unavailable");
   expect(fs.existsSync(path.join(fs.realpathSync.native(dir), ".fake-rpc-prompt"))).toBe(false);
+});
+
+test.each([
+  { prompt: "inspect", taskOutcome: "completed", outcome: "failed", errorKind: "cleanup" },
+  { prompt: "SCENARIO=slow", taskOutcome: "timed_out", outcome: "timed_out", errorKind: "deadline", executionTimeoutMs: 100 },
+  { prompt: "SCENARIO=fail", taskOutcome: "failed", outcome: "failed", errorKind: "provider" },
+] as const)("unconfirmed cleanup retains the lease and original $taskOutcome cause after leader exit", async (options) => {
+  const dir = tempDir();
+  const session = path.join(dir, "owned.jsonl");
+  fs.writeFileSync(session, `${JSON.stringify({ type: "session", cwd: dir })}\n`);
+  const result = await runChild({ task: task(dir, { resume: session, ...options }) }, {
+    spawn, watchdog: spawnDeathWatchdog,
+    async cleanup(...args) {
+      const actual = await cleanupChild(...args);
+      expect(actual).toEqual({ leaderExited: true, error: undefined });
+      return { ...actual, error: "Injected cleanup uncertainty after real resource cleanup" };
+    },
+  });
+  expect(result).toMatchObject({
+    outcome: options.outcome, errorKind: options.errorKind,
+    cleanup: { status: "unconfirmed", taskOutcome: options.taskOutcome },
+  });
+  if (options.taskOutcome === "timed_out") expect(result.errorMessage).toContain("Subagent timed out during execution");
+  if (options.taskOutcome === "failed") expect(result.errorMessage).toContain("Child provider returned an error.");
+  expect(fs.existsSync(`${session}.subagent-lock`)).toBe(true);
+  const contender = await run(task(dir, { resume: session }));
+  expect(contender).toMatchObject({ outcome: "failed", errorKind: "startup" });
+  expect(contender.errorMessage).toContain("already owned");
+  // Only this test injected uncertainty after independently confirming cleanup.
+  fs.unlinkSync(`${session}.subagent-lock`);
+  expect((await run(task(dir, { resume: session }))).outcome).toBe("completed");
 });
 
 test("session ownership spans orderly shutdown and is released before returning", async () => {

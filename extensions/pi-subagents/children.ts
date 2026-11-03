@@ -1,337 +1,198 @@
 import { randomInt, randomUUID } from "node:crypto";
-import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
-import type { ChildResult } from "./types.ts";
-import { addUsage, copyResult, emptyUsage, type UsageRecord } from "./types.ts";
-import type { ChildControl, ChildSupervisor, ChildTask } from "./supervisor.ts";
-import { MAX_CONCURRENCY, MAX_DIAGNOSTIC_BYTES, MAX_RETAINED_RUNS } from "./limits.ts";
 import { truncateOutput } from "./bounds.ts";
+import { MAX_CONCURRENCY, MAX_DIAGNOSTIC_BYTES, MAX_RETAINED_RUNS } from "./limits.ts";
+import { copyReport, type ChildExecution, type ChildSupervisor, type ChildTask, type ExecutionReport, type ExecutionSnapshot } from "./execution.ts";
+import { addUsage, copyResult, emptyUsage, type ChildResult, type UsageRecord } from "./types.ts";
 
-export interface ChildRun {
-  result: ChildResult;
-  /** Short session-scoped handle, assigned once and never reused. */
-  handle: string;
-  /** Inbox notifications are emitted at most once per parent turn. */
-  inboxNotified: boolean;
-  /** Locally collected by a join/stop, not confirmed published or model-read. */
+export type StartChild = Omit<ChildTask, "id"> & { emit?: (result: ChildResult, progress: string) => void };
+interface RetainedChild {
+  readonly task: ChildTask;
+  readonly handle: string;
+  execution: { status: "active"; owner: ChildExecution } | { status: "finished"; report: ExecutionReport };
   collected: boolean;
-  /** At most one continuation attempt per child in a parent run. */
-  continuationOffered: boolean;
-  controller: AbortController;
-  /** Terminal output is not publishable until process-tree cleanup finishes. */
-  settled: boolean;
-  promise: Promise<void>;
-  /** Removable completion listeners; timed-out waits must not accumulate promise reactions. */
-  waiters: Set<() => void>;
-  /** In-flight wait/stop joins suppress notices without consuming reports. */
-  activeWaits: number;
-  /** Set at prompt acceptance; startup failure wakes readiness joins too. */
-  control?: ChildControl;
-  readinessWaiters: Set<() => void>;
+  joins: number;
 }
 
-export interface StartChild {
-  prompt: string;
-  cwd: string;
-  tools: string[];
-  model?: string;
-  thinking?: ModelThinkingLevel;
-  strictThinking?: boolean;
-  /** Per-task execution deadline; omitted uses the global child deadline. */
-  executionTimeoutMs?: number;
-  /** Startup deadline for RPC process, tool probe, and MCP readiness. */
-  startupTimeoutMs?: number;
-  /** Keep the child Pi session for later inspection. */
-  persist?: boolean;
-  /** Trust project-local resources in the child. */
-  trustProject?: boolean;
-  /** Existing child session file to continue. */
-  resume?: string;
-  /** Tools that must remain unreachable through nested/codemode calls. */
-  excludeTools?: string[];
-  emit?: (result: ChildResult, progress: string) => void;
-}
-
-/** Owns one parent's children, admission, retained handles, and shutdown fencing. */
+/** Admission/retention owner. Executions own runtime state; callers get snapshots only. */
 export class SessionChildren {
-  private readonly runs = new Map<string, ChildRun>();
+  private readonly children = new Map<string, RetainedChild>();
+  private readonly changes = new Set<() => void>();
   private closed = false;
-  private pendingUsage: UsageRecord | undefined;
-  // Start at a random point so a resumed session cannot immediately reuse a
-  // handle still visible in the restored transcript.
+  private pendingUsage?: UsageRecord;
   private nextHandle = randomInt(1, 1_000_000);
 
-  constructor(private readonly supervisor: ChildSupervisor, private readonly available: (result: ChildResult) => void) {}
-
+  constructor(private readonly supervisor: ChildSupervisor, private readonly available: () => void) {}
   get isClosed(): boolean { return this.closed; }
 
-  start(options: StartChild): ChildRun {
-    if (this.closed) throw new Error("The parent session is closing; no new children can start.");
-    const active = [...this.runs.values()].filter((run) => !run.settled);
-    if (active.length >= MAX_CONCURRENCY) throw new Error(`Too many active children (maximum ${MAX_CONCURRENCY}). Wait for or stop a child first.`);
-    while (this.runs.size >= MAX_RETAINED_RUNS) {
-      const oldest = [...this.runs.values()].find((run) => run.settled && run.collected);
-      if (!oldest) throw new Error("Retained child results are unread or still running. Read completed results with wait before starting more children.");
-      this.runs.delete(oldest.result.id);
-    }
-    const handle = `sa-${this.nextHandle++}`;
-    const result: ChildResult = {
-      id: randomUUID(), handle, prompt: options.prompt, cwd: options.cwd, tools: [...options.tools],
-      phase: "starting", model: options.model, state: { status: "running" }, stderr: "", usage: emptyUsage(),
-    };
-    const completion = Promise.withResolvers<void>();
-    const run: ChildRun = {
-      result, handle, inboxNotified: false, collected: false, continuationOffered: false,
-      controller: new AbortController(), settled: false, readinessWaiters: new Set(),
-      promise: completion.promise, waiters: new Set(), activeWaits: 0,
-    };
-    const task: ChildTask = Object.freeze({
-      id: result.id, prompt: options.prompt, cwd: options.cwd, tools: Object.freeze([...options.tools]),
-      model: options.model, thinking: options.thinking, strictThinking: options.strictThinking,
-      executionTimeoutMs: options.executionTimeoutMs,
-      startupTimeoutMs: options.startupTimeoutMs,
-      persist: options.persist,
-      trustProject: options.trustProject,
-      resume: options.resume,
-      excludeTools: options.excludeTools ? Object.freeze([...options.excludeTools]) : undefined,
-    });
-    // Register before execution can emit, await, or invoke extension callbacks.
-    this.runs.set(result.id, run);
-    void this.execute(run, task, options.emit).then(completion.resolve, completion.reject);
-    return run;
+  private reserved(child: RetainedChild): boolean {
+    return child.execution.status === "active" || child.execution.report.cleanup.status === "unconfirmed";
   }
 
-  private async execute(run: ChildRun, task: ChildTask, emit: StartChild["emit"]): Promise<void> {
-    const present = (progress: string) => {
-      if (this.closed || !emit) return;
-      try { emit(this.snapshot(run), progress); } catch { emit = undefined; }
-    };
-    try {
-      const { outcome, exitCode, stopReason, errorKind, timeoutPhase, taskFinishedAt, ...data } = await this.supervisor.run({
-        task, signal: run.controller.signal,
-        onUpdate: (data, progress) => {
-          run.result = copyResult({ ...run.result, ...data });
-          if (progress !== undefined) present(progress);
-        },
-        onControl: (control) => {
-          if (this.closed || run.settled) return;
-          run.control = control;
-          for (const ready of run.readinessWaiters) ready();
-          run.readinessWaiters.clear();
-        },
-      });
-      const settledAt = Date.now();
-      run.result = copyResult({
-        ...run.result, ...data,
-        state: { status: "terminal", outcome, exitCode, stopReason, finishedAt: settledAt },
-        ...(errorKind === undefined ? {} : { errorKind }),
-        ...(timeoutPhase === undefined ? {} : { timeoutPhase }),
-        ...(taskFinishedAt === undefined ? {} : { cleanupMs: Math.max(0, settledAt - taskFinishedAt) }),
-      });
-      delete run.result.phase;
-    } catch (error) {
-      const cancelled = run.controller.signal.aborted;
-      run.result.errorMessage = truncateOutput(error instanceof Error ? error.message : String(error), MAX_DIAGNOSTIC_BYTES);
-      run.result.errorKind = cancelled ? "cancelled" : "unknown";
-      delete run.result.phase;
-      run.result.state = {
-        status: "terminal", outcome: cancelled ? "cancelled" : "failed", exitCode: 1,
-        stopReason: cancelled ? "aborted" : "error", finishedAt: Date.now(),
-      };
-    } finally {
-      delete run.result.activity;
-      delete run.result.currentTool;
-      run.result.prompt = truncateOutput(run.result.prompt, MAX_DIAGNOSTIC_BYTES);
-      // Account each execution once, independently of notices, repeated reads,
-      // and handle eviction. Closed sessions must never publish pending costs.
+  start(options: StartChild): ChildResult {
+    if (this.closed) throw new Error("The parent session is closing; no new children can start.");
+    if ([...this.children.values()].filter((child) => this.reserved(child)).length >= MAX_CONCURRENCY) throw new Error(`Too many active or cleanup-unconfirmed children (maximum ${MAX_CONCURRENCY}). Wait for or stop active work; unconfirmed cleanup retains admission.`);
+    while (this.children.size >= MAX_RETAINED_RUNS) {
+      const oldest = [...this.children.values()].find((child) => !this.reserved(child) && child.collected);
+      if (!oldest) throw new Error("Retained child results are unread, running, or cleanup-unconfirmed. Read completed results with wait before starting more children.");
+      this.children.delete(oldest.task.id);
+    }
+    const { emit, ...input } = options;
+    const task: ChildTask = Object.freeze({ ...input, id: randomUUID(), tools: Object.freeze([...input.tools]),
+      excludeTools: input.excludeTools ? Object.freeze([...input.excludeTools]) : undefined });
+    // create is effect-free; reserve before start can spawn, publish, or call extensions.
+    const owner = this.supervisor.create(task);
+    const child: RetainedChild = { task, handle: `sa-${this.nextHandle++}`, execution: { status: "active", owner }, collected: false, joins: 0 };
+    this.children.set(task.id, child);
+    void owner.done.then((report) => {
+      child.execution = { status: "finished", report: copyReport(report) };
       if (!this.closed) {
         this.pendingUsage ??= emptyUsage();
-        addUsage(this.pendingUsage, run.result.usage);
+        addUsage(this.pendingUsage, report.usage);
       }
-      run.settled = true;
-      // The control closes over the RPC runtime and its full final message.
-      // Terminal retention owns only the bounded snapshot, not execution state.
-      delete run.control;
-      for (const ready of run.readinessWaiters) ready();
-      run.readinessWaiters.clear();
-      for (const complete of run.waiters) complete();
-      run.waiters.clear();
-    }
-    this.signalAvailable(run);
+      this.changed();
+      this.announce();
+    });
+    let present = emit;
+    owner.start((progress) => {
+      if (this.closed || !present || progress === undefined) return;
+      try { present(this.project(child), progress); } catch { present = undefined; }
+    });
+    return this.project(child);
   }
 
-  private signalAvailable(run: ChildRun): void {
-    if (!this.closed && run.settled && !run.collected && run.activeWaits === 0) {
-      try { this.available(copyResult(run.result)); } catch { /* A later boundary or wait can still deliver it. */ }
-    }
+  private changed(): void { for (const change of this.changes) change(); }
+  private announce(): void { if (!this.closed) { try { this.available(); } catch { /* Reports remain retrievable. */ } } }
+
+  private lookup(id: string): RetainedChild {
+    const child = this.children.get(id) ?? [...this.children.values()].find((child) => child.handle === id);
+    if (!child) throw new Error(`Unknown child: ${id}. Handles are session-scoped; oldest completed, collected handles may be evicted after ${MAX_RETAINED_RUNS}.`);
+    return child;
   }
 
-  /** Peek at unread reports eligible for an active-boundary announcement. */
-  pendingCompletions(): ChildResult[] {
+  private project(child: RetainedChild): ChildResult {
+    const execution: ExecutionSnapshot = child.execution.status === "active" ? child.execution.owner.snapshot() : { status: "finished", report: child.execution.report };
+    const { task, handle } = child;
+    const identity = { id: task.id, handle, prompt: task.prompt, cwd: task.cwd, tools: [...task.tools], model: task.model };
+    if (execution.status === "active") return copyResult({ ...identity, ...execution.facts, phase: execution.phase, state: { status: "running" } });
+    const { outcome, stopReason, finishedAt, cleanup, ...facts } = execution.report;
+    return copyResult({ ...identity, ...facts, prompt: truncateOutput(task.prompt, MAX_DIAGNOSTIC_BYTES), cleanup: { ...cleanup },
+      cleanupMs: Math.max(0, finishedAt - (facts.taskFinishedAt ?? finishedAt)),
+      state: { status: "terminal", outcome, stopReason, finishedAt } });
+  }
+
+  has(id: string): boolean { return this.children.has(id); }
+  get(id: string): ChildResult { return this.project(this.lookup(id)); }
+  list(): ChildResult[] { return [...this.children.values()].map((child) => this.project(child)); }
+
+  unread(): ChildResult[] {
     if (this.closed) return [];
-    return [...this.runs.values()]
-      .filter((run) => !run.continuationOffered && run.settled && !run.collected && run.activeWaits === 0)
-      .map((run) => this.snapshot(run));
+    return [...this.children.values()].filter((child) => child.execution.status === "finished" && !child.collected && child.joins === 0).map((child) => this.project(child));
   }
 
-  /** A new parent run may attempt another readiness announcement, never consume it. */
-  resetContinuationNotices(): void {
-    for (const run of this.runs.values()) run.continuationOffered = false;
-  }
-
-  offerCompletions(ids: readonly string[]): void {
-    for (const id of ids) {
-      const run = this.runs.get(id);
-      if (run?.settled) run.continuationOffered = true;
-    }
-  }
-
-  /** Allow unread inbox results to be advertised again in the next turn. */
-  resetInboxNotices(): void {
-    for (const run of this.runs.values()) run.inboxNotified = false;
-  }
-
-  /** Drop terminal, locally collected handles; never running or unread work. */
-  pruneCollected(): number {
-    let removed = 0;
-    for (const [id, run] of this.runs) {
-      if (run.settled && run.collected) { this.runs.delete(id); removed++; }
-    }
-    return removed;
-  }
-
-  /** Terminal inbox results not yet advertised this turn. */
-  pendingInbox(): ChildResult[] {
-    if (this.closed) return [];
-    const pending = [...this.runs.values()]
-      .filter((run) => run.settled && !run.collected && run.activeWaits === 0 && !run.inboxNotified);
-    for (const run of pending) run.inboxNotified = true;
-    return pending.map((run) => this.snapshot(run));
-  }
-
-  /** Notifications do not transfer ownership of an unread report. */
-  unreadCompletionCount(): number {
-    if (this.closed) return 0;
-    return [...this.runs.values()].filter((run) => run.settled && !run.collected && run.activeWaits === 0).length;
-  }
-
-  /** Pi custom completion messages cannot carry usage; the next tool result does. */
   takePendingUsage(): UsageRecord | undefined {
     const usage = this.pendingUsage;
     this.pendingUsage = undefined;
     return usage;
   }
 
-  get(idOrHandle: string): ChildRun {
-    const run = this.runs.get(idOrHandle) ?? [...this.runs.values()].find((candidate) => candidate.handle === idOrHandle);
-    if (!run) throw new Error(`Unknown child: ${idOrHandle}. Handles are session-scoped; oldest completed handles are evicted after ${MAX_RETAINED_RUNS}.`);
-    return run;
+  pruneCollected(): number {
+    let count = 0;
+    for (const [id, child] of this.children) {
+      if (child.collected && !this.reserved(child)) { this.children.delete(id); count++; }
+    }
+    return count;
   }
 
-  /** Resolve only a stopped child's retained session; never reuse its live runtime. */
   resumeTarget(handle: string): { sessionFile: string; cwd: string } {
-    const run = this.get(handle);
-    if (!run.settled) throw new Error(`Child ${run.handle} is still running; use steer or wait before resuming.`);
-    if (!run.result.sessionFile) throw new Error(`Child ${run.handle} has no persisted session to resume.`);
-    return { sessionFile: run.result.sessionFile, cwd: run.result.cwd };
+    const child = this.lookup(handle);
+    if (child.execution.status === "active") throw new Error(`Child ${child.handle} is still running; use steer or wait before resuming.`);
+    if (child.execution.report.cleanup.status === "unconfirmed") throw new Error(`Child ${child.handle} cleanup is unconfirmed; reconcile its process and session ownership before continuing.`);
+    if (!child.execution.report.sessionFile) throw new Error(`Child ${child.handle} has no persisted session to resume.`);
+    return { sessionFile: child.execution.report.sessionFile, cwd: child.task.cwd };
   }
 
-  snapshot(run: ChildRun): ChildResult {
-    const result = copyResult(run.result);
-    // Terminal output is not publishable until process-tree cleanup finishes.
-    if (!run.settled) result.state = { status: "running" };
-    return result;
-  }
-
-  list(): ChildResult[] {
-    return [...this.runs.values()].map((run) => this.snapshot(run));
-  }
-
-  /** Queue a steering message into a running child. */
   async steer(id: string, message: string, signal?: AbortSignal): Promise<ChildResult> {
-    const run = this.get(id);
-    // The child's startup deadline bounds readiness. Cancelling this join must
-    // not cancel the child, just as cancelling wait leaves it running.
-    const control = await new Promise<ChildControl | undefined>((resolve, reject) => {
-      const cleanup = () => {
-        run.readinessWaiters.delete(ready);
-        signal?.removeEventListener("abort", abort);
-      };
-      const ready = () => { cleanup(); resolve(run.control); };
-      const abort = () => { cleanup(); reject(new Error("Steering cancelled; child continues.")); };
-      if (signal?.aborted) { abort(); return; }
-      if (run.settled || run.control) { ready(); return; }
-      signal?.addEventListener("abort", abort, { once: true });
-      run.readinessWaiters.add(ready);
-    });
-    if (run.settled || !control) throw new Error(`Child ${run.handle} is no longer running.`);
-    await control.steer(message, signal);
-    return this.snapshot(run);
+    const child = this.lookup(id);
+    if (child.execution.status !== "active") throw new Error(`Child ${child.handle} is no longer running.`);
+    await child.execution.owner.steer(message, signal);
+    return this.project(child);
+  }
+
+  /** A foreground join owns cancellation; ordinary wait never cancels executions. */
+  async join(id: string, timeoutMs: number, signal?: AbortSignal): Promise<ChildResult> {
+    const child = this.lookup(id);
+    child.joins++;
+    let cancelled = false;
+    const abort = () => {
+      cancelled = true;
+      if (child.execution.status === "active") child.execution.owner.cancel();
+      this.changed();
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    try {
+      await this.until(() => cancelled || child.execution.status === "finished", timeoutMs);
+      // Cancellation owns cleanup, even when the foreground budget expires.
+      if (cancelled) await this.until(() => child.execution.status === "finished");
+      if (child.execution.status === "finished") child.collected = true;
+      return this.project(child);
+    } finally {
+      signal?.removeEventListener("abort", abort);
+      child.joins--;
+      this.announce();
+    }
   }
 
   async stop(id: string): Promise<ChildResult> {
-    const run = this.get(id);
-    // Suppress notices during cleanup without prematurely consuming the report.
-    run.activeWaits++;
+    const child = this.lookup(id);
+    child.joins++;
     try {
-      run.controller.abort();
-      await run.promise;
-      const result = this.snapshot(run);
-      run.collected = true;
-      return result;
-    } finally {
-      run.activeWaits--;
-      this.signalAvailable(run);
-    }
+      if (child.execution.status === "active") child.execution.owner.cancel();
+      await this.until(() => child.execution.status === "finished");
+      child.collected = true;
+      return this.project(child);
+    } finally { child.joins--; this.announce(); }
   }
 
-  /** Join under one deadline; collect terminal snapshots, not publication acknowledgments. */
   async wait(ids: readonly string[], timeoutMs: number, signal?: AbortSignal): Promise<ChildResult[]> {
     if (!ids.length) throw new Error("wait requires at least one child id.");
-    // Resolve before claiming reports, then deduplicate UUID/handle aliases.
-    const runs = [...new Set(ids.map((id) => this.get(id)))];
-    const collect = () => {
-      // Completion can wake the join just before cancellation. Check again at
-      // collection, even though the completion listener has already detached.
-      if (signal?.aborted) throw new Error("Wait cancelled; use stop to cancel children.");
-      const results = runs.map((run) => this.snapshot(run));
-      for (const run of runs) if (run.settled) run.collected = true;
-      return results;
-    };
-    if (signal?.aborted) throw new Error("Wait cancelled; use stop to cancel children.");
-    if (runs.some((run) => run.settled)) return collect();
-    for (const run of runs) run.activeWaits++;
+    const selected = [...new Set(ids.map((id) => this.lookup(id)))];
+    for (const child of selected) child.joins++;
     try {
-      await new Promise<void>((resolve, reject) => {
-        let settled = false;
-        const finish = (error?: Error) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          signal?.removeEventListener("abort", abort);
-          for (const run of runs) run.waiters.delete(complete);
-          if (error) reject(error); else resolve();
-        };
-        const complete = () => finish();
-        const abort = () => finish(new Error("Wait cancelled; use stop to cancel children."));
-        const timer = setTimeout(complete, timeoutMs);
-        signal?.addEventListener("abort", abort, { once: true });
-        for (const run of runs) run.waiters.add(complete);
-      });
-      return collect();
-    } finally {
-      for (const run of runs) {
-        run.activeWaits--;
-        // A cancelled join can race completion without having collected it.
-        this.signalAvailable(run);
-      }
-    }
+      await this.until(() => selected.some((child) => child.execution.status === "finished"), timeoutMs, signal);
+      if (signal?.aborted) throw new Error("Wait cancelled; use stop to cancel children.");
+      const results = selected.map((child) => this.project(child));
+      for (const child of selected) if (child.execution.status === "finished") child.collected = true;
+      return results;
+    } finally { for (const child of selected) child.joins--; this.announce(); }
+  }
+
+  /** One removable subscription per join, not one promise reaction per child. */
+  private until(ready: () => boolean, timeoutMs?: number, signal?: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (error?: Error) => {
+        if (timer) clearTimeout(timer);
+        this.changes.delete(check);
+        signal?.removeEventListener("abort", abort);
+        if (error) reject(error); else resolve();
+      };
+      const check = () => { if (ready()) finish(); };
+      const abort = () => finish(new Error("Wait cancelled; use stop to cancel children."));
+      if (signal?.aborted) { abort(); return; }
+      if (ready()) { finish(); return; }
+      this.changes.add(check);
+      signal?.addEventListener("abort", abort, { once: true });
+      if (timeoutMs !== undefined) timer = setTimeout(() => finish(), timeoutMs);
+    });
   }
 
   async close(): Promise<void> {
     this.closed = true;
     this.pendingUsage = undefined;
-    for (const run of this.runs.values()) if (!run.settled) run.controller.abort();
-    await Promise.allSettled([...this.runs.values()].map((run) => run.promise));
-    this.runs.clear();
+    const active = [...this.children.values()].flatMap((child) => child.execution.status === "active" ? [child.execution.owner] : []);
+    for (const owner of active) owner.cancel();
+    await Promise.all(active.map((owner) => owner.done));
+    this.children.clear();
   }
 }

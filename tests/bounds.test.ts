@@ -1,14 +1,24 @@
 import { describe, expect, test } from "bun:test";
 import { boundChildResult, boundDetails, jsonBytes, minimalChildResult, truncateOutput } from "../extensions/pi-subagents/bounds.ts";
 import { emptyUsage, type ChildResult } from "../extensions/pi-subagents/types.ts";
-import { childReports, childStatuses } from "../extensions/pi-subagents/reports.ts";
+import { childReports as formatReports, childStatuses as formatStatuses } from "../extensions/pi-subagents/reports.ts";
+import { childResponse } from "../extensions/pi-subagents/response.ts";
+
+function modelText(format: typeof formatReports, results: ChildResult[]): string {
+  const response = childResponse("wait", results, format);
+  const text = response.content[0]!;
+  if (text.type !== "text") throw new Error("Expected text response");
+  return text.text;
+}
+const childReports = (results: ChildResult[]) => modelText(formatReports, results);
+const childStatuses = (results: ChildResult[]) => modelText(formatStatuses, results);
 import { Check } from "typebox/value";
 import { SubagentDetailsSchema } from "../extensions/pi-subagents/result-schema.ts";
 
 function child(id = "child-1"): ChildResult {
   return {
     id, prompt: "task", cwd: "/tmp", tools: ["read"], startedAt: 1,
-    state: { status: "terminal", outcome: "failed", exitCode: 1, finishedAt: 2 },
+    state: { status: "terminal", outcome: "failed", finishedAt: 2 },
     errorMessage: "\u0001".repeat(512), model: "\u0001".repeat(256),
     output: "😀\\\"\n".repeat(2000),
     outputTruncation: { truncated: false, originalBytes: 14000, retainedBytes: 14000 },
@@ -20,7 +30,7 @@ describe("serialized result bounds", () => {
   test("session and deadline metadata survive both result envelopes", () => {
     const metadata = { interruption: { activity: "tool" as const, activeToolCount: 3, currentTool: "bash" }, deadline: { phase: "execution" as const, startedAt: 1, expiresAt: 3 }, lastActivityAt: 2, sessionFile: "/tmp/session.jsonl", taskFinishedAt: 3, cleanupMs: 1, errorKind: "deadline" as const, timeoutPhase: "execution" as const };
     const result = { ...child(), ...metadata,
-      state: { status: "terminal", outcome: "timed_out", exitCode: 1, finishedAt: 4 } as const };
+      state: { status: "terminal", outcome: "timed_out", finishedAt: 4 } as const };
     const minimal = minimalChildResult(result);
     const { sessionFile: _path, ...required } = metadata;
     expect(minimal).toMatchObject(required);
@@ -69,7 +79,7 @@ describe("serialized result bounds", () => {
       startedAt: 1_700_000_000_000, taskFinishedAt: 1_700_000_003_000, cleanupMs: 100, lastActivityAt: 1_700_000_002_900,
       deadline: { phase: "execution", startedAt: 1_700_000_001_000, expiresAt: 1_700_000_003_000 },
       errorKind: "deadline", timeoutPhase: "execution", errorMessage: "Deadline expired",
-      state: { status: "terminal", outcome: "timed_out", exitCode: 1, finishedAt: 1_700_000_003_100 },
+      state: { status: "terminal", outcome: "timed_out", finishedAt: 1_700_000_003_100 },
       interruption: { activity: "tool", activeToolCount: 1, currentTool: "a".repeat(256) },
     }));
     const bounded = boundDetails({ command: "wait", results });
@@ -135,12 +145,11 @@ describe("serialized result bounds", () => {
     expect(() => boundDetails(details, NaN)).toThrow(RangeError);
   });
 
-  test.each([1, 32])("small failures keep their causes when omission metadata is more expensive (%s children)", (count) => {
+  test.each([1, 32])("small failures keep their full context and causes (%s children)", (count) => {
     const results = Array.from({ length: count }, (_, index) => ({
       ...child(`child-${index}`), prompt: "x", cwd: "/tmp", tools: [], model: undefined,
       output: undefined, outputTruncation: undefined, errorMessage: "bad",
     }));
-    expect(jsonBytes(results[0]!)).toBeLessThan(jsonBytes(minimalChildResult(results[0]!)));
     const bounded = boundDetails({ command: "wait", results });
     expect(bounded.results).toEqual(results);
     expect(jsonBytes(bounded)).toBeLessThanOrEqual(51200);
@@ -161,8 +170,8 @@ describe("serialized result bounds", () => {
     const result = { ...child(), errorMessage: undefined, model: undefined,
       tools: Array.from({ length: 64 }, (_, index) => `${index}-${"t".repeat(200)}`), cwd: "/" + "d".repeat(2000) };
     const bounded = boundChildResult(result, 1100);
-    expect(bounded.tools).toEqual([]);
-    expect(bounded.cwd).toBe("");
+    expect(bounded.tools).toBeUndefined();
+    expect(bounded.cwd).toBeUndefined();
     expect(bounded.omittedFields).toEqual(["cwd", "tools"]);
     expect(Check(SubagentDetailsSchema, { command: "wait", results: [bounded] })).toBe(true);
     const rebound = boundDetails({ command: "status", results: [bounded] }).results[0]!;
@@ -171,10 +180,10 @@ describe("serialized result bounds", () => {
 
   test("truncation guidance points at the retained handle", () => {
     const result = { ...child("child-uuid"), handle: "sa-42",
-      state: { status: "terminal", outcome: "completed", exitCode: 0, stopReason: "stop", finishedAt: 2 } as const,
+      state: { status: "terminal", outcome: "completed", stopReason: "stop", finishedAt: 2 } as const,
       errorMessage: undefined, model: undefined, output: "x".repeat(5_000),
       outputTruncation: { truncated: false, originalBytes: 5_000, retainedBytes: 5_000 } };
-    const text = childReports([result], { maxReportBytes: 100 });
+    const text = formatReports([boundChildResult(result, 1000)]);
     expect(text).toContain('ids: ["sa-42"]');
     expect(text).not.toContain(`ids: ["${result.id}"]`);
   });

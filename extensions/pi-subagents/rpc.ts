@@ -6,6 +6,15 @@ import { truncateHeadTail } from "./bounds.ts";
 
 export type ChildEvent = JsonAgentSessionEvent | RpcExtensionUIRequest
   | { type: "extension_error"; event?: string; error?: string };
+export const MAX_RPC_PENDING = 32;
+export const MAX_RPC_WRITE_BYTES = MAX_PROTOCOL_LINE_BYTES;
+
+export class RpcCommandError extends Error {
+  constructor(message: string, readonly acceptance: "not_sent" | "rejected" | "unknown") {
+    super(acceptance === "unknown" ? `${message} Acceptance is unknown; the command may already have taken effect. Do not resend automatically.` : message);
+  }
+}
+
 type Success<T extends RpcCommand["type"]> = Extract<RpcResponse, { command: T; success: true }>;
 interface Pending {
   command: string;
@@ -22,6 +31,7 @@ export class ChildRpc {
   private readonly stderrDecoder = new StringDecoder("utf8");
   private readonly pending = new Map<string, Pending>();
   private nextId = 0;
+  private queuedBytes = 0;
   private closed = false;
   private trailing = "";
   private discarding = false;
@@ -56,14 +66,16 @@ export class ChildRpc {
   get diagnostics(): string { return this.stderr; }
 
   request<T extends RpcCommand["type"]>(command: Extract<RpcCommand, { type: T }>, timeoutMs = 30_000, signal?: AbortSignal): Promise<Success<T>> {
-    if (signal?.aborted) return Promise.reject(new Error("RPC command cancelled; child continues."));
+    if (signal?.aborted) return Promise.reject(new RpcCommandError("RPC command cancelled before sending; child continues.", "not_sent"));
+    if (this.closed) return Promise.reject(new RpcCommandError("Child execution ended before sending.", "not_sent"));
+    if (this.pending.size >= MAX_RPC_PENDING) return Promise.reject(new RpcCommandError("Too many outstanding child RPC commands; command was not sent.", "not_sent"));
     const id = `subagent-${++this.nextId}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.pending.get(id)?.reject(new Error(`Timed out waiting for child RPC ${command.type}.`));
+        this.pending.get(id)?.reject(new RpcCommandError(`Timed out waiting for child RPC ${command.type}.`, "unknown"));
       }, timeoutMs);
       timer.unref?.();
-      const abort = () => this.pending.get(id)?.reject(new Error("RPC command cancelled; child continues."));
+      const abort = () => this.pending.get(id)?.reject(new RpcCommandError("RPC command cancelled; child continues.", "unknown"));
       const finish = () => { clearTimeout(timer); signal?.removeEventListener("abort", abort); this.pending.delete(id); };
       // Register before writing: a fast response must never miss its waiter.
       this.pending.set(id, {
@@ -83,21 +95,34 @@ export class ChildRpc {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    for (const request of this.pending.values()) request.reject(new Error("Child execution ended."));
+    for (const request of this.pending.values()) request.reject(new RpcCommandError("Child execution ended.", "unknown"));
     this.pending.clear();
   }
 
   private write(record: RpcCommand | RpcExtensionUIResponse, done: (error?: Error | null) => void): void {
     if (this.closed || !this.child.stdin?.writable || this.child.stdin.destroyed) {
-      done(new Error("Child RPC stdin is not writable."));
+      done(new RpcCommandError("Child RPC stdin is not writable; command was not sent.", "not_sent"));
       return;
     }
+    const line = `${JSON.stringify(record)}\n`;
+    const bytes = Buffer.byteLength(line);
+    if (this.queuedBytes + bytes > MAX_RPC_WRITE_BYTES) {
+      done(new RpcCommandError("Child RPC write budget exhausted; command was not sent.", "not_sent"));
+      return;
+    }
+    this.queuedBytes += bytes;
+    let completed = false;
+    const finish = (error?: Error | null) => {
+      if (completed) return;
+      completed = true;
+      this.queuedBytes -= bytes;
+      done(error ? new RpcCommandError(error.message, "unknown") : undefined);
+    };
     try {
-      // Node queues writes under backpressure. Do not treat write(false) as a
-      // failure; the callback covers flushing/errors and the response gates the
-      // next sequential command.
-      this.child.stdin.write(`${JSON.stringify(record)}\n`, done);
-    } catch (error) { done(error instanceof Error ? error : new Error(String(error))); }
+      // A false return is backpressure, not failure. Account queued bytes until
+      // the write callback, even if the caller abandons its response waiter.
+      this.child.stdin.write(line, finish);
+    } catch (error) { finish(error instanceof Error ? error : new Error(String(error))); }
   }
 
   private fail(error: Error): void {
@@ -122,7 +147,7 @@ export class ChildRpc {
         throw new Error("Child RPC emitted a malformed command response.");
       }
       if (record.success) request.resolve(record as RpcResponse);
-      else request.reject(new Error(typeof record.error === "string" ? record.error : "Child RPC command failed."));
+      else request.reject(new RpcCommandError(typeof record.error === "string" ? record.error : "Child RPC command failed.", "rejected"));
     } catch (error) {
       this.fail(error instanceof SyntaxError ? new Error("Child RPC emitted malformed JSON.") : error instanceof Error ? error : new Error(String(error)));
     }

@@ -5,8 +5,9 @@ import { Check, Errors } from "typebox/value";
 import { SessionChildren } from "./children.ts";
 import { RpcChildSupervisor } from "./supervisor.ts";
 import { SubagentParamsSchema, excludedChildTools, resolveCwd, selectTools, validateCommand } from "./params.ts";
-import { DEFAULT_WAIT_MS, MAX_OUTPUT_BYTES, RUNNING_PROGRESS_TEXT, RUNTIME_UPDATE_INTERVAL_MS, foregroundBudgetMs, isChildProcess } from "./limits.ts";
-import { boundDetails, truncateOutput } from "./bounds.ts";
+import { DEFAULT_WAIT_MS, RUNNING_PROGRESS_TEXT, RUNTIME_UPDATE_INTERVAL_MS, foregroundBudgetMs, isChildProcess } from "./limits.ts";
+import { truncateOutput } from "./bounds.ts";
+import { childResponse as answer } from "./response.ts";
 import { addUsage, failed, isRunning } from "./types.ts";
 import { SubagentDetailsSchema } from "./result-schema.ts";
 import type { ChildResult, SubagentDetails } from "./types.ts";
@@ -18,11 +19,6 @@ export { SubagentParamsSchema } from "./params.ts";
 export type { SubagentParams } from "./params.ts";
 export type { ChildResult, ChildActivity, SubagentDetails, AgentOutcome, ChildState, UsageSummary } from "./types.ts";
 export { MAX_CONCURRENCY } from "./limits.ts";
-
-function answer(command: SubagentDetails["command"], results: ChildResult[], text: string, waitExpired?: boolean): AgentToolResult<SubagentDetails> {
-  const details = boundDetails({ command, results, ...(waitExpired === undefined ? {} : { waitExpired }) });
-  return { content: [{ type: "text", text: truncateOutput(text, MAX_OUTPUT_BYTES) }], details, structuredContent: details };
-}
 
 function inboxNotice(results: ChildResult[]): string {
   const items = results.slice(0, 8).map((result) =>
@@ -39,8 +35,7 @@ function outcome(command: "run" | "wait", results: ChildResult[]): AgentToolResu
     ? `${waitExpired ? "Wait budget expired; children continue." : "Returned ready reports; remaining children continue."} Wait again only on remaining ids when their results block progress.\n\n`
     : "";
   // The model authored run prompts; keep them only where the call lacks them.
-  const text = preamble + childReports(results, { includePrompt: command !== "run" });
-  return { ...answer(command, results, text, waitExpired), isError: results.some(failed) };
+  return { ...answer(command, results, (view) => preamble + childReports(view, { includePrompt: command !== "run" }), waitExpired), isError: results.some(failed) };
 }
 
 export default function (pi: ExtensionAPI) {
@@ -58,7 +53,7 @@ export default function (pi: ExtensionAPI) {
     runtime.delivery.refreshStatus();
     const usage = runtime.children.takePendingUsage();
     // Nested/codemode results only reach the calling tool, never the model.
-    const inbox = event.parentToolCallId !== undefined || event.toolName === "subagent" ? [] : runtime.children.pendingInbox();
+    const inbox = event.parentToolCallId !== undefined || event.toolName === "subagent" ? [] : runtime.delivery.inbox();
     if (!usage && inbox.length === 0) return;
     const result: ToolResultEventResult = {};
     if (usage) {
@@ -87,7 +82,7 @@ export default function (pi: ExtensionAPI) {
   // only for a new external run, or a dropped notice can cause a restart loop.
   pi.on("before_agent_start", (_event, ctx) => runtime.delivery.started(ctx));
   pi.on("agent_end", (event, ctx) => runtime.delivery.ended(event, ctx));
-  pi.on("turn_start", () => runtime.children.resetInboxNotices());
+  pi.on("turn_start", () => runtime.delivery.turnStarted());
   pi.on("turn_end", (event, ctx) => runtime.delivery.boundary(event, ctx));
   pi.on("agent_before_settle", (event, ctx) => runtime.delivery.boundary(event, ctx));
   pi.on("agent_settled", (_event, ctx) => runtime.delivery.settled(ctx));
@@ -119,19 +114,19 @@ export default function (pi: ExtensionAPI) {
       const owner = runtime.children;
       runtime.delivery.bind(ctx);
       if (params.command === "status") {
-        const results = params.id ? [owner.snapshot(owner.get(params.id))] : owner.list();
-        return answer("status", results, childStatuses(results));
+        const results = params.id ? [owner.get(params.id)] : owner.list();
+        return answer("status", results, childStatuses);
       }
       if (params.command === "stop") {
-        const result = await owner.stop(params.id!);
-        return answer("stop", [result], childReports([result]));
+        const result = await owner.stop(params.id);
+        return answer("stop", [result], childReports);
       }
       if (params.command === "steer") {
-        const result = await owner.steer(params.id!, params.message!, signal);
-        return answer("steer", [result], `Steering queued for ${result.handle ?? result.id}.`);
+        const result = await owner.steer(params.id, params.message, signal);
+        return answer("steer", [result], ([view]) => `Steering queued for ${view!.handle ?? view!.id}.`);
       }
       if (params.command === "wait") {
-        const results = await owner.wait(params.ids!, params.timeoutMs ?? DEFAULT_WAIT_MS, signal);
+        const results = await owner.wait(params.ids, params.timeoutMs ?? DEFAULT_WAIT_MS, signal);
         return outcome("wait", results);
       }
       if (signal?.aborted) throw new Error("Child launch cancelled.");
@@ -151,7 +146,7 @@ export default function (pi: ExtensionAPI) {
       let presenting = foreground;
       const present = (result: ChildResult, progress: string) => {
         if (!presenting || !onUpdate || owner.isClosed) return;
-        try { onUpdate(answer("run", [{ ...result, state: { status: "running" } }], progress)); }
+        try { onUpdate(answer("run", [{ ...result, state: { status: "running" } }], () => progress)); }
         catch { presenting = false; }
       };
       const parentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
@@ -161,7 +156,7 @@ export default function (pi: ExtensionAPI) {
       // A completed join reads the result; only unread results are eligible
       // for automatic delivery at an active parent boundary; never wake an idle parent.
       const run = owner.start({
-        prompt: params.prompt!, tools, cwd,
+        prompt: params.prompt, tools, cwd,
         model, thinking, strictThinking: params.thinking !== undefined,
         executionTimeoutMs: params.executionTimeoutMs,
         startupTimeoutMs: params.startupTimeoutMs,
@@ -172,28 +167,23 @@ export default function (pi: ExtensionAPI) {
         emit: foreground && onUpdate ? present : undefined,
       });
       if (!foreground) {
-        const snapshot = owner.snapshot(run);
-        const session = snapshot.sessionFile ? `\nSession: ${snapshot.sessionFile}` : "";
-        return answer("spawn", [snapshot], `Started child ${run.handle}. Completion is announced at an active boundary or on a later tool result; idle parents are not woken. Continue non-overlapping work; use wait when its result blocks finishing your task, or status/stop with this handle.${session}`);
+        const snapshot = owner.get(run.id);
+        return answer("spawn", [snapshot], ([view]) => `Started child ${view!.handle}. Completion is announced at an active boundary or on a later tool result; idle parents are not woken. Continue non-overlapping work; use wait when its result blocks finishing your task, or status/stop with this handle.${view!.sessionFile ? `\nSession: ${view!.sessionFile}` : ""}`);
       }
       // Presentation stops at the foreground join, even when execution continues.
       const timer = onUpdate ? setInterval(() => {
-        if (presenting && !owner.isClosed) present(owner.snapshot(run), RUNNING_PROGRESS_TEXT);
+        if (presenting && !owner.isClosed) present(owner.get(run.id), RUNNING_PROGRESS_TEXT);
       }, RUNTIME_UPDATE_INTERVAL_MS) : undefined;
-      const abort = () => run.controller.abort();
-      signal?.addEventListener("abort", abort, { once: true });
-      if (signal?.aborted) abort();
       try {
         const budget = params.joinTimeoutMs ?? foregroundBudgetMs();
-        const result = (await owner.wait([run.result.id], budget))[0]!;
+        const result = await owner.join(run.id, budget, signal);
         if (isRunning(result)) {
-          return answer("run", [result], `${summary(result)}\nStill running after ${formatElapsed(budget)}; it continues as background work. Completion is announced at an active boundary or on a later tool result; idle parents are not woken. Use wait when its result blocks finishing your task, or status/stop with this handle.`);
+          return answer("run", [result], ([view]) => `${summary(view!)}\nStill running after ${formatElapsed(budget)}; it continues as background work. Completion is announced at an active boundary or on a later tool result; idle parents are not woken. Use wait when its result blocks finishing your task, or status/stop with this handle.`);
         }
         return outcome("run", [result]);
       } finally {
         presenting = false;
         if (timer) clearInterval(timer);
-        signal?.removeEventListener("abort", abort);
       }
     },
     renderCall: renderChildCall,
@@ -214,7 +204,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const results = runtime.children.list();
-      const unread = runtime.children.unreadCompletionCount();
+      const unread = runtime.children.unread().length;
       const header = results.length === 0 ? "No retained child agents." : `${results.length} retained${unread ? ` · ${unread} unread` : ""}`;
       ctx.ui.notify(`${header}\n${childListText(results)}`.trim(), "info");
     },

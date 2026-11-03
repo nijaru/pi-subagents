@@ -1,5 +1,4 @@
-import { allocateBudget, truncateOutput } from "./bounds.ts";
-import { MAX_OUTPUT_BYTES } from "./limits.ts";
+import { truncateOutput } from "./bounds.ts";
 import { failed, isFiniteNumber, isRunning, type ChildResult } from "./types.ts";
 
 /** Human units; sub-second values keep millisecond precision. */
@@ -79,7 +78,7 @@ export function activitySummary(result: ChildResult): string {
 /** Failure causes precede partial output so bounds cannot hide why the child stopped. */
 export function resultText(result: ChildResult): string {
   if (!failed(result)) return result.output || "(no output)";
-  const cause = result.errorMessage || result.stderr || result.stdout || "Child did not complete.";
+  const cause = result.errorMessage || result.stderr || "Child did not complete.";
   // A generic wrapper cause must not hide the child's own diagnostic.
   const detail = /no terminal assistant output|did not complete/i.test(cause) && result.stderr.trim()
     ? `${cause}\n\n${truncateOutput(result.stderr, 2_048)}`
@@ -94,7 +93,7 @@ export function resultText(result: ChildResult): string {
 export function childStatus(result: ChildResult): string {
   const head = childSummary(result, false);
   if (result.state.status !== "terminal" || !failed(result)) return head;
-  const cause = result.errorMessage || result.stderr || result.stdout;
+  const cause = result.errorMessage || result.stderr;
   const lines = [head];
   if (cause) lines.push(`cause: ${truncateOutput(cause, 500)}`);
   const preview = result.output?.trim() ?? "";
@@ -106,53 +105,28 @@ export function childSummary(result: ChildResult, includePrompt = true): string 
   const status = result.state.status === "running" ? (result.phase ?? "running") : result.state.outcome;
   const duration = runtimeLabel(result);
   const model = result.model ? `\nmodel: ${truncateOutput(result.model, 512)}${result.thinking ? ` · thinking: ${result.thinking}` : ""}` : "";
-  const session = result.sessionFile ? `\nsession: ${truncateOutput(result.sessionFile, 1024)}` : "";
+  const session = result.sessionFile ? `\nsession: ${result.sessionFile}` : "";
   const handle = result.handle ?? result.id;
-  const observations = [deadlineSummary(result), activitySummary(result)].filter(Boolean).join("\n");
+  const cleanup = result.cleanup?.status === "unconfirmed"
+    ? "Cleanup unconfirmed; admission and any session lease remain reserved. Do not resume or relaunch until process/workspace state is reconciled." : "";
+  const observations = [deadlineSummary(result), activitySummary(result), cleanup].filter(Boolean).join("\n");
   const head = `${handle} [${status}]${duration ? ` · ${duration}` : ""}${observations ? `\n${observations}` : ""}${model}${session}`;
-  return includePrompt ? `${head}\n${truncateOutput(result.prompt, 256)}` : head;
+  return includePrompt && result.prompt !== undefined ? `${head}\n${truncateOutput(result.prompt, 256)}` : head;
 }
 
-/** Variable metadata must not crowd later children out of a batch response. */
-function boundChildHeaders(results: ChildResult[], headers: string[], maxBytes: number): string[] {
-  const budgets = allocateBudget(headers.map((head) => Buffer.byteLength(head)), maxBytes);
-  return headers.map((head, index) => {
-    const budget = budgets[index]!;
-    if (Buffer.byteLength(head) <= budget) return head;
-    const guidance = `\nMetadata shortened; inspect child with status id: "${results[index]!.handle ?? results[index]!.id}".`;
-    return truncateOutput(head, Math.max(0, budget - Buffer.byteLength(guidance))) + guidance;
-  });
-}
-
+/** Formatting consumes one already-budgeted view; it never selects a different excerpt. */
 export function childStatuses(results: ChildResult[]): string {
-  if (!results.length) return "No retained children.";
-  const separator = "\n\n";
-  return boundChildHeaders(results, results.map(childStatus), MAX_OUTPUT_BYTES - 512 - Buffer.byteLength(separator) * (results.length - 1)).join(separator);
+  return results.length ? results.map(childStatus).join("\n\n") : "No retained children.";
 }
 
-/** Every selected child keeps its identity/status, even when reports share a tight budget. */
-export function childReports(results: ChildResult[], { includePrompt = true, maxReportBytes = MAX_OUTPUT_BYTES } = {}): string {
+export function childReports(results: ChildResult[], { includePrompt = true } = {}): string {
   if (!results.length) return "No retained children.";
-  const separator = "\n\n---\n\n";
-  const heads = boundChildHeaders(results, results.map((result) => {
+  return results.map((result) => {
     const head = childSummary(result, includePrompt);
-    return !isRunning(result) && result.outputTruncation?.truncated
-      ? `${head}\nChild report truncated: ${result.outputTruncation.retainedBytes}/${result.outputTruncation.originalBytes} UTF-8 bytes retained in this report; saved sessions may retain completed messages.`
-      : head;
-  }), MAX_OUTPUT_BYTES - 512 - Buffer.byteLength(separator) * (results.length - 1) - results.filter((result) => !isRunning(result)).length * 258);
-  const outputs = results.map((result) => isRunning(result) ? "" : resultText(result));
-  // Reserve identities, truncation guidance, and the caller's short preamble.
-  const overhead = heads.reduce((bytes, head, index) => bytes + Buffer.byteLength(head) + (isRunning(results[index]!) ? 0 : 258), 0);
-  const allocations = allocateBudget(outputs.map((output) => Math.min(maxReportBytes, Buffer.byteLength(output))),
-    MAX_OUTPUT_BYTES - 512 - Buffer.byteLength(separator) * (results.length - 1) - overhead);
-  return results.map((result, index) => {
-    const head = heads[index]!;
     if (isRunning(result)) return head;
-    const output = outputs[index]!;
-    const excerpt = truncateOutput(output, allocations[index]!);
-    const guidance = excerpt === output ? "" : results.length > 1 || maxReportBytes < MAX_OUTPUT_BYTES
-      ? `\n\nExcerpt truncated; use subagent wait with ids: ["${result.handle ?? result.id}"] for a longer retained report.`
-      : "\n\nReport shortened to fit this response.";
-    return `${head}\n\n${excerpt}${guidance}`;
-  }).join(separator);
+    const truncation = result.outputTruncation?.truncated
+      ? `\nChild report truncated: ${result.outputTruncation.retainedBytes}/${result.outputTruncation.originalBytes} UTF-8 bytes retained. Use subagent wait with ids: ["${result.handle ?? result.id}"] for a longer retained report; saved sessions may retain completed messages.`
+      : "";
+    return `${head}${truncation}\n\n${resultText(result)}`;
+  }).join("\n\n---\n\n");
 }

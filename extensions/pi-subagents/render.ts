@@ -76,7 +76,8 @@ export function childListText(results: readonly ChildResult[]): string {
       ? `${result.phase ?? "starting"}${result.startedAt ? ` · ${Math.max(0, Math.round((Date.now() - result.startedAt) / 1000))}s` : ""}`
       : result.state.outcome;
     const handle = result.handle ?? result.id.slice(0, 8);
-    return `${handle} [${status}] · ${result.tools.length} tool${result.tools.length === 1 ? "" : "s"} · ${oneLineBounded(result.cwd, 512)}`;
+    const tools = result.tools === undefined ? "tools omitted" : `${result.tools.length} tool${result.tools.length === 1 ? "" : "s"}`;
+    return `${handle} [${status}] · ${tools} · ${result.cwd === undefined ? "cwd omitted" : oneLineBounded(result.cwd, 512)}`;
   }).join("\n");
 }
 
@@ -87,15 +88,15 @@ export function childListText(results: readonly ChildResult[]): string {
  */
 function collapsedPreview(child: ChildResult, command: SubagentDetails["command"] | undefined): string {
   const statusList = command === "status";
-  if (child.state.status === "running" || statusList) return child.omittedFields?.includes("prompt") ? "task not retained" : oneLine(child.prompt);
+  if (child.state.status === "running" || statusList) return child.prompt === undefined ? "task not retained" : oneLine(child.prompt);
   if (child.state.outcome === "completed") return "";
   // The timeout heading already says what happened and how long it ran; the
   // expanded view carries the elapsed/deadline summary.
   if (child.state.outcome === "timed_out" && isTimeoutSummary(child.errorMessage)) return "";
   const genericCancellation = child.state.outcome === "cancelled" && /^subagent cancelled\.?$/i.test(child.errorMessage?.trim() ?? "");
   const cause = genericCancellation
-    ? child.stderr || child.stdout
-    : child.errorMessage || child.stderr || child.stdout;
+    ? child.stderr
+    : child.errorMessage || child.stderr;
   return cause ? oneLine(clean(cause, 1024)) : "";
 }
 
@@ -187,7 +188,7 @@ function renderChildren(details: unknown, expanded: boolean, theme: Theme, targe
       if (deadline) container.addChild(new Text(theme.fg("dim", deadline), 0, 0));
       // Status/wait/stop rows need task labels; run/spawn/steer payloads are in their call header.
       if (data?.command !== "run" && data?.command !== "spawn" && data?.command !== "steer") {
-        container.addChild(new Text(theme.fg("dim", child.omittedFields?.includes("prompt") ? "Task prompt omitted to fit the response budget." : clean(child.prompt, 8192)), 0, 0));
+        container.addChild(new Text(theme.fg("dim", child.prompt === undefined ? "Task prompt omitted to fit the response budget." : clean(child.prompt, 8192)), 0, 0));
       }
       const report = resultText(child);
       let renderedReport = "";
@@ -200,18 +201,15 @@ function renderChildren(details: unknown, expanded: boolean, theme: Theme, targe
       if (child.outputTruncation?.truncated) {
         container.addChild(new Text(theme.fg("warning", `Output shortened: ${child.outputTruncation.retainedBytes}/${child.outputTruncation.originalBytes} UTF-8 bytes retained.`), 0, 0));
       }
-      for (const [label, value] of [["stderr", child.stderr], ["stdout", child.stdout]] as const) {
-        if (!value || remaining <= 0) continue;
-        // resultText may already embed the retained diagnostic. Keep the row only
-        // when it contributes content that the bounded report does not contain.
-        const safeValue = stripTerminalControls(value).trim();
-        if (!safeValue || value === report || renderedReport.includes(safeValue)) continue;
-        const diagnostic = truncateHeadTail(value, Math.min(remaining, 2048));
+      // resultText may already embed the retained diagnostic.
+      const safeStderr = stripTerminalControls(child.stderr).trim();
+      if (remaining > 0 && safeStderr && child.stderr !== report && !renderedReport.includes(safeStderr)) {
+        const diagnostic = truncateHeadTail(child.stderr, Math.min(remaining, 2048));
         remaining = Math.max(0, remaining - Buffer.byteLength(diagnostic));
-        container.addChild(new Text(theme.fg("dim", `${label}: ${stripTerminalControls(diagnostic)}`), 0, 0));
+        container.addChild(new Text(theme.fg("dim", `stderr: ${stripTerminalControls(diagnostic)}`), 0, 0));
       }
-      const cwd = child.omittedFields?.includes("cwd") ? "not retained (response budget)" : clean(child.cwd, 1024);
-      const tools = child.omittedFields?.includes("tools") ? "not retained (response budget)" : clean(child.tools.join(", "), 1024) || "none";
+      const cwd = child.cwd === undefined ? "not retained (response budget)" : clean(child.cwd, 1024);
+      const tools = child.tools === undefined ? "not retained (response budget)" : clean(child.tools.join(", "), 1024) || "none";
       const session = child.sessionFile ? `\nsession: ${clean(child.sessionFile, 1024)}`
         : child.omittedFields?.includes("sessionFile") ? "\nsession: omitted to fit response; inspect this child alone with status." : "";
       container.addChild(new Text(theme.fg("dim", `cwd: ${cwd}\ntools: ${tools}${session}`), 0, 0));

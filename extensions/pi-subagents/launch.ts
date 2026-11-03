@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, getPackageDir } from "@earendil-works/pi-coding-agent";
-import type { ChildTask } from "./supervisor.ts";
+import type { ChildTask } from "./execution.ts";
 
 export function findOnPath(name: string): string | undefined {
   for (const directory of (process.env.PATH ?? "").split(path.delimiter)) {

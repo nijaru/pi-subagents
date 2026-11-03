@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { RpcChildSupervisor, type ChildControl, type ChildExecutionData } from "../extensions/pi-subagents/supervisor.ts";
+import { runChild, type ExecutionUpdate, type ExecutionControl } from "./fixtures/run-child.ts";
 import { realRpcFixture } from "./fixtures/real-rpc.ts";
 
 // Each test starts the installed CLI, not an SDK bootstrap or fake RPC process.
@@ -10,8 +10,8 @@ test("real RPC child executes a tool and reports usage", async () => {
     ? { content: "FILE_SENTINEL" }
     : { reasoning_content: "PRIVATE_REASONING", tool_calls: [{ index: 0, id: "read_call", type: "function", function: { name: "read", arguments: JSON.stringify({ path: "fixture.txt" }) } }] });
   fs.writeFileSync(path.join(f.dir, "fixture.txt"), "SENTINEL_CONTENT");
-  const updates: ChildExecutionData[] = [];
-  const result = await new RpcChildSupervisor().run({
+  const updates: ExecutionUpdate[] = [];
+  const result = await runChild({
     task: {
       id: "real-run", prompt: "Read fixture.txt and report its content.", cwd: f.dir,
       tools: ["read"], model: "fixture/model", thinking: "off", executionTimeoutMs: 20_000,
@@ -39,7 +39,7 @@ test("real RPC child executes a tool and reports usage", async () => {
 
 test("missing tools exhaust startup without submitting model work", async () => {
   using f = realRpcFixture();
-  const result = await new RpcChildSupervisor().run({
+  const result = await runChild({
     task: {
       id: "missing-tool", prompt: "must not run", cwd: f.dir,
       tools: ["definitely_missing"], model: "fixture/model", executionTimeoutMs: 5_000, startupTimeoutMs: 1_000,
@@ -52,8 +52,8 @@ test("missing tools exhaust startup without submitting model work", async () => 
 
 test("failed default-persisted sessions recover their history only in the original workspace", async () => {
   using f = realRpcFixture((body) => ({ content: JSON.stringify(body.messages).includes("SECOND_MARKER") ? "OK" : "" }));
-  const supervisor = new RpcChildSupervisor();
-  const first = await supervisor.run({
+  const run = runChild;
+  const first = await run({
     task: { id: "persisted", prompt: "FIRST_MARKER", cwd: f.dir, tools: [], model: "fixture/model", executionTimeoutMs: 10_000 },
     signal: new AbortController().signal,
   });
@@ -62,13 +62,13 @@ test("failed default-persisted sessions recover their history only in the origin
   expect(fs.existsSync(first.sessionFile!)).toBe(true);
   const other = path.join(f.dir, "other");
   fs.mkdirSync(other);
-  const rejected = await supervisor.run({
+  const rejected = await run({
     task: { id: "wrong-cwd", prompt: "must not run", cwd: other, tools: [], model: "fixture/model", resume: first.sessionFile },
     signal: new AbortController().signal,
   });
   expect(rejected).toMatchObject({ outcome: "failed", errorKind: "startup" });
   expect(rejected.errorMessage).toContain("does not match requested cwd");
-  const second = await supervisor.run({
+  const second = await run({
     task: { id: "resumed", prompt: "SECOND_MARKER", cwd: f.dir, tools: [], model: "fixture/model", resume: first.sessionFile, executionTimeoutMs: 10_000 },
     signal: new AbortController().signal,
   });
@@ -90,13 +90,13 @@ test("a saved high-effort session continues at explicitly requested low effort",
   const extension = path.join(f.dir, "startup-effort.ts");
   fs.writeFileSync(extension, 'export default (pi: any) => pi.on("session_start", () => pi.setThinkingLevel("high"));');
   fs.writeFileSync(path.join(f.dir, "settings.json"), JSON.stringify({ extensions: [extension] }));
-  const supervisor = new RpcChildSupervisor();
-  const first = await supervisor.run({
+  const run = runChild;
+  const first = await run({
     task: { id: "effort-high", prompt: "First task", cwd: f.dir, tools: [], model: "fixture/model", thinking: "high", strictThinking: true, executionTimeoutMs: 10_000 },
     signal: new AbortController().signal,
   });
   expect(first).toMatchObject({ outcome: "completed", thinking: "high" });
-  const second = await supervisor.run({
+  const second = await run({
     task: { id: "effort-low", prompt: "Continue", cwd: f.dir, tools: [], model: "fixture/model", thinking: "low", strictThinking: true, resume: first.sessionFile, executionTimeoutMs: 10_000 },
     signal: new AbortController().signal,
   });
@@ -111,11 +111,11 @@ test("steering preserves a completed review alongside its follow-up through real
     if (f.requests.length === 1) { firstRequest.resolve(); return release.promise; }
     return { content: "FOLLOW_UP" };
   });
-  const ready = Promise.withResolvers<ChildControl>();
+  const ready = Promise.withResolvers<ExecutionControl>();
   const controller = new AbortController();
-  const pending = new RpcChildSupervisor().run({
+  const pending = runChild({
     task: { id: "steered-report", prompt: "Review", cwd: f.dir, tools: [], model: "fixture/model", executionTimeoutMs: 10_000 },
-    signal: controller.signal, onControl: ready.resolve,
+    signal: controller.signal, onReady: ready.resolve,
   });
   try {
     await firstRequest.promise;
@@ -140,10 +140,10 @@ test("a timed-out default session resumes completed work without restarting its 
     return { content: "EARLIER_FINDING", tool_calls: [{ index: 0, id: "read_call", type: "function", function: { name: "read", arguments: JSON.stringify({ path: "fixture.txt" }) } }] };
   });
   fs.writeFileSync(path.join(f.dir, "fixture.txt"), "COMPLETED_TOOL_RESULT");
-  const supervisor = new RpcChildSupervisor();
+  const run = runChild;
   let first;
   try {
-    first = await supervisor.run({
+    first = await run({
       task: { id: "deadline-recovery", prompt: "FIRST_MARKER", cwd: f.dir, tools: ["read"], model: "fixture/model", executionTimeoutMs: 5_000 },
       signal: new AbortController().signal,
     });
@@ -156,7 +156,7 @@ test("a timed-out default session resumes completed work without restarting its 
   expect(f.requests).toHaveLength(2);
   // A changed file makes replaying the completed read observable.
   fs.writeFileSync(path.join(f.dir, "fixture.txt"), "CHANGED_AFTER_TIMEOUT");
-  const resumed = await supervisor.run({
+  const resumed = await run({
     task: { id: "deadline-resumed", prompt: "SECOND_MARKER", cwd: f.dir, tools: ["read"], model: "fixture/model", resume: first.sessionFile, executionTimeoutMs: 10_000 },
     signal: new AbortController().signal,
   });
@@ -174,7 +174,7 @@ test("real RPC child finishes async session_shutdown hooks on normal completion"
 import { setTimeout as delay } from "node:timers/promises";
 export default (pi: any) => pi.on("session_shutdown", async () => { await delay(300); writeFileSync("shutdown.done", "yes"); });`);
   fs.writeFileSync(path.join(f.dir, "settings.json"), JSON.stringify({ extensions: [path.join(f.dir, "shutdown.ts")] }));
-  const result = await new RpcChildSupervisor().run({
+  const result = await runChild({
     task: { id: "shutdown", prompt: "say OK", cwd: f.dir, tools: [], model: "fixture/model", executionTimeoutMs: 10_000 },
     signal: new AbortController().signal,
   });
@@ -188,7 +188,7 @@ test("selected callable codemode tool remains reachable after exclusions", async
     : { tool_calls: [{ index: 0, id: "code_call", type: "function", function: { name: "code_lookup", arguments: "{}" } }] });
   fs.writeFileSync(path.join(f.dir, "code.ts"), `export default (pi: any) => pi.registerTool({ name: "code_lookup", label: "lookup", description: "codemode", exposure: "codemode", parameters: { type: "object", properties: {}, additionalProperties: false }, execute: async () => ({ content: [{ type: "text", text: "tool-ran" }] }) });`);
   fs.writeFileSync(path.join(f.dir, "settings.json"), JSON.stringify({ extensions: [path.join(f.dir, "code.ts")] }));
-  const result = await new RpcChildSupervisor().run({
+  const result = await runChild({
     task: { id: "codemode", prompt: "use the tool", cwd: f.dir, tools: ["code_lookup"], model: "fixture/model", executionTimeoutMs: 10_000 },
     signal: new AbortController().signal,
   });
@@ -208,7 +208,7 @@ export default (pi: any) => {
   pi.registerTool({ name: "delegate_probe", label: "delegate", description: "delegate", parameters: { type: "object", properties: {}, additionalProperties: false }, execute: async (_id: string, _args: unknown, _signal: unknown, _update: unknown, ctx: any) => { const outcome = await ctx.executeTool("mcp__omitted__action", {}); writeFileSync("nested-result", JSON.stringify({ isError: outcome.isError, content: outcome.content })); return { content: [{ type: "text", text: outcome.isError ? "blocked" : "reached" }] }; } });
 };`);
   fs.writeFileSync(path.join(f.dir, "settings.json"), JSON.stringify({ extensions: [path.join(f.dir, "nested.ts")] }));
-  const result = await new RpcChildSupervisor().run({
+  const result = await runChild({
     task: { id: "nested", prompt: "use delegate", cwd: f.dir, tools: ["delegate_probe"], model: "fixture/model", executionTimeoutMs: 10_000 },
     signal: new AbortController().signal,
   });
@@ -228,7 +228,7 @@ export default (pi: any) => {
   });
 }`);
   fs.writeFileSync(path.join(f.dir, "settings.json"), JSON.stringify({ extensions: [path.join(f.dir, "slow.ts")] }));
-  const result = await new RpcChildSupervisor().run({
+  const result = await runChild({
     task: { id: "slow-start", prompt: "say OK", cwd: f.dir, tools: ["slow_tool"], model: "fixture/model", executionTimeoutMs: 10_000, startupTimeoutMs: 15_000 },
     signal: new AbortController().signal,
   });

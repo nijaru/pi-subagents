@@ -34,6 +34,15 @@ export const SubagentParamsSchema = Type.Object({
 
 export type SubagentParams = Static<typeof SubagentParamsSchema>;
 
+/** The flat wire schema stays provider-friendly; dispatch uses validated commands. */
+export type SubagentCommand = SubagentParams & (
+  | { command: "run" | "spawn"; prompt: string }
+  | { command: "wait"; ids: string[] }
+  | { command: "steer"; id: string; message: string }
+  | { command: "stop"; id: string }
+  | { command: "status" }
+);
+
 // Least privilege: a delegated task can read, search, and browse by default.
 // Mutation tools (bash/edit/write) must be requested explicitly.
 const DEFAULT_TOOLS = [
@@ -78,7 +87,7 @@ export function selectTools(requested: string[] | undefined, active: string[], c
   return [...tools];
 }
 
-export function validateCommand(params: SubagentParams): void {
+export function validateCommand(params: SubagentParams): asserts params is SubagentCommand {
   const start = params.command === "run" || params.command === "spawn";
   if (start) {
     if (!params.prompt?.trim()) throw new Error(`${params.command} requires a non-blank prompt.`);

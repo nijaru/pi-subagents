@@ -113,13 +113,14 @@ function truncationFor(result: ChildResult, output: string) {
 
 export function minimalChildResult(result: ChildResult): ChildResult {
   const omittedFields = (["prompt", "cwd", "tools", "sessionFile"] as const).filter((key) =>
-    (result[key]?.length ?? 0) > 0 || result.omittedFields?.includes(key));
+    result[key] !== undefined || result.omittedFields?.includes(key));
   return {
     id: result.id,
     ...(result.handle === undefined ? {} : { handle: result.handle }),
     ...(result.phase === undefined ? {} : { phase: result.phase }),
     ...(result.errorKind === undefined ? {} : { errorKind: result.errorKind }),
     ...(result.timeoutPhase === undefined ? {} : { timeoutPhase: result.timeoutPhase }),
+    ...(result.cleanup === undefined ? {} : { cleanup: result.cleanup.status === "confirmed" ? { ...result.cleanup } : { ...result.cleanup, error: truncateOutput(result.cleanup.error, 256) } }),
     ...(result.cleanupMs === undefined ? {} : { cleanupMs: result.cleanupMs }),
     ...(result.taskFinishedAt === undefined ? {} : { taskFinishedAt: result.taskFinishedAt }),
     ...(result.deadline === undefined ? {} : { deadline: { ...result.deadline } }),
@@ -127,15 +128,11 @@ export function minimalChildResult(result: ChildResult): ChildResult {
     ...(result.activity === undefined ? {} : { activity: result.activity }),
     ...(result.currentTool === undefined ? {} : { currentTool: result.currentTool }),
     ...(result.interruption === undefined ? {} : { interruption: { ...result.interruption } }),
-    prompt: "",
-    cwd: "",
-    tools: [],
     ...(omittedFields.length ? { omittedFields } : {}),
     startedAt: result.startedAt,
     state: { ...result.state },
     outputTruncation: truncationFor(result, ""),
     stderr: "",
-    stdout: result.stdout === undefined ? undefined : "",
     usage: copyUsage(result.usage),
   };
 }
@@ -147,8 +144,9 @@ export function boundChildResult(result: ChildResult, maxBytes: number): ChildRe
     throw new RangeError("Child result budget cannot hold its minimal representation");
   }
   const addCandidate = (key: keyof ChildResult, value: unknown): boolean => {
+    if (value === undefined) return false;
     const next = { ...bounded, [key]: value } as ChildResult;
-    if ((key === "prompt" || key === "cwd" || key === "tools" || key === "sessionFile") && (value as string | string[]).length > 0) {
+    if (key === "prompt" || key === "cwd" || key === "tools" || key === "sessionFile") {
       next.omittedFields = next.omittedFields?.filter((field) => field !== key);
       if (!next.omittedFields?.length) delete next.omittedFields;
     }
@@ -159,34 +157,37 @@ export function boundChildResult(result: ChildResult, maxBytes: number): ChildRe
   };
   // Account for object overhead and JSON escaping rather than dropping a
   // successful report merely because its full text fills the output budget.
-  const addText = (key: "output" | "prompt" | "stderr" | "stdout" | "errorMessage" | "model", value: string | undefined, cap: number, truncate: typeof truncateOutput = truncateOutput): void => {
+  const addText = (key: "output" | "prompt" | "stderr" | "errorMessage" | "model", value: string | undefined, cap: number, truncate: typeof truncateOutput = truncateOutput): void => {
     if (value === undefined) return;
     let low = 0;
     let high = Math.min(cap, Buffer.byteLength(value, "utf8"));
-    if (addCandidate(key, truncate(value, high))) return;
+    const tryText = (budget: number) => {
+      const text = truncate(value, budget);
+      return key === "prompt" && value.length > 0 && text.length === 0 ? false : addCandidate(key, text);
+    };
+    if (tryText(high)) return;
     while (low <= high) {
       const middle = Math.floor((low + high) / 2);
-      if (addCandidate(key, truncate(value, middle))) low = middle + 1;
+      if (tryText(middle)) low = middle + 1;
       else high = middle - 1;
     }
   };
-  // Paths must fit whole: never return a truncated resume target.
-  if (result.sessionFile !== undefined) addCandidate("sessionFile", result.sessionFile);
-  // Optional metadata must pay for JSON escaping just like report text.
+  // Primary diagnostics outrank optional recovery paths. A whole path can
+  // otherwise consume every byte of a batch share and erase the failure cause.
   addText("errorMessage", result.errorMessage, 512);
   // Reserve task identity and actionable diagnostics before filling the report.
   addText("prompt", result.prompt, 256);
   addText("stderr", result.stderr, 1024, truncateHeadTail);
-  addText("stdout", result.stdout, 512, truncateHeadTail);
+  // Paths must fit whole: never return a truncated resume target.
+  if (result.sessionFile !== undefined) addCandidate("sessionFile", result.sessionFile);
   addText("model", result.model, 256);
   if (result.thinking !== undefined) addCandidate("thinking", result.thinking);
-  addCandidate("tools", [...result.tools]);
+  if (result.tools !== undefined) addCandidate("tools", [...result.tools]);
   addCandidate("cwd", result.cwd);
   addText("output", result.output, MAX_OUTPUT_BYTES);
   // Expand context only when the report leaves room.
   addText("prompt", result.prompt, MAX_DIAGNOSTIC_BYTES);
   addText("stderr", result.stderr, MAX_DIAGNOSTIC_BYTES, truncateHeadTail);
-  addText("stdout", result.stdout, MAX_DIAGNOSTIC_BYTES, truncateHeadTail);
   return bounded;
 }
 

@@ -20,7 +20,7 @@ Requires Pi 1.3.0+ from a Node/npm installation with the `pi` CLI and Node 22.19
 {"command":"wait","ids":["sa-4821"]}
 ```
 
-**steer** queues an instruction after the running child's current assistant turn and tool calls. During startup it joins readiness. It cannot interrupt a model request or tool batch; acceptance is not proof of delivery. Cancelling steering stops waiting, not the child, and cannot recall an instruction already sent. Successful output retains completed answers before and after steering, excluding tool-use narration.
+**steer** queues an instruction after the running child's current assistant turn and tool calls. During startup it joins readiness. It cannot interrupt a model request or tool batch; acceptance is not proof of delivery. Cancelling steering stops waiting, not the child, and cannot recall an instruction already sent. A missing or cancelled acknowledgment has unknown acceptance; do not resend automatically. Successful output retains completed answers before and after steering, excluding tool-use narration.
 
 **status** inspects one handle or lists retained children without collecting reports. **stop** cancels a child and joins cleanup; safe to repeat. `status`, `wait`, `stop`, and `steer` also accept full UUIDs.
 
@@ -44,7 +44,7 @@ Use `run` or `spawn` with a focused prompt and `resume: "sa-4821"`. This creates
 
 After handles are cleared or the parent restarts, use `resume: "<sessionFile>"` with the original `cwd`. Relative paths resolve against the parent cwd. The active parent session and mismatched workspaces are rejected. Do not combine `persist` with `resume`.
 
-Persisted sessions have exclusive cooperative ownership through cleanup. Ordinary Pi processes do not honor the lock; do not open an owned session elsewhere. A hard crash or unconfirmed cleanup can leave `<sessionFile>.subagent-lock`; verify the old child has stopped before removing it. Locks never expire automatically.
+Persisted sessions have exclusive cooperative ownership through cleanup. Ordinary Pi processes do not honor the lock; do not open an owned session elsewhere. A hard crash or unconfirmed cleanup can leave `<sessionFile>.subagent-lock`; verify the old child has stopped before removing it. Locks never expire automatically. `cleanup.status: "unconfirmed"` also retains an admission slot even after collection; that handle cannot be resumed, cleared, or evicted. Reconcile the process/workspace before recovery. Starting a new parent clears handle reservations, not orphaned lock files.
 
 RPC cannot show project-trust prompts. Set `trustProject: true` for one-shot `--approve` when project resources are needed; parent trust is not inherited.
 
@@ -57,18 +57,18 @@ RPC cannot show project-trust prompts. Set `trustProject: true` for one-shot `--
 | `joinTimeoutMs` | 60s | One `run` join; maximum 10m |
 | `timeoutMs` | 5m | One `wait` join; maximum 10m |
 
-Environment defaults: `PI_SUBAGENT_STARTUP_TIMEOUT_MS`, `PI_SUBAGENT_TIMEOUT_MS`, and `PI_SUBAGENT_FOREGROUND_MS`. Join/wait expiry leaves children running and does not change execution deadlines. Never relaunch because a join expired. Cancelling `run` cancels its child; cancelling `wait` leaves children running.
+Environment defaults: `PI_SUBAGENT_STARTUP_TIMEOUT_MS`, `PI_SUBAGENT_TIMEOUT_MS`, and `PI_SUBAGENT_FOREGROUND_MS`. Join/wait expiry leaves children running and does not change execution deadlines. Never relaunch because a join expired. Cancelling `run` cancels its child and joins cleanup even beyond the join budget; cancelling `wait` leaves children running.
 
 Failed `run`/`wait` reports are tool errors. Codemode still returns `{ command, results, waitExpired? }`: inspect each `state`, `errorKind`, `timeoutPhase`, and `output`. Mixed waits retain successful reports; do not repeat that work. Invalid requests and cancelled waits reject. `incomplete` means a model output limit, not success. `waitExpired: true` means no selected child completed within the wait budget, not an execution timeout.
 
 On timeout or failure, inspect retained output, timing, and saved history before choosing recovery. `deadline` records the effective phase cutoff; activity never extends it. `lastActivityAt` and live `activity`/`currentTool` distinguish model, thinking, text, tool, Pi retry, and compaction observations without exposing private payloads. Neither silence nor activity proves a stall or useful progress; deadline expiry does not establish its cause.
 
-Before continuing interrupted mutations, reconcile workspace/external effects. `interruption` records observed activity and tool starts without observed ends, not a complete effects ledger. A tool may apply a mutation without saving its result; missing or synthetic results do not prove failure. Resume is not rollback and never justifies blind replay. Resend still-needed steering explicitly; undelivered queues are not saved history.
+Before continuing interrupted mutations, reconcile workspace/external effects. `interruption` records observed activity and tool starts without observed ends, not a complete effects ledger. A tool may apply a mutation without saving its result; missing or synthetic results do not prove failure. Resume is not rollback and never justifies blind replay. Undelivered steering queues are not saved history; inspect the conversation and reconcile effects before deciding whether an instruction needs resending.
 
 ## Limits and retention
 
-Four active children and 32 retained handles per parent. Wait for or stop work when admission is full; read unread reports before starting more. Only explicit `run`/`wait`/`stop` retrieval collects terminal reports. Oldest completed, collected handles may be evicted; unread reports never are. `/subagents` lists children; `/subagents clear` drops completed, collected handles, not session files.
+Four admission slots, including cleanup-unconfirmed children, and 32 retained handles per parent. Wait for or stop work when admission is full; read unread reports before starting more. Only explicit `run`/`wait`/`stop` retrieval collects terminal reports. Oldest completed, collected handles may be evicted; unread reports never are. `/subagents` lists children; `/subagents clear` drops completed, collected handles, not session files.
 
-Prompts are capped at 100 KiB; responses and details at 50 KiB each. Reports retain bounded UTF-8 prefixes with `outputTruncation`; larger text requires a saved session. If batch details list `sessionFile` in `omittedFields`, inspect that child alone with `status` for its full path. Never resume from a shortened prose path. Task/steering envelopes keep leading slash commands literal.
+Prompts are capped at 100 KiB; responses and details at 50 KiB each. Text and structured results share one budgeted report view with truthful `outputTruncation`; larger text requires a saved session. Budget-omitted launch metadata is absent, not an empty execution value. If batch details list `sessionFile` in `omittedFields`, inspect that child alone with `status` for its full path. Never resume from a shortened prose path. Task/steering envelopes keep leading slash commands literal.
 
 Quit, reload, or session replacement stops all children and discards handles. Background work requires a live parent; the parent-death watchdog stops the child process group after a hard crash.
