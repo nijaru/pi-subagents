@@ -27,9 +27,8 @@ export const SubagentParamsSchema = Type.Object({
   executionTimeoutMs: Type.Optional(Type.Integer({ description: "run/spawn only: model/tool execution deadline, starting when the task is submitted. Positive integer milliseconds, at most 2 hours; defaults to PI_SUBAGENT_TIMEOUT_MS (30 minutes). Separate from startup, join, and wait budgets. A timed-out result keeps partial output and reports elapsed runtime and the deadline.", minimum: 1, maximum: MAX_PROCESS_TIMEOUT_MS })),
   startupTimeoutMs: Type.Optional(Type.Integer({ description: "run/spawn only: deadline for the RPC process, model selection, tool probe, and MCP readiness before the task starts. Positive integer milliseconds, at most 5 minutes; defaults to PI_SUBAGENT_STARTUP_TIMEOUT_MS (30 seconds).", minimum: 1, maximum: MAX_STARTUP_TIMEOUT_MS })),
   joinTimeoutMs: Type.Optional(Type.Integer({ description: "run only: how long this call waits before returning the running child for background delivery. Does not change the execution deadline. Defaults to PI_SUBAGENT_FOREGROUND_MS (60 seconds).", minimum: 1, maximum: MAX_WAIT_MS })),
-  notify: Type.Optional(Type.Enum(["inbox", "turn"] as const, { type: "string", description: "Completion delivery: inbox (default) advertises unread results on the next tool result; turn additionally attempts an active-boundary readiness announcement. Notices never consume reports; retrieve them with wait." })),
   persist: Type.Optional(Type.Boolean({ description: "run/spawn only: save the Pi conversation for inspection/recovery, including after failure; default true. Set false to avoid retaining potentially sensitive prompts/tool results. Returns sessionFile for resume in the same cwd after the child stops; not a full token trace." })),
-  resume: Type.Optional(Type.String({ description: "run/spawn only: existing child session file to continue instead of starting fresh. Mutually exclusive with persist.", minLength: 1, maxLength: 4096 })),
+  resume: Type.Optional(Type.String({ description: "run/spawn only: stopped child handle (sa-N) or saved session path to continue. Handle resume defaults to its original cwd; paths resolve against the parent cwd. Mutually exclusive with persist.", minLength: 1, maxLength: 4096 })),
   trustProject: Type.Optional(Type.Boolean({ description: "run/spawn only: pass --approve to the child so project-local resources load without a trust prompt; default false." })),
 }, { additionalProperties: false });
 
@@ -84,13 +83,13 @@ export function validateCommand(params: SubagentParams): void {
   if (start) {
     if (!params.prompt?.trim()) throw new Error(`${params.command} requires a non-blank prompt.`);
     if (Buffer.byteLength(params.prompt, "utf8") > MAX_TASK_BYTES) throw new Error(`Prompt must be at most ${MAX_TASK_BYTES} bytes.`);
-    if (params.id !== undefined || params.ids !== undefined || params.timeoutMs !== undefined || params.message !== undefined) throw new Error(`${params.command} accepts only prompt, tools, model, thinking, cwd, notify, persist, resume, trustProject, startupTimeoutMs and executionTimeoutMs.`);
-    if (params.persist && params.resume !== undefined) throw new Error("persist and resume are mutually exclusive.");
+    if (params.id !== undefined || params.ids !== undefined || params.timeoutMs !== undefined || params.message !== undefined) throw new Error(`${params.command} accepts only prompt, tools, model, thinking, cwd, persist, resume, trustProject, startupTimeoutMs and executionTimeoutMs.`);
+    if (params.persist !== undefined && params.resume !== undefined) throw new Error("persist and resume are mutually exclusive.");
     if (params.command === "spawn" && params.joinTimeoutMs !== undefined) throw new Error("spawn does not join; joinTimeoutMs is only accepted by run.");
     if (params.model !== undefined && !params.model.trim()) throw new Error("Model must not be blank.");
     if (params.cwd !== undefined && !params.cwd.trim()) throw new Error("Working directory must not be blank.");
   } else {
-    if (params.prompt !== undefined || params.tools !== undefined || params.model !== undefined || params.thinking !== undefined || params.cwd !== undefined || params.executionTimeoutMs !== undefined || params.startupTimeoutMs !== undefined || params.joinTimeoutMs !== undefined || params.notify !== undefined || params.persist !== undefined || params.resume !== undefined || params.trustProject !== undefined) throw new Error(`${params.command} does not accept child creation or join options.`);
+    if (params.prompt !== undefined || params.tools !== undefined || params.model !== undefined || params.thinking !== undefined || params.cwd !== undefined || params.executionTimeoutMs !== undefined || params.startupTimeoutMs !== undefined || params.joinTimeoutMs !== undefined || params.persist !== undefined || params.resume !== undefined || params.trustProject !== undefined) throw new Error(`${params.command} does not accept child creation or join options.`);
     if (params.command === "wait") {
       if (params.id !== undefined || !params.ids?.length) throw new Error('wait requires ids: ["<child-id>", ...], not id.');
       if (params.message !== undefined) throw new Error("message is only accepted by steer.");

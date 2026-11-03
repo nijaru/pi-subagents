@@ -127,7 +127,6 @@ export function minimalChildResult(result: ChildResult): ChildResult {
     ...(result.activity === undefined ? {} : { activity: result.activity }),
     ...(result.currentTool === undefined ? {} : { currentTool: result.currentTool }),
     ...(result.interruption === undefined ? {} : { interruption: { ...result.interruption } }),
-    ...(result.notify === undefined ? {} : { notify: result.notify }),
     prompt: "",
     cwd: "",
     tools: [],

@@ -22,7 +22,7 @@ function controlled() {
   };
   const notices: string[] = [];
   const children = new SessionChildren(supervisor, (result) => notices.push(result.id));
-  const start = (options: { notify?: "inbox" | "turn" } = {}) => children.start({ prompt: "bounded task", tools: ["read"], cwd: process.cwd(), notify: "turn", ...options });
+  const start = () => children.start({ prompt: "bounded task", tools: ["read"], cwd: process.cwd() });
   return { children, start, requests, executions, gates, notices };
 }
 
@@ -167,7 +167,7 @@ describe("session ownership", () => {
   });
   test("inbox notices are re-advertised once per turn and read handles can be pruned", async () => {
     const c = controlled();
-    const run = c.start({ notify: "inbox" });
+    const run = c.start();
     c.gates[0]!.resolve();
     await run.promise;
     expect(c.children.pendingInbox().map((result) => result.handle)).toEqual([run.handle]);

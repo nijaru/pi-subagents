@@ -75,7 +75,7 @@ describe("RPC-backed subagent tool", () => {
     const steered = await h.execute({ command: "steer", id: handle, message: "focus" });
     expect(steered.details.command).toBe("steer");
     const joined = await h.execute({ command: "wait", ids: [handle], timeoutMs: 5000 });
-    expect(joined.details.results[0].output).toBe("steered: Steering instruction:\n\nfocus");
+    expect(joined.details.results[0].output).toBe("waiting for steer\n\nsteered: Steering instruction:\n\nfocus");
     expect(joined.details.results[0].state).toMatchObject({ status: "terminal", outcome: "completed" });
   });
 
@@ -86,6 +86,39 @@ describe("RPC-backed subagent tool", () => {
     const value = await h.execute({ command: "run", prompt: "continue", tools: [], resume: sessionFile });
     expect(value.details.results[0].sessionFile).toBe(fs.realpathSync.native(sessionFile));
     expect(fs.readFileSync(path.join(h.cwd, ".fake-rpc-capture.json"), "utf8")).toContain("--session");
+  });
+
+  test("resumes a retained handle in its original cwd with a new handle", async () => {
+    const h = host();
+    const childCwd = tempDir();
+    const first = (await h.execute({ command: "run", prompt: "first", tools: [], cwd: childCwd })).details.results[0];
+    // The fake CLI does not persist a transcript; provide its session header.
+    fs.writeFileSync(first.sessionFile, `${JSON.stringify({ type: "session", cwd: childCwd })}\n`);
+    const second = (await h.execute({ command: "run", prompt: "continue", tools: [], resume: first.handle, thinking: "low" })).details.results[0];
+    expect(second).toMatchObject({ cwd: fs.realpathSync.native(childCwd), sessionFile: first.sessionFile, thinking: "low", state: { outcome: "completed" } });
+    expect(second.handle).not.toBe(first.handle);
+    expect((await h.execute({ command: "status", id: first.handle })).details.results[0].output).toBe("done");
+  });
+
+  test("handle resume rejects running and non-persisted children without relaunching", async () => {
+    const h = host();
+    const running = (await h.execute({ command: "spawn", prompt: "SCENARIO=steer", tools: [] })).details.results[0];
+    await expect(h.execute({ command: "run", prompt: "continue", tools: [], resume: running.handle })).rejects.toThrow("still running");
+    const finished = (await h.execute({ command: "run", prompt: "first", tools: [], persist: false })).details.results[0];
+    await expect(h.execute({ command: "run", prompt: "continue", tools: [], resume: finished.handle })).rejects.toThrow("no persisted session");
+    await expect(h.execute({ command: "run", prompt: "continue", tools: [], resume: "sa-0" })).rejects.toThrow("Unknown child");
+    expect((await h.execute({ command: "status" })).details.results).toHaveLength(2);
+  });
+
+  test("mixed successful and failed reports remain independently readable", async () => {
+    const h = host();
+    const good = (await h.execute({ command: "run", prompt: "hello", tools: [] })).details.results[0];
+    const bad = (await h.execute({ command: "run", prompt: "SCENARIO=fail", tools: [] })).details.results[0];
+    const joined = await h.execute({ command: "wait", ids: [good.handle, bad.handle] });
+    expect(joined.isError).toBe(true);
+    expect(joined.details.results.map((result: any) => result.state.outcome)).toEqual(["completed", "failed"]);
+    expect(joined.details.results[0].output).toBe("done");
+    expect((await h.execute({ command: "wait", ids: [good.handle] })).isError).toBe(false);
   });
 
   test("persists a child session when requested", async () => {
@@ -132,7 +165,7 @@ describe("RPC-backed subagent tool", () => {
   test("low-level agent restarts cannot rearm readiness continuations", async () => {
     const h = host();
     h.handlers.get("before_agent_start")?.({}, h.context);
-    const started = await h.execute({ command: "spawn", prompt: "hello", tools: [], notify: "turn" });
+    const started = await h.execute({ command: "spawn", prompt: "hello", tools: [] });
     const id = started.details.results[0].handle;
     try {
       const deadline = Date.now() + 3000;
@@ -198,7 +231,7 @@ describe("RPC-backed subagent tool", () => {
     }
   });
 
-  test("/subagents lists, omits zero-unread/default inbox decoration, and clears", async () => {
+  test("/subagents lists retained handles, omits zero-unread decoration, and clears", async () => {
     const h = host();
     await h.execute({ command: "run", prompt: "hello", tools: [] });
     const command = h.commands.get("subagents");
@@ -212,9 +245,9 @@ describe("RPC-backed subagent tool", () => {
     expect(listed).not.toContain("inbox");
     for (const alias of ["status", "prune"]) expect(run(alias)).toBe("Usage: /subagents [clear]");
     expect(run("clear")).toContain("Cleared 1 read child handle");
-    const running = await h.execute({ command: "spawn", prompt: "SCENARIO=steer", tools: [], notify: "turn" });
+    const running = await h.execute({ command: "spawn", prompt: "SCENARIO=steer", tools: [] });
     try {
-      expect(run("")).toContain(" · turn · ");
+      expect(run("")).toContain(running.details.results[0].handle);
     } finally {
       await h.execute({ command: "stop", id: running.details.results[0].handle });
     }

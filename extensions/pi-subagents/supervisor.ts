@@ -156,7 +156,7 @@ export class RpcChildSupervisor implements ChildSupervisor {
       timer = setTimeout(() => stop({ kind: "deadline", phase: which, budget, elapsed: Date.now() - start }), Math.max(1, data.deadline.expiresAt - Date.now()));
       timer.unref?.();
     };
-    const updateOutput = (includeHistory = false) => Object.assign(data, transcript.snapshot(includeHistory));
+    const updateOutput = (mode: "live" | "history" | "reports" = "live") => Object.assign(data, transcript.snapshot(mode));
     const recordActivity = (kind?: ChildActivity) => {
       const previousActivity = data.activity, previousTool = data.currentTool;
       const now = Date.now();
@@ -228,7 +228,7 @@ export class RpcChildSupervisor implements ChildSupervisor {
           if (event.message?.role === "assistant") {
             assistantOpen = false;
             assistant = event.message;
-            transcript.finish(textFromMessage(assistant));
+            transcript.finish(textFromMessage(assistant), assistant.stopReason);
             data.usage.turns++;
             if (isUsage(assistant.usage)) addUsage(data.usage, assistant.usage);
             else if (streamingUsage) addUsage(data.usage, streamingUsage);
@@ -291,11 +291,21 @@ export class RpcChildSupervisor implements ChildSupervisor {
       if (phase !== "starting") return;
       // Every startup command spends the same deadline, including the probe.
       const remaining = () => Math.max(1, startupBudget - Math.max(0, Date.now() - startedAt));
-      const state = (await rpc.request({ type: "get_state" }, remaining())).data;
-      if (!state?.model) throw new Error("Child has no selected model.");
-      const model = `${state.model.provider}/${state.model.id}`;
-      if (task.model && model !== task.model) throw new Error(`Child model ${model} does not match requested ${task.model}.`);
-      if (task.strictThinking && state.thinkingLevel !== task.thinking) throw new Error(`Child thinking ${state.thinkingLevel} does not match requested ${task.thinking}.`);
+      // CLI flags select startup defaults; establish the requested configuration
+      // again after session restoration and extension startup, before any work.
+      if (task.model) {
+        const separator = task.model.indexOf("/");
+        if (separator < 1) throw new Error("Child model must use provider/model-id.");
+        await rpc.request({ type: "set_model", provider: task.model.slice(0, separator), modelId: task.model.slice(separator + 1) }, remaining());
+      }
+      if (task.thinking !== undefined) {
+        if (task.strictThinking) {
+          const levels = (await rpc.request({ type: "get_available_thinking_levels" }, remaining())).data?.levels;
+          if (!Array.isArray(levels)) throw new Error("Child did not report supported thinking levels.");
+          if (!levels.includes(task.thinking)) throw new Error(`Child model does not support thinking ${task.thinking}; supported: ${levels.join(", ")}.`);
+        }
+        await rpc.request({ type: "set_thinking_level", level: task.thinking }, remaining());
+      }
       const commands = (await rpc.request({ type: "get_commands" }, remaining())).data?.commands;
       if (!Array.isArray(commands) || !commands.some((command) => command.name === PROBE_COMMAND && command.source === "extension")) throw new Error("Child probe extension is unavailable.");
       const probeResponse = await rpc.request({ type: "prompt", message: `/${PROBE_COMMAND}` }, remaining());
@@ -306,6 +316,11 @@ export class RpcChildSupervisor implements ChildSupervisor {
       const missing = task.tools.filter((tool) => !report.tools.includes(tool));
       if (missing.length) throw new Error(`Requested child tools are unavailable: ${missing.join(", ")}`);
       if (new Set(report.tools).size !== task.tools.length || report.tools.length !== task.tools.length) throw new Error("Child tool selection did not match request.");
+      const state = (await rpc.request({ type: "get_state" }, remaining())).data;
+      if (!state?.model) throw new Error("Child has no selected model.");
+      const model = `${state.model.provider}/${state.model.id}`;
+      if (task.model && model !== task.model) throw new Error(`Child model ${model} does not match requested ${task.model}.`);
+      if (task.strictThinking && state.thinkingLevel !== task.thinking) throw new Error(`Child thinking ${state.thinkingLevel} does not match requested ${task.thinking}.`);
       data.model = model;
       data.thinking = state.thinkingLevel;
       data.phase = "running";
@@ -351,7 +366,7 @@ export class RpcChildSupervisor implements ChildSupervisor {
       outcome.errorKind = "cleanup";
       outcome.errorMessage = [outcome.errorMessage, cleanup.error, !hasExited(child) && data.sessionFile ? "Session ownership lock retained." : undefined].filter(Boolean).join("\n");
     }
-    if (outcome.outcome !== "completed") updateOutput(true);
+    updateOutput(outcome.outcome === "completed" ? "reports" : "history");
     return { ...snapshot(), ...outcome };
   }
 }

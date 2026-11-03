@@ -76,8 +76,7 @@ export function childListText(results: readonly ChildResult[]): string {
       ? `${result.phase ?? "starting"}${result.startedAt ? ` · ${Math.max(0, Math.round((Date.now() - result.startedAt) / 1000))}s` : ""}`
       : result.state.outcome;
     const handle = result.handle ?? result.id.slice(0, 8);
-    const notify = result.notify === "turn" ? " · turn" : "";
-    return `${handle} [${status}]${notify} · ${result.tools.length} tool${result.tools.length === 1 ? "" : "s"} · ${oneLineBounded(result.cwd, 512)}`;
+    return `${handle} [${status}] · ${result.tools.length} tool${result.tools.length === 1 ? "" : "s"} · ${oneLineBounded(result.cwd, 512)}`;
   }).join("\n");
 }
 

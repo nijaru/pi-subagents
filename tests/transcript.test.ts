@@ -2,14 +2,29 @@ import { expect, test } from "bun:test";
 import { ChildTranscript } from "../extensions/pi-subagents/transcript.ts";
 import { MAX_OUTPUT_BYTES } from "../extensions/pi-subagents/limits.ts";
 
-test("successful output is the final report, not earlier narration or streamed duplicates", () => {
+test("successful output retains completed reports across steering, not narration or streamed duplicates", () => {
   const transcript = new ChildTranscript();
-  transcript.finish("Earlier finding");
+  transcript.finish("Tool narration", "toolUse");
+  transcript.finish("Original review", "stop");
   transcript.start();
-  transcript.append(0, "Final report");
-  transcript.finish("Final report");
-  expect(transcript.snapshot().output).toBe("Final report");
-  expect(transcript.snapshot(true).output).toBe("Earlier finding\n\nFinal report");
+  transcript.append(0, "Follow-up");
+  transcript.finish("Follow-up", "stop");
+  expect(transcript.snapshot().output).toBe("Follow-up");
+  expect(transcript.snapshot("reports").output).toBe("Original review\n\nFollow-up");
+  expect(transcript.snapshot("history").output).toBe("Tool narration\n\nOriginal review\n\nFollow-up");
+});
+
+test("completed reports retain a bounded UTF-8 prefix with truthful combined sizes", () => {
+  const transcript = new ChildTranscript();
+  const first = "界🙂".repeat(MAX_OUTPUT_BYTES);
+  const second = "Follow-up";
+  transcript.finish(first, "stop");
+  transcript.finish("not a report", "toolUse");
+  transcript.finish(second, "stop");
+  const result = transcript.snapshot("reports");
+  expect(result.outputTruncation).toEqual({ truncated: true, originalBytes: Buffer.byteLength(first + "\n\n" + second), retainedBytes: Buffer.byteLength(result.output!) });
+  expect(Buffer.byteLength(result.output!)).toBeLessThanOrEqual(MAX_OUTPUT_BYTES);
+  expect(result.output).not.toContain("�");
 });
 
 test("authoritative block text replaces deltas by index without losing other text blocks", () => {
@@ -24,8 +39,8 @@ test("authoritative block text replaces deltas by index without losing other tex
   expect(transcript.snapshot()).toEqual({ output: "corrected🙂\ntail\n", outputTruncation: undefined });
   transcript.completeBlock(0, "");
   expect(transcript.snapshot().output).toBe("\ntail\n");
-  transcript.finish("whole authoritative message");
-  expect(transcript.snapshot(true).output).toBe("whole authoritative message");
+  transcript.finish("whole authoritative message", "stop");
+  expect(transcript.snapshot("history").output).toBe("whole authoritative message");
 });
 
 test("Unicode pairs split across deltas do not imply discarded text or inflate byte counts", () => {
@@ -33,7 +48,7 @@ test("Unicode pairs split across deltas do not imply discarded text or inflate b
     const transcript = new ChildTranscript();
     transcript.start();
     for (const delta of [prefix, "\ud83d", "\ude42", "X"]) transcript.append(0, delta);
-    const snapshot = transcript.snapshot(true);
+    const snapshot = transcript.snapshot("history");
     if (!prefix) expect(snapshot).toEqual({ output: "🙂X", outputTruncation: undefined });
     else expect(snapshot.outputTruncation!.originalBytes).toBe(Buffer.byteLength(prefix + "🙂X"));
   }
@@ -41,7 +56,7 @@ test("Unicode pairs split across deltas do not imply discarded text or inflate b
 
 test("block replacement preserves a bounded prefix and truthful counts after earlier truncation", () => {
   const transcript = new ChildTranscript();
-  transcript.finish("Earlier finding");
+  transcript.finish("Earlier finding", "stop");
   transcript.start();
   transcript.append(0, "界".repeat(MAX_OUTPUT_BYTES));
   transcript.append(2, "later text");
@@ -52,9 +67,9 @@ test("block replacement preserves a bounded prefix and truthful counts after ear
   expect(lost.outputTruncation).toEqual({ truncated: true, originalBytes: 15, retainedBytes: 5 });
   // Authoritative later content can restore the missing text without duplicates.
   transcript.completeBlock(2, "tail🙂");
-  expect(transcript.snapshot(true)).toEqual({ output: "Earlier finding\n\nhead\ntail🙂", outputTruncation: undefined });
+  expect(transcript.snapshot("history")).toEqual({ output: "Earlier finding\n\nhead\ntail🙂", outputTruncation: undefined });
   transcript.completeBlock(2, "🙂".repeat(MAX_OUTPUT_BYTES));
-  const large = transcript.snapshot(true);
+  const large = transcript.snapshot("history");
   expect(Buffer.byteLength(large.output!)).toBeLessThanOrEqual(MAX_OUTPUT_BYTES);
   expect(large.outputTruncation!.originalBytes).toBe(Buffer.byteLength("Earlier finding\n\nhead\n") + MAX_OUTPUT_BYTES * 4);
   expect(large.output).not.toContain("�");
@@ -68,11 +83,11 @@ test.each([false, true])("interrupted multi-message history stays byte-bounded a
   const completed = ["界🙂".repeat(oversizedFirst ? 10_000 : 10), "later finding".repeat(5_000)];
   const partial = "unfinished🙂".repeat(10_000);
   const transcript = new ChildTranscript();
-  for (const text of completed) transcript.finish(text);
+  for (const text of completed) transcript.finish(text, "stop");
   transcript.start();
   transcript.append(0, partial);
   const full = [...completed, partial].join("\n\n");
-  const snapshot = transcript.snapshot(true);
+  const snapshot = transcript.snapshot("history");
   const output = snapshot.output!;
   expect(Buffer.byteLength(output)).toBeLessThanOrEqual(MAX_OUTPUT_BYTES);
   expect(snapshot.outputTruncation).toEqual({

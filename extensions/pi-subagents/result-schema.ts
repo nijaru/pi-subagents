@@ -70,7 +70,7 @@ export const ChildResultSchema = Type.Object({
   omittedFields: Type.Optional(Type.Array(Type.Enum(["prompt", "cwd", "tools", "sessionFile"] as const, { type: "string" }), {
     uniqueItems: true, description: "Fields omitted to fit the response budget; empty placeholders are not execution values. Retrieve an omitted sessionFile with status for this child alone.",
   })),
-  output: Type.Optional(Type.String({ description: "Final assistant report on success; bounded visible assistant-text history on failure or interruption. Not a complete execution trace." })),
+  output: Type.Optional(Type.String({ description: "Completed assistant reports from this execution on success (including steering/follow-ups); bounded visible assistant-text history on failure or interruption. Not a complete execution trace." })),
   outputTruncation: Type.Optional(OutputTruncationSchema),
   stdout: Type.Optional(Type.String({ description: "Diagnostic stdout; never the child protocol." })),
   startedAt: Type.Optional(Type.Number({ minimum: 0 })),
@@ -80,7 +80,6 @@ export const ChildResultSchema = Type.Object({
   usage: UsageSchema,
   model: Type.Optional(Type.String()),
   thinking: Type.Optional(Type.Enum(THINKING_LEVELS, { type: "string", description: "Effective effort verified at child startup." })),
-  notify: Type.Optional(Type.Enum(["inbox", "turn"] as const, { type: "string", description: "How completion is surfaced: inbox (next tool result) or turn (parent continuation)." })),
 }, { additionalProperties: false });
 
 /** One bounded envelope for tool details and structured results; notices carry handles only. */

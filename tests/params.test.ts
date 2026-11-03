@@ -61,16 +61,16 @@ describe("tool selection", () => {
     expect(() => validateCommand({ command: "status", executionTimeoutMs: 1000 })).toThrow("does not accept child creation or join options");
     expect(() => validateCommand({ command: "stop", id: "x", executionTimeoutMs: 1000 })).toThrow("does not accept child creation or join options");
   });
-  test("startup, join, and notify options are scoped to their commands", () => {
+  test("startup and join options are scoped; removed notification options are rejected", () => {
     for (const value of [1, 1000, MAX_STARTUP_TIMEOUT_MS]) {
       expect(Check(SubagentParamsSchema, { command: "run", prompt: "x", startupTimeoutMs: value })).toBe(true);
     }
     for (const value of [0, -1, 1.5, MAX_STARTUP_TIMEOUT_MS + 1]) {
       expect(Check(SubagentParamsSchema, { command: "spawn", prompt: "x", startupTimeoutMs: value })).toBe(false);
     }
-    expect(Check(SubagentParamsSchema, { command: "run", prompt: "x", joinTimeoutMs: 1000, notify: "turn" })).toBe(true);
+    expect(Check(SubagentParamsSchema, { command: "run", prompt: "x", joinTimeoutMs: 1000 })).toBe(true);
     expect(() => validateCommand({ command: "spawn", prompt: "x", joinTimeoutMs: 1000 })).toThrow("spawn does not join");
-    expect(() => validateCommand({ command: "wait", ids: ["x"], notify: "inbox" })).toThrow("does not accept child creation or join options");
+    expect(Check(SubagentParamsSchema, { command: "spawn", prompt: "x", notify: "turn" })).toBe(false);
   });
 });
 
@@ -122,7 +122,7 @@ describe("steering, persistence, and trust policy", () => {
   });
   test("rejects persist/resume on non-start commands and both together", () => {
     expect(() => validateCommand({ command: "status", id: "sa-1", persist: true } as any)).toThrow();
-    expect(() => validateCommand({ command: "run", prompt: "x", persist: true, resume: "s.jsonl" } as any)).toThrow("mutually exclusive");
+    for (const persist of [true, false]) expect(() => validateCommand({ command: "run", prompt: "x", persist, resume: "s.jsonl" })).toThrow("mutually exclusive");
     expect(() => validateCommand({ command: "run", prompt: "x", trustProject: true } as any)).not.toThrow();
   });
 });

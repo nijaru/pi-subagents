@@ -10,9 +10,11 @@ for (let i = 0; i < args.length; i++) {
   if (args[i] === "--model") model = args[++i];
   if (args[i] === "--thinking") thinking = args[++i];
 }
+const startupName = args[args.indexOf("--name") + 1];
+if (startupName === "config-drift") { model = "previous/model"; thinking = "high"; }
 const separator = model.indexOf("/");
-const provider = separator > 0 ? model.slice(0, separator) : "fixture";
-const modelId = separator > 0 ? model.slice(separator + 1) : model;
+let provider = separator > 0 ? model.slice(0, separator) : "fixture";
+let modelId = separator > 0 ? model.slice(separator + 1) : model;
 fs.writeFileSync(".fake-rpc-capture.json", JSON.stringify({ args, cwd: process.cwd(), model, thinking }));
 
 const usage = { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, totalTokens: 9, cost: { input: 0.1, output: 0.2, cacheRead: 0.3, cacheWrite: 0.4, total: 1 } };
@@ -23,6 +25,13 @@ const message = (text, stopReason = "stop") => ({
 const send = (record) => process.stdout.write(JSON.stringify(record) + "\n");
 const settle = (aborted = false) => send({ type: "agent_settled", aborted });
 let scenario = "ok";
+let initialReportSent = false;
+let pendingSteer;
+const finishSteering = () => {
+  if (!initialReportSent || pendingSteer === undefined) return;
+  send({ type: "message_end", message: message(`steered: ${pendingSteer}`) });
+  settle();
+};
 
 function emitTask() {
   if (scenario === "startup") return;
@@ -141,6 +150,8 @@ function emitTask() {
   }
   if (scenario === "steer") {
     send({ type: "message_end", message: message("waiting for steer") });
+    initialReportSent = true;
+    finishSteering();
     return;
   }
   send({ type: "message_start", message: { role: "assistant", content: [] } });
@@ -153,6 +164,22 @@ const input = readline.createInterface({ input: process.stdin, crlfDelay: Infini
 input.on("line", (line) => {
   let command;
   try { command = JSON.parse(line); } catch { return; }
+  if (command.type === "set_model") {
+    provider = command.provider;
+    modelId = command.modelId;
+    thinking = "high"; // Model selection may reset effort; configure effort afterward.
+    send({ id: command.id, type: "response", command: command.type, success: true });
+    return;
+  }
+  if (command.type === "get_available_thinking_levels") {
+    send({ id: command.id, type: "response", command: command.type, success: true, data: { levels: ["off", "low", "medium", "high"] } });
+    return;
+  }
+  if (command.type === "set_thinking_level") {
+    if (startupName !== "config-locked") thinking = command.level;
+    send({ id: command.id, type: "response", command: command.type, success: true });
+    return;
+  }
   if (command.type === "get_commands") {
     const noProbe = args.includes("--name") && args[args.indexOf("--name") + 1] === "no-probe";
     send({ id: command.id, type: "response", command: "get_commands", success: true, data: { commands: noProbe ? [] : [{ name: "__pi_subagent_ready", description: "probe", source: "extension" }] } });
@@ -186,8 +213,8 @@ input.on("line", (line) => {
     fs.writeFileSync(".fake-rpc-steer", command.message);
     send({ id: command.id, type: "response", command: "steer", success: true, data: { disposition: "queued" } });
     if (scenario === "steer") {
-      send({ type: "message_end", message: message(`steered: ${command.message}`) });
-      settle();
+      pendingSteer = command.message;
+      finishSteering();
     }
     return;
   }

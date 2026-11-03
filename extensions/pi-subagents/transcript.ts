@@ -1,3 +1,4 @@
+import type { StopReason } from "@earendil-works/pi-ai";
 import { truncateOutput, utf8Prefix } from "./bounds.ts";
 import { MAX_OUTPUT_BYTES, MAX_PROTOCOL_LINE_BYTES } from "./limits.ts";
 import type { ChildResult } from "./types.ts";
@@ -15,6 +16,8 @@ function endsInHighSurrogate(text: string): boolean {
 export class ChildTranscript {
   private history = "";
   private historyBytes = 0;
+  private reports = "";
+  private reportBytes = 0;
   private latest = "";
   private latestBytes = 0;
   private blocks = new Map<number, TextBlock>();
@@ -98,7 +101,7 @@ export class ChildTranscript {
     return utf8Prefix(text, MAX_OUTPUT_BYTES);
   }
 
-  finish(text: string): void {
+  finish(text: string, stopReason: StopReason): void {
     this.open = false;
     this.blocks.clear();
     this.currentBytes = 0;
@@ -111,16 +114,23 @@ export class ChildTranscript {
       this.history = utf8Prefix(this.history + separator + text, MAX_OUTPUT_BYTES);
     }
     this.historyBytes += Buffer.byteLength(separator) + this.latestBytes;
+    if (stopReason === "stop") {
+      const separator = this.reportBytes ? "\n\n" : "";
+      if (this.reportBytes === Buffer.byteLength(this.reports)) {
+        this.reports = utf8Prefix(this.reports + separator + text, MAX_OUTPUT_BYTES);
+      }
+      this.reportBytes += Buffer.byteLength(separator) + this.latestBytes;
+    }
   }
 
-  snapshot(includeHistory = false): Pick<ChildResult, "output" | "outputTruncation"> {
+  snapshot(mode: "live" | "history" | "reports" = "live"): Pick<ChildResult, "output" | "outputTruncation"> {
     const hasCurrent = this.open && this.currentBytes > 0;
     const current = hasCurrent ? this.currentText() : "";
     const separator = this.historyBytes && hasCurrent ? "\n\n" : "";
-    const text = includeHistory
+    const text = mode === "reports" ? this.reports : mode === "history"
       ? this.history + (this.historyBytes === Buffer.byteLength(this.history) ? separator + current : "")
       : hasCurrent ? current : this.latest;
-    const bytes = includeHistory
+    const bytes = mode === "reports" ? this.reportBytes : mode === "history"
       ? this.historyBytes + Buffer.byteLength(separator) + (hasCurrent ? this.currentBytes : 0)
       : hasCurrent ? this.currentBytes : this.latestBytes;
     const output = truncateOutput(text, MAX_OUTPUT_BYTES, bytes);

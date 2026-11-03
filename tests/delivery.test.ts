@@ -23,7 +23,7 @@ function controlled() {
   };
   delivery = new CompletionDelivery(children);
   delivery.started(ctx);
-  const start = (notify: "inbox" | "turn" = "turn") => children.start({ prompt: "inspect", tools: [], cwd: process.cwd(), notify });
+  const start = () => children.start({ prompt: "inspect", tools: [], cwd: process.cwd() });
   const boundary = (outcome = "completed", entries: any[] = []) => delivery.boundary({ type: "turn_end", messageEntryId: "entry", entries, outcome } as any, ctx);
   const close = async () => { delivery.close(); await children.close(); };
   return { children, delivery, gates, statuses, ctx, start, boundary, close };
@@ -110,9 +110,9 @@ describe("non-consuming readiness announcements", () => {
     await c.close();
   });
 
-  test.each(["inbox", "turn"] as const)("late %s completions never wake idle parents", async (notify) => {
+  test("late completions never wake idle parents", async () => {
     const c = controlled();
-    const run = c.start(notify);
+    const run = c.start();
     expect(c.boundary()).toBeUndefined();
     c.delivery.settled(c.ctx);
     c.gates[0]!.resolve();

@@ -20,7 +20,7 @@ test.each(["run", "spawn"] as const)("real Pi parent delegates with %s and retri
       if (isParent && !returned) {
         delta = { tool_calls: [{ index: 0, id: "parent_subagent", type: "function", function: {
           name: "subagent",
-          arguments: JSON.stringify({ command: mode, notify: "turn", prompt: "/capture CHILD_SENTINEL: read fixture.txt and report it.", tools: ["read"] }),
+          arguments: JSON.stringify({ command: mode, prompt: "/capture CHILD_SENTINEL: read fixture.txt and report it.", tools: ["read"] }),
         } }] };
       } else if (isParent) {
         const text = JSON.stringify(body.messages);

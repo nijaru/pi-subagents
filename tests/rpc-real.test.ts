@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { RpcChildSupervisor, type ChildExecutionData } from "../extensions/pi-subagents/supervisor.ts";
+import { RpcChildSupervisor, type ChildControl, type ChildExecutionData } from "../extensions/pi-subagents/supervisor.ts";
 import { realRpcFixture } from "./fixtures/real-rpc.ts";
 
 // Each test starts the installed CLI, not an SDK bootstrap or fake RPC process.
@@ -79,6 +79,58 @@ test("failed default-persisted sessions recover their history only in the origin
   expect(JSON.stringify(f.requests[1].messages)).toContain("SECOND_MARKER");
   expect(JSON.stringify(f.requests[1].messages)).not.toContain("subagent-probe");
 }, 30_000);
+
+test("a saved high-effort session continues at explicitly requested low effort", async () => {
+  using f = realRpcFixture(() => ({ content: "OK" }));
+  const modelFile = path.join(f.dir, "models.json");
+  const models = JSON.parse(fs.readFileSync(modelFile, "utf8"));
+  models.providers.fixture.models[0].reasoning = true;
+  fs.writeFileSync(modelFile, JSON.stringify(models));
+  // Exercise a real startup override, not just a session whose CLI flags already win.
+  const extension = path.join(f.dir, "startup-effort.ts");
+  fs.writeFileSync(extension, 'export default (pi: any) => pi.on("session_start", () => pi.setThinkingLevel("high"));');
+  fs.writeFileSync(path.join(f.dir, "settings.json"), JSON.stringify({ extensions: [extension] }));
+  const supervisor = new RpcChildSupervisor();
+  const first = await supervisor.run({
+    task: { id: "effort-high", prompt: "First task", cwd: f.dir, tools: [], model: "fixture/model", thinking: "high", strictThinking: true, executionTimeoutMs: 10_000 },
+    signal: new AbortController().signal,
+  });
+  expect(first).toMatchObject({ outcome: "completed", thinking: "high" });
+  const second = await supervisor.run({
+    task: { id: "effort-low", prompt: "Continue", cwd: f.dir, tools: [], model: "fixture/model", thinking: "low", strictThinking: true, resume: first.sessionFile, executionTimeoutMs: 10_000 },
+    signal: new AbortController().signal,
+  });
+  expect(second).toMatchObject({ outcome: "completed", thinking: "low", sessionFile: first.sessionFile });
+  expect(f.requests.map((body) => body.reasoning_effort)).toEqual(["high", "low"]);
+}, 30_000);
+
+test("steering preserves a completed review alongside its follow-up through real Pi", async () => {
+  const firstRequest = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<{ content: string }>();
+  using f = realRpcFixture(() => {
+    if (f.requests.length === 1) { firstRequest.resolve(); return release.promise; }
+    return { content: "FOLLOW_UP" };
+  });
+  const ready = Promise.withResolvers<ChildControl>();
+  const controller = new AbortController();
+  const pending = new RpcChildSupervisor().run({
+    task: { id: "steered-report", prompt: "Review", cwd: f.dir, tools: [], model: "fixture/model", executionTimeoutMs: 10_000 },
+    signal: controller.signal, onControl: ready.resolve,
+  });
+  try {
+    await firstRequest.promise;
+    await (await ready.promise).steer("FOLLOW_UP_MARKER");
+    release.resolve({ content: "ORIGINAL_REVIEW" });
+    const result = await pending;
+    expect(result).toMatchObject({ outcome: "completed", output: "ORIGINAL_REVIEW\n\nFOLLOW_UP" });
+    expect(f.requests).toHaveLength(2);
+    expect(JSON.stringify(f.requests[1].messages)).toContain("FOLLOW_UP_MARKER");
+  } finally {
+    release.resolve({ content: "ORIGINAL_REVIEW" });
+    controller.abort();
+    await pending;
+  }
+}, 20_000);
 
 test("a timed-out default session resumes completed work without restarting its tool", async () => {
   const blocked = Promise.withResolvers<{ content: string }>();

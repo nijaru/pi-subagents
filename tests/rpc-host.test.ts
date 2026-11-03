@@ -48,6 +48,22 @@ describe("public RPC child host", () => {
     expect(capture.cwd).toBe(fs.realpathSync.native(dir));
   });
 
+  test("establishes requested model and effort after startup drift", async () => {
+    const result = await run(task(tempDir(), { id: "config-drift", thinking: "low", strictThinking: true }));
+    expect(result).toMatchObject({ outcome: "completed", model: "fixture/model", thinking: "low" });
+  });
+
+  test.each([
+    ["config-locked", "low", "does not match requested low"],
+    ["unsupported-effort", "xhigh", "does not support thinking xhigh"],
+  ] as const)("rejects %s before submitting model work", async (id, thinking, error) => {
+    const dir = tempDir();
+    const result = await run(task(dir, { id, thinking, strictThinking: true }));
+    expect(result).toMatchObject({ outcome: "failed", errorKind: "startup" });
+    expect(result.errorMessage).toContain(error);
+    expect(fs.existsSync(path.join(dir, ".fake-rpc-prompt"))).toBe(false);
+  });
+
   test("observes thinking and overlapping tool lifecycles without retaining private payloads", async () => {
     const updates: ChildExecutionData[] = [];
     const progress: string[] = [];
@@ -194,7 +210,7 @@ describe("public RPC child host", () => {
     while (!control) await Bun.sleep(5);
     await control.steer("focus");
     const steered = await pending;
-    expect(steered.output).toBe("steered: Steering instruction:\n\nfocus");
+    expect(steered.output).toBe("waiting for steer\n\nsteered: Steering instruction:\n\nfocus");
     expect(steered.outcome).toBe("completed");
   });
 

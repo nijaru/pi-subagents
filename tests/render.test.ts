@@ -206,16 +206,16 @@ describe("compact child rendering", () => {
     expect(childStatus(waiting)).not.toContain("Tool effects");
   });
 
-  test("command list omits default inbox and bounds cwd to one clean line", () => {
-    const inbox = { ...child, cwd: "/work\nspace\u001b[31m", notify: "inbox" as const };
-    const turn = { ...child, id: "second", handle: "sa-2", notify: "turn" as const, cwd: `/${"d".repeat(5000)}` };
-    const rows = childListText([inbox, turn]).split("\n");
+  test("command list bounds cwd to one clean line without delivery-mode decoration", () => {
+    const first = { ...child, cwd: "/work\nspace\u001b[31m" };
+    const second = { ...child, id: "second", handle: "sa-2", cwd: `/${"d".repeat(5000)}` };
+    const rows = childListText([first, second]).split("\n");
     expect(rows).toHaveLength(2);
     const defaultRow = rows.find((row) => row.startsWith("900c096e"))!;
     expect(defaultRow).toContain("/work space");
     expect(defaultRow).not.toContain("inbox");
     expect(defaultRow).not.toContain("\u001b");
-    expect(rows.find((row) => row.startsWith("sa-2"))).toContain(" · turn · ");
+    expect(rows.find((row) => row.startsWith("sa-2"))).not.toContain(" · turn · ");
   });
   test("narrow terminals keep one bounded preview row per child", () => {
     const long = { ...child, prompt: "wide界🙂 ".repeat(1000), state: { status: "running" } as const };

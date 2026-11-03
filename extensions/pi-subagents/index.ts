@@ -95,20 +95,18 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
-    description: "Delegate one self-contained task to a fresh Pi child over the public RPC protocol. run joins within a join budget, then lets the child finish as background work; spawn returns a handle immediately. status, wait, stop, and steer control session-scoped children. Defaults to read/search/web tools; request bash, edit, or write explicitly for mutating work. Children are leaves. Child conversations are saved locally by default for inspection/recovery; use persist: false to opt out. Continue a returned sessionFile with resume after the child stops.",
+    description: "Delegate one self-contained task to a fresh Pi child over the public RPC protocol. run joins within a join budget, then lets the child finish as background work; spawn returns a handle immediately. status, wait, stop, and steer control session-scoped children. Defaults to read/search/web tools; request bash, edit, or write explicitly for mutating work. Children are leaves. Child conversations are saved locally by default for inspection/recovery; use persist: false to opt out. Use resume with a stopped child's handle or sessionFile for a focused continuation.",
     parameters: SubagentParamsSchema,
     outputSchema: SubagentDetailsSchema,
     executionMode: "parallel",
     promptSnippet: "Use run for a fresh-context result, spawn for independent work alongside useful local work, and steer to redirect a running child.",
     promptGuidelines: [
-      "Give subagent children relevant evidence, scope, constraints, expected output and checks. Their conversations start fresh without parent history.",
-      "Children default to read/search/web tools. Request bash, edit, or write explicitly only when the task needs mutations. Give concurrent subagent writers separate worktrees, including parent-versus-child writers; child processes share the selected working tree and subagent does not arbitrate write ownership.",
-      "Completion notices only announce handles; they never consume reports. Use wait to retrieve and acknowledge reports, including after a notify: \"turn\" announcement. Short sa-N handles are valid in wait/status/stop/steer calls.",
-      "Prefer direct work over subagent for routine or tightly coupled tasks. Do not duplicate delegated work; the parent owns integration and verification.",
-      "Spawn independent subagent tasks before waiting. Inbox results are advertised on the next tool result and never wake an idle parent; notify: \"turn\" opts into an active-boundary continuation. Use subagent wait with ids when blocked; it wakes when any finishes. Do not poll or wait again on reports already received. Cancelling wait leaves children running; stop cancels them.",
-      "subagent run joins within a join budget; if it expires the child keeps working and reports completion like spawn, so never relaunch it as a duplicate.",
-      "Bound task execution with executionTimeoutMs (default 30m, at most 2h), separate from startupTimeoutMs, run's joinTimeoutMs, and wait's timeoutMs. A timed-out result establishes deadline expiry, not its cause. Inspect retained output, timing, activity, and any persisted session before choosing recovery or a library fix; do not infer stalled or unproductive work from the timeout alone.",
-      "Child conversations are saved locally by default and may contain sensitive prompts/tool results; use persist: false when they must not be retained. Once the child stops, inspect its sessionFile and resume in the same cwd with a focused continuation when justified. status exposes the effective deadline and content-free activity; neither activity nor silence proves useful progress or a stall.",
+      "Delegate self-contained work with relevant evidence, constraints, expected output and checks. Prefer direct work for routine or tightly coupled tasks; the parent owns integration and verification.",
+      "Request mutation tools explicitly. Concurrent writers, including parent and child, need separate worktrees; tool allowlists and subprocesses are not sandboxes.",
+      "Spawn independent tasks before waiting. Use wait with handles when blocked; it wakes when any finishes. Collect reports after completion notices, which announce handles only. Do not poll or relaunch a running child when a join expires.",
+      "Cancelling wait leaves children running; stop cancels them. Use steer for running children and resume with a stopped child's handle or sessionFile for a focused continuation. Handle resume defaults to the child's original cwd; tools/model options follow normal launch rules.",
+      "Execution, startup, and join/wait budgets are separate. On failure or timeout, inspect retained output, timing and session before recovery; deadline expiry or silence is not a cause diagnosis. Resume does not roll back side effects or make interrupted mutations safe to repeat.",
+      "Sessions are saved locally by default and may contain sensitive prompts/tool results; use persist: false to opt out. Completion notices never wake an idle parent.",
     ],
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       if (!Check(SubagentParamsSchema, params)) {
@@ -142,8 +140,9 @@ export default function (pi: ExtensionAPI) {
       const tools = selectTools(params.tools, activeTools, callableTools);
       const allToolNames = typeof pi.getAllTools === "function" ? pi.getAllTools().map((tool) => tool.name) : [];
       const excludeTools = excludedChildTools(tools, [...new Set([...activeTools, ...callableTools, ...allToolNames])]);
-      const cwd = resolveCwd(ctx.cwd || process.cwd(), params.cwd);
-      const resume = params.resume === undefined ? undefined : path.resolve(ctx.cwd, params.resume);
+      const retained = params.resume !== undefined && /^sa-\d+$/.test(params.resume) ? owner.resumeTarget(params.resume) : undefined;
+      const cwd = resolveCwd(ctx.cwd || process.cwd(), params.cwd ?? retained?.cwd);
+      const resume = retained?.sessionFile ?? (params.resume === undefined ? undefined : path.resolve(ctx.cwd, params.resume));
       const parentSession = ctx.sessionManager.getSessionFile();
       if (resume && parentSession && canonicalSession(resume) === canonicalSession(parentSession)) {
         throw new Error("Cannot resume the active parent session as a child.");
@@ -170,13 +169,12 @@ export default function (pi: ExtensionAPI) {
         resume,
         trustProject: params.trustProject,
         excludeTools,
-        notify: params.notify,
         emit: foreground && onUpdate ? present : undefined,
       });
       if (!foreground) {
         const snapshot = owner.snapshot(run);
         const session = snapshot.sessionFile ? `\nSession: ${snapshot.sessionFile}` : "";
-        return answer("spawn", [snapshot], `Started child ${run.handle}. Completion is advertised in the inbox${run.notify === "turn" ? " and attempts an active-boundary continuation when eligible" : ""}; idle parents are not woken. Continue non-overlapping work; use wait when its result blocks finishing your task, or status/stop with this handle.${session}`);
+        return answer("spawn", [snapshot], `Started child ${run.handle}. Completion is announced at an active boundary or on a later tool result; idle parents are not woken. Continue non-overlapping work; use wait when its result blocks finishing your task, or status/stop with this handle.${session}`);
       }
       // Presentation stops at the foreground join, even when execution continues.
       const timer = onUpdate ? setInterval(() => {
@@ -189,7 +187,7 @@ export default function (pi: ExtensionAPI) {
         const budget = params.joinTimeoutMs ?? foregroundBudgetMs();
         const result = (await owner.wait([run.result.id], budget))[0]!;
         if (isRunning(result)) {
-          return answer("run", [result], `${summary(result)}\nStill running after ${formatElapsed(budget)}; it continues as background work. ${run.notify === "turn" ? "Completion attempts an active-boundary announcement and continuation when eligible; idle parents are not woken." : "Completion is advertised in the inbox on the next tool result; idle parents are not woken."} Use wait when its result blocks finishing your task, or status/stop with this handle.`);
+          return answer("run", [result], `${summary(result)}\nStill running after ${formatElapsed(budget)}; it continues as background work. Completion is announced at an active boundary or on a later tool result; idle parents are not woken. Use wait when its result blocks finishing your task, or status/stop with this handle.`);
         }
         return outcome("run", [result]);
       } finally {

@@ -10,8 +10,6 @@ export interface ChildRun {
   result: ChildResult;
   /** Short session-scoped handle, assigned once and never reused. */
   handle: string;
-  /** How a completed result is surfaced to the parent. */
-  notify: "inbox" | "turn";
   /** Inbox notifications are emitted at most once per parent turn. */
   inboxNotified: boolean;
   /** Locally collected by a join/stop, not confirmed published or model-read. */
@@ -42,8 +40,6 @@ export interface StartChild {
   executionTimeoutMs?: number;
   /** Startup deadline for RPC process, tool probe, and MCP readiness. */
   startupTimeoutMs?: number;
-  /** Inbox (default) or an eligible active-boundary continuation attempt. */
-  notify?: "inbox" | "turn";
   /** Keep the child Pi session for later inspection. */
   persist?: boolean;
   /** Trust project-local resources in the child. */
@@ -78,14 +74,13 @@ export class SessionChildren {
       this.runs.delete(oldest.result.id);
     }
     const handle = `sa-${this.nextHandle++}`;
-    const notify = options.notify ?? "inbox";
     const result: ChildResult = {
       id: randomUUID(), handle, prompt: options.prompt, cwd: options.cwd, tools: [...options.tools],
-      phase: "starting", notify, model: options.model, state: { status: "running" }, stderr: "", usage: emptyUsage(),
+      phase: "starting", model: options.model, state: { status: "running" }, stderr: "", usage: emptyUsage(),
     };
     const completion = Promise.withResolvers<void>();
     const run: ChildRun = {
-      result, handle, notify, inboxNotified: false, collected: false, continuationOffered: false,
+      result, handle, inboxNotified: false, collected: false, continuationOffered: false,
       controller: new AbortController(), settled: false, readinessWaiters: new Set(),
       promise: completion.promise, waiters: new Set(), activeWaits: 0,
     };
@@ -174,7 +169,7 @@ export class SessionChildren {
   pendingCompletions(): ChildResult[] {
     if (this.closed) return [];
     return [...this.runs.values()]
-      .filter((run) => run.notify === "turn" && !run.continuationOffered && run.settled && !run.collected && run.activeWaits === 0)
+      .filter((run) => !run.continuationOffered && run.settled && !run.collected && run.activeWaits === 0)
       .map((run) => this.snapshot(run));
   }
 
@@ -230,6 +225,14 @@ export class SessionChildren {
     const run = this.runs.get(idOrHandle) ?? [...this.runs.values()].find((candidate) => candidate.handle === idOrHandle);
     if (!run) throw new Error(`Unknown child: ${idOrHandle}. Handles are session-scoped; oldest completed handles are evicted after ${MAX_RETAINED_RUNS}.`);
     return run;
+  }
+
+  /** Resolve only a stopped child's retained session; never reuse its live runtime. */
+  resumeTarget(handle: string): { sessionFile: string; cwd: string } {
+    const run = this.get(handle);
+    if (!run.settled) throw new Error(`Child ${run.handle} is still running; use steer or wait before resuming.`);
+    if (!run.result.sessionFile) throw new Error(`Child ${run.handle} has no persisted session to resume.`);
+    return { sessionFile: run.result.sessionFile, cwd: run.result.cwd };
   }
 
   snapshot(run: ChildRun): ChildResult {
