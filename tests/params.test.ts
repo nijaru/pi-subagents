@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { excludedChildTools, MCP_RESOURCE_TOOLS, resolveCwd, selectTools, validateCommand, SubagentParamsSchema } from "../extensions/pi-subagents/params.ts";
 import { Check } from "typebox/value";
 import { childEnvironment } from "../extensions/pi-subagents/env.ts";
-import { isChildProcess, processTimeoutMs, DEFAULT_PROCESS_TIMEOUT_MS, STARTUP_TIMEOUT_ENV, startupTimeoutMs, MAX_PROCESS_TIMEOUT_MS, MAX_STARTUP_TIMEOUT_MS, foregroundBudgetMs, DEFAULT_FOREGROUND_MS, MAX_WAIT_MS } from "../extensions/pi-subagents/limits.ts";
+import { isChildProcess, processTimeoutMs, TIMEOUT_ENV, STARTUP_TIMEOUT_ENV, startupTimeoutMs, MAX_PROCESS_TIMEOUT_MS, MAX_STARTUP_TIMEOUT_MS, foregroundBudgetMs, DEFAULT_FOREGROUND_MS, MAX_WAIT_MS } from "../extensions/pi-subagents/limits.ts";
 
 let env: NodeJS.ProcessEnv;
 beforeEach(() => { env = { ...process.env }; });
@@ -35,7 +35,6 @@ describe("tool selection", () => {
     }
   });
   test.each([
-    ["PI_SUBAGENT_TIMEOUT_MS", processTimeoutMs, DEFAULT_PROCESS_TIMEOUT_MS, MAX_PROCESS_TIMEOUT_MS],
     [STARTUP_TIMEOUT_ENV, startupTimeoutMs, 30_000, MAX_STARTUP_TIMEOUT_MS],
     ["PI_SUBAGENT_FOREGROUND_MS", foregroundBudgetMs, DEFAULT_FOREGROUND_MS, MAX_WAIT_MS],
   ] as const)("invalid %s cannot disable or overflow its timer", (key, read, fallback, maximum) => {
@@ -47,6 +46,20 @@ describe("tool selection", () => {
     expect(read()).toBe(1234);
     process.env[key] = String(maximum);
     expect(read()).toBe(maximum);
+  });
+  test("execution deadlines are off unless explicitly configured", () => {
+    delete process.env[TIMEOUT_ENV];
+    expect(processTimeoutMs()).toBeUndefined();
+    for (const value of [1, 1234, MAX_PROCESS_TIMEOUT_MS]) {
+      process.env[TIMEOUT_ENV] = String(value);
+      expect(processTimeoutMs()).toBe(value);
+    }
+  });
+  test("invalid execution deadline configuration cannot silently remove an intended limit", () => {
+    for (const value of ["", "0", "-1", "Infinity", "1.5", "garbage", String(MAX_PROCESS_TIMEOUT_MS + 1), "2147483648"]) {
+      process.env[TIMEOUT_ENV] = value;
+      expect(() => processTimeoutMs()).toThrow(TIMEOUT_ENV);
+    }
   });
   test("executionTimeoutMs is a run/spawn option within the two-hour bound", () => {
     expect(Check(SubagentParamsSchema, { command: "run", prompt: "x", executionTimeoutMs: 1 })).toBe(true);

@@ -100,7 +100,7 @@ export default function (pi: ExtensionAPI) {
       "Request mutation tools explicitly. Concurrent writers, including parent and child, need separate worktrees; tool allowlists and subprocesses are not sandboxes.",
       "Spawn independent tasks before waiting. Use wait with handles when blocked; it wakes when any finishes. Collect reports after completion notices, which announce handles only. Do not poll or relaunch a running child when a join expires.",
       "Cancelling wait leaves children running; stop cancels them. Use steer for running children and resume with a stopped child's handle or sessionFile for a focused continuation. Handle resume defaults to the child's original cwd; tools/model options follow normal launch rules.",
-      "Execution, startup, and join/wait budgets are separate. On failure or timeout, inspect retained output, timing and session before recovery; deadline expiry or silence is not a cause diagnosis. Resume does not roll back side effects or make interrupted mutations safe to repeat.",
+      "Execution deadlines are off unless executionTimeoutMs or PI_SUBAGENT_TIMEOUT_MS is set. Startup and join/wait budgets remain separate; join/wait expiry does not stop work. On failure or timeout, inspect retained output, timing and session before recovery; deadline expiry or silence is not a cause diagnosis. Resume does not roll back side effects or make interrupted mutations safe to repeat.",
       "Sessions are saved locally by default and may contain sensitive prompts/tool results; use persist: false to opt out. Completion notices never wake an idle parent.",
     ],
     async execute(_toolCallId, params, signal, onUpdate, ctx) {

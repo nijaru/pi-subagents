@@ -65,18 +65,19 @@ export class ChildRpc {
 
   get diagnostics(): string { return this.stderr; }
 
-  request<T extends RpcCommand["type"]>(command: Extract<RpcCommand, { type: T }>, timeoutMs = 30_000, signal?: AbortSignal): Promise<Success<T>> {
+  /** null delegates waiting to the execution owner instead of a second command clock. */
+  request<T extends RpcCommand["type"]>(command: Extract<RpcCommand, { type: T }>, timeoutMs: number | null = 30_000, signal?: AbortSignal): Promise<Success<T>> {
     if (signal?.aborted) return Promise.reject(new RpcCommandError("RPC command cancelled before sending; child continues.", "not_sent"));
     if (this.closed) return Promise.reject(new RpcCommandError("Child execution ended before sending.", "not_sent"));
     if (this.pending.size >= MAX_RPC_PENDING) return Promise.reject(new RpcCommandError("Too many outstanding child RPC commands; command was not sent.", "not_sent"));
     const id = `subagent-${++this.nextId}`;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const timer = timeoutMs === null ? undefined : setTimeout(() => {
         this.pending.get(id)?.reject(new RpcCommandError(`Timed out waiting for child RPC ${command.type}.`, "unknown"));
       }, timeoutMs);
-      timer.unref?.();
+      timer?.unref?.();
       const abort = () => this.pending.get(id)?.reject(new RpcCommandError("RPC command cancelled; child continues.", "unknown"));
-      const finish = () => { clearTimeout(timer); signal?.removeEventListener("abort", abort); this.pending.delete(id); };
+      const finish = () => { if (timer) clearTimeout(timer); signal?.removeEventListener("abort", abort); this.pending.delete(id); };
       // Register before writing: a fast response must never miss its waiter.
       this.pending.set(id, {
         command: command.type,

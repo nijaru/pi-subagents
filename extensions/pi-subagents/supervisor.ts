@@ -156,10 +156,18 @@ class RpcExecution implements ChildExecution {
     if (this.lifecycle.phase !== "starting") return;
     const config = await prepareChild(this.rpc!, this.task, this.readiness.promise, this.facts.startedAt + this.startupBudget);
     if (this.lifecycle.phase !== "starting") return;
+    const budget = this.task.executionTimeoutMs ?? processTimeoutMs();
     Object.assign(this.facts, config);
+    // Startup protection ends at task submission. Without an opted-in execution
+    // limit, neither its timer nor its now-inapplicable deadline may survive.
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+    this.facts.deadline = undefined;
     this.lifecycle = { phase: "submitting" };
-    this.arm("execution", Date.now(), this.task.executionTimeoutMs ?? processTimeoutMs());
-    const response = await this.rpc!.request({ type: "prompt", message: `Task:\n\n${this.task.prompt}` });
+    if (budget !== undefined) this.arm("execution", Date.now(), budget);
+    // Pi acknowledges after preflight, which can include model-backed compaction
+    // and extension hooks. Only the execution policy may cut that work short.
+    const response = await this.rpc!.request({ type: "prompt", message: `Task:\n\n${this.task.prompt}` }, null);
     if (response.data?.disposition !== "started") throw new Error("Child did not start the submitted task.");
     if (this.lifecycle.phase !== "submitting") return;
     this.lifecycle = { phase: "running" };

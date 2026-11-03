@@ -37,6 +37,44 @@ test("real RPC child executes a tool and reports usage", async () => {
   expect(JSON.stringify(f.requests[1].messages)).toContain("SENTINEL_CONTENT");
 }, 30_000);
 
+test.each([undefined, 2_000, 50])("task preflight follows execution policy, not the control acknowledgment timer (limit=%s)", async (executionTimeoutMs) => {
+  using f = realRpcFixture(() => ({ content: "PREFLIGHT_FINISHED" }));
+  const extension = path.join(f.dir, "slow-preflight.ts");
+  fs.writeFileSync(extension, `
+    import { setTimeout as delay } from "node:timers/promises";
+    export default (pi: any) => pi.on("before_agent_start", async () => { await delay(250); });
+  `);
+  fs.writeFileSync(path.join(f.dir, "settings.json"), JSON.stringify({ extensions: [extension] }));
+  const original = globalThis.setTimeout;
+  const abort = new AbortController();
+  try {
+    // Accelerate only the parent's ordinary 30-second RPC acknowledgment timer.
+    // The real child preflight, startup budget, and execution policy stay real.
+    globalThis.setTimeout = ((...args: Parameters<typeof setTimeout>) => {
+      if (args[1] === 30_000) args[1] = 50;
+      return original(...args);
+    }) as typeof setTimeout;
+    const result = await runChild({
+      task: { id: "preflight", prompt: "Report the answer.", cwd: f.dir, tools: [], model: "fixture/model", startupTimeoutMs: 5_000, executionTimeoutMs },
+      signal: abort.signal,
+    });
+    expect(result.cleanup.status).toBe("confirmed");
+    if (executionTimeoutMs === 50) {
+      expect(result).toMatchObject({ outcome: "timed_out", errorKind: "deadline", timeoutPhase: "execution" });
+      expect(f.requests).toHaveLength(0);
+    } else {
+      expect(result.outcome).toBe("completed");
+      expect(result.output).toBe("PREFLIGHT_FINISHED");
+      expect(f.requests).toHaveLength(1);
+    }
+    if (executionTimeoutMs === undefined) expect(result.deadline).toBeUndefined();
+    else expect(result.deadline?.phase).toBe("execution");
+  } finally {
+    globalThis.setTimeout = original;
+    abort.abort();
+  }
+}, 10_000);
+
 test("missing tools exhaust startup without submitting model work", async () => {
   using f = realRpcFixture();
   const result = await runChild({

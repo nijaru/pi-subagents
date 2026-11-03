@@ -53,11 +53,11 @@ RPC cannot show project-trust prompts. Set `trustProject: true` for one-shot `--
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `startupTimeoutMs` | 30s | Process/configuration/tool readiness; maximum 5m |
-| `executionTimeoutMs` | 30m | Model/tool work after task submission; maximum 2h |
+| `executionTimeoutMs` | Off | Optional task-preflight/model/tool cutoff after submission; maximum configured limit 2h |
 | `joinTimeoutMs` | 60s | One `run` join; maximum 10m |
 | `timeoutMs` | 5m | One `wait` join; maximum 10m |
 
-Environment defaults: `PI_SUBAGENT_STARTUP_TIMEOUT_MS`, `PI_SUBAGENT_TIMEOUT_MS`, and `PI_SUBAGENT_FOREGROUND_MS`. Join/wait expiry leaves children running and does not change execution deadlines. Never relaunch because a join expired. Cancelling `run` cancels its child and joins cleanup even beyond the join budget; cancelling `wait` leaves children running.
+Environment defaults: `PI_SUBAGENT_STARTUP_TIMEOUT_MS` and `PI_SUBAGENT_FOREGROUND_MS`. Execution has no extension deadline unless `executionTimeoutMs` or `PI_SUBAGENT_TIMEOUT_MS` is set; explicit arguments override the environment. Unset the execution variable for no global limit; malformed values fail before task work. Without a limit, cost and admission occupancy can continue until completion, stop, or parent shutdown. Pi/provider transport limits still apply. Join/wait expiry leaves children running and does not change execution deadlines. Never relaunch because a join expired. Cancelling `run` cancels its child and joins cleanup even beyond the join budget; cancelling `wait` leaves children running.
 
 Failed `run`/`wait` reports are tool errors. Codemode still returns `{ command, results, waitExpired? }`: inspect each `state`, `errorKind`, `timeoutPhase`, and `output`. Mixed waits retain successful reports; do not repeat that work. Invalid requests and cancelled waits reject. `incomplete` means a model output limit, not success. `waitExpired: true` means no selected child completed within the wait budget, not an execution timeout.
 

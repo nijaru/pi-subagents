@@ -41,6 +41,7 @@ beforeEach(() => {
   process.env.PI_SUBAGENT_CLI = path.resolve(import.meta.dir, "fixtures/fake-rpc-cli.mjs");
   process.env.PI_SUBAGENT_SESSION_DIR = path.join(tempDir(), "sessions");
   delete process.env.PI_SUBAGENT_DEPTH;
+  delete process.env.PI_SUBAGENT_TIMEOUT_MS;
 });
 afterEach(async () => {
   await Promise.all(hosts.splice(0).map((h) => h.handlers.get("session_shutdown")()));
@@ -59,7 +60,7 @@ describe("RPC-backed subagent tool", () => {
     expect(child.model).toBe("parent/model");
     expect(child.thinking).toBe("high");
     expect(child.sessionFile).toContain("sessions");
-    expect(child.deadline.phase).toBe("execution");
+    expect(child.deadline).toBeUndefined();
     expect(value.isError).toBe(false);
     expect(value.structuredContent).toEqual(value.details);
     const capture = JSON.parse(fs.readFileSync(path.join(fs.realpathSync.native(h.cwd), ".fake-rpc-capture.json"), "utf8"));

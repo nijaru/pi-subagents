@@ -56,9 +56,11 @@ An assistant error, an unsuccessful boundary, or an observed abort suppresses bo
 | Budget | Default | Scope |
 | --- | --- | --- |
 | `startupTimeoutMs` | 30s (`PI_SUBAGENT_STARTUP_TIMEOUT_MS`) | RPC process, model selection, tool probe, and readiness |
-| `executionTimeoutMs` | 30m (`PI_SUBAGENT_TIMEOUT_MS`) | Model/tool work, starting when the task is submitted |
+| `executionTimeoutMs` | Off; `PI_SUBAGENT_TIMEOUT_MS` opts in | Task preflight and model/tool work, starting when the task is submitted |
 | `joinTimeoutMs` | 60s (`PI_SUBAGENT_FOREGROUND_MS`) | How long one `run` blocks; at most 10m |
 | `timeoutMs` | 5m | How long one `wait` joins; never changes a child deadline |
+
+Execution deadlines are off by default. Set `executionTimeoutMs` for a task-specific cutoff, or `PI_SUBAGENT_TIMEOUT_MS` for an opt-in global default; explicit arguments take precedence. Configured limits must be positive integer milliseconds, at most two hours. Invalid execution-limit environment values fail before task submission; unset the variable to disable that default. Without a limit, a child can keep running, spending, and occupying its admission slot until it finishes, is stopped, or its parent shuts down. Pi/provider request, connection, idle, and retry limits still apply.
 
 `joinTimeoutMs` is a foreground join budget, not an execution deadline. It is capped at 10 minutes; an out-of-range `PI_SUBAGENT_FOREGROUND_MS` value falls back to the 60-second default.
 
@@ -66,7 +68,7 @@ An assistant error, an unsuccessful boundary, or an observed abort suppresses bo
 
 Interrupted execution also retains `interruption`: the observed `activity`, an `activeToolCount` of calls with a start but no observed end, and one `currentTool` name when available. This snapshot is frozen before cleanup; it contains no arguments or results. A start event does not prove a tool executed, and a missing end does not prove its effects failed. Reports warn to reconcile workspace/external state before retrying when this count is nonzero. The count and sampled name are not a complete side-effect ledger. Batch metadata is bounded too: details may omit a session path with `omittedFields: ["sessionFile"]`, never return a truncated resume target. Inspect that child alone with `status` to retrieve it.
 
-Every armed phase exposes its effective `deadline`: `{ phase, startedAt, expiresAt }`, with Unix millisecond timestamps after defaults and environment settings are resolved. The last deadline remains in terminal details; running and failed text reports show it too. Activity never extends the cutoff. The library does not automatically retry, extend the budget, or send a wrap-up prompt: queued steering cannot interrupt a long model request or tool call.
+Every armed phase exposes its effective `deadline`: `{ phase, startedAt, expiresAt }`, with Unix millisecond timestamps after defaults and environment settings are resolved. Startup protection and its metadata clear when a task is submitted without an execution limit. An explicitly configured execution deadline—or a failed-startup deadline—remains in terminal details; running and failed text reports show it too. Activity never extends the cutoff. The library does not automatically retry, extend the budget, or send a wrap-up prompt: queued steering cannot interrupt a long model request or tool call.
 
 At startup/execution expiry the child is stopped and its result retains bounded visible assistant text across messages, including unfinished text. Completed text blocks replace their interim deltas even if the whole assistant message never finishes. Successful results retain completed assistant reports from that execution, including answers before and after steering or follow-ups; tool-use narration is excluded. The combined report is byte-bounded, with a retained prefix and explicit truncation metadata. Join/wait expiry leaves the child running. `errorKind` distinguishes `startup`, `provider`, `protocol`, `deadline`, `cancelled`, and `cleanup`; `timeoutPhase` names the expired deadline. Reported runtime excludes process-tree cleanup; `cleanupMs` records the excluded portion.
 
@@ -74,6 +76,7 @@ At startup/execution expiry the child is stopped and its result retains bounded 
 
 - **Public RPC boundary.** The child is spawned as `pi --mode rpc`; the parent speaks only the documented JSONL protocol. No `jiti`, no SDK bootstrap, and no private Pi module imports.
 - **Exact startup checks.** After session restoration and extension startup, the parent explicitly sets the requested model, then effort, through RPC. Unsupported explicit effort fails before model work. A private readiness command and typed custom session entry verify the active tool set; a final `get_state` verifies the effective model and explicit effort before the task is submitted. The child probe also blocks calls outside the allowlist. Tool registration shares the caller's startup deadline, with no separate ten-second cap. Missing tools exhaust startup without submitting the task.
+- **Task preflight.** Pi can compact saved history and run extension hooks before acknowledging a task prompt. This work uses the optional execution deadline, not a separate 30-second control-acknowledgment cutoff.
 - **Full Pi configuration.** The child loads its own settings, extensions, skills, MCP servers, and project instructions. A fresh conversation does not mean an empty system prompt.
 - **Isolation.** Each child runs in its own detached process group. A detached watchdog terminates the group if the parent dies without running shutdown hooks. Normal completion closes child stdin and waits for orderly Pi shutdown before ending the watchdog and sweeping descendants; cancellation and timeouts stop the tree promptly. The concurrency slot is held through confirmed cleanup; an unconfirmed cleanup keeps it reserved.
 - **Steering.** Steering messages use the RPC `steer` command and are delivered after the current assistant turn's tool calls. A call made during startup joins the same readiness outcome; it does not introduce another timeout. Cancelling the call stops waiting, not the child. Once sent, an instruction cannot be recalled through this tool. A cancelled or lost acknowledgment has unknown acceptance: the instruction may already have taken effect, so do not resend automatically. Queue acceptance does not mean delivery: a deadline can stop the child first, and undelivered steering is not restored by resuming a saved conversation.
@@ -109,7 +112,7 @@ Explicit tools must be active or callable in the parent and are passed to the ch
 | Admission slots | 4 per parent session, including cleanup-unconfirmed children; excess starts are rejected |
 | Retained handles | 32; oldest completed, read handles are evicted first; unread results are never evicted |
 | Startup | 30 seconds by default, up to 5 minutes |
-| Execution | 30 minutes by default, up to 2 hours |
+| Execution deadline | Off by default; optional configured cutoff up to 2 hours |
 | One wait | 5 minutes by default, at most 10 |
 | Task prompt | 100 KiB |
 | Tool response and details | 50 KiB each |
@@ -154,6 +157,9 @@ RPC preserves the normal Pi CLI runtime while supporting steering and session co
 ## Migration
 
 ### Unreleased
+
+- Execution deadlines are now opt-in. Omit `executionTimeoutMs` and leave `PI_SUBAGENT_TIMEOUT_MS` unset for no execution cutoff. Valid environment configuration still provides a global default; explicit arguments override it. Invalid execution-limit environment values now fail instead of falling back silently. Startup, foreground handoff, wait, and cleanup budgets are unchanged.
+- Initial task preflight no longer has a separate 30-second RPC acknowledgment cutoff; optional execution deadlines govern preflight as well as model/tool work.
 
 - Result consumers must stop reading synthetic `state.exitCode` and unused `stdout`; use `state.outcome`, `errorKind`, and `stderr`. Optional `cleanup` describes resource disposition separately from the task outcome.
 - Budget-omitted `prompt`, `cwd`, and `tools` are now absent rather than empty placeholders. `omittedFields` identifies omitted launch metadata or session paths. Model text and structured results use the same report excerpt.

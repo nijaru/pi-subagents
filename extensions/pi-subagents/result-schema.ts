@@ -57,7 +57,7 @@ export const ChildResultSchema = Type.Object({
     phase: Type.Enum(["startup", "execution"] as const, { type: "string" }),
     startedAt: Type.Integer({ minimum: 0, maximum: 8_640_000_000_000_000 }),
     expiresAt: Type.Integer({ minimum: 0, maximum: 8_640_000_000_000_000 }),
-  }, { additionalProperties: false, description: "Effective phase deadline in Unix milliseconds, after defaults/environment resolution. Retained after termination; activity never extends it." })),
+  }, { additionalProperties: false, description: "Effective armed deadline in Unix milliseconds. Startup protection ends at task submission; absent during unlimited execution. A configured execution deadline or failed-startup deadline survives termination; activity never extends it." })),
   lastActivityAt: Type.Optional(Type.Integer({ minimum: 0, maximum: 8_640_000_000_000_000, description: "Parent-observed Unix milliseconds of the latest foreground activity event, including Pi retry/compaction; retained after termination. Not a progress or stall verdict." })),
   activity: Type.Optional({ ...ChildActivitySchema, description: "Current observed activity; absent after execution stops." }),
   currentTool: Type.Optional({ ...ToolNameSchema, description: "An observed tool call from the requested allowlist; one name when calls overlap. Name only; no arguments or results. Absent after execution stops." }),

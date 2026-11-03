@@ -6,29 +6,29 @@ import { THINKING_LEVELS } from "./types.ts";
 
 export const SubagentParamsSchema = Type.Object({
   command: Type.Enum(["run", "spawn", "status", "wait", "stop", "steer"] as const, { type: "string",
-    description: "run/spawn require prompt: run joins within its join budget (60s default) then continues in background; spawn returns immediately. steer requires id and message. wait requires ids and returns when any finishes. status optionally takes id; stop requires id and cancels/joins cleanup.",
+    description: "run/spawn require prompt: run waits up to joinTimeoutMs (60s default), then returns a running handle without stopping the child; spawn returns immediately. Cancelling run cancels its child. wait requires ids, wakes when any finishes, and never cancels children on expiry/cancellation. steer requires id and message. status optionally takes id; stop requires id and cancels/joins cleanup.",
   }),
   prompt: Type.Optional(Type.String({ description: "Self-contained task: scope, relevant evidence, constraints, expected output and checks", minLength: 1, maxLength: MAX_TASK_BYTES })),
   tools: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 256, pattern: "^[A-Za-z][A-Za-z0-9_.:-]*$" }), {
-    description: "Exact tool allowlist: tools must be active or callable in the parent. Defaults to active coding and known research tools; [] means reasoning only. No nested subagent tool.", maxItems: 64, uniqueItems: true,
+    description: "Exact tool allowlist: tools must be active or callable in the parent. Defaults to active read/search/web tools only; bash/edit/write require explicit selection. [] means reasoning only. No nested subagent tool.", maxItems: 64, uniqueItems: true,
   })),
   model: Type.Optional(Type.String({ description: "run/spawn only: exact provider/model-id; omitted inherits the parent model", minLength: 1, maxLength: 512 })),
   thinking: Type.Optional(Type.Enum(THINKING_LEVELS, { type: "string",
     description: "run/spawn only: reasoning effort supported by the selected model. Omitted inherits parent effort for the same model; a different model uses its Pi defaults. Unsupported explicit levels fail before prompting.",
   })),
   cwd: Type.Optional(Type.String({ description: "Child working directory; relative to the parent cwd", minLength: 1, maxLength: 4096 })),
-  id: Type.Optional(Type.String({ description: "status/stop/steer only: child id; omit for status to list retained children", minLength: 1, maxLength: 128 })),
-  message: Type.Optional(Type.String({ description: "steer only: instruction to queue after the child's current tool turn; joins startup readiness if necessary", minLength: 1, maxLength: MAX_TASK_BYTES })),
+  id: Type.Optional(Type.String({ description: "status/stop/steer only: child handle (sa-N) or full UUID; omit for status to list retained children", minLength: 1, maxLength: 128 })),
+  message: Type.Optional(Type.String({ description: "steer only: instruction to queue after the child's current tool turn; joins startup readiness if necessary. Cancelling stops waiting, not the child; an instruction already sent may still take effect.", minLength: 1, maxLength: MAX_TASK_BYTES })),
   ids: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128 }), {
-    description: "wait only: child ids to join. Returns all ready reports and identifies still-running children when any finishes. Wait again only on remaining ids when blocked.",
+    description: "wait only: child handles (sa-N) or full UUIDs to join. Returns all ready reports and identifies still-running children when any finishes. Wait again only on remaining ids when blocked.",
     minItems: 1, maxItems: MAX_RETAINED_RUNS, uniqueItems: true,
   })),
   timeoutMs: Type.Optional(Type.Integer({ description: "wait only: shared wait budget, not a child deadline. Default 5 minutes, maximum 10; wakes early on completion. Cancelling wait leaves children running. It never sets or changes execution deadlines.", minimum: 1, maximum: MAX_WAIT_MS })),
-  executionTimeoutMs: Type.Optional(Type.Integer({ description: "run/spawn only: model/tool execution deadline, starting when the task is submitted. Positive integer milliseconds, at most 2 hours; defaults to PI_SUBAGENT_TIMEOUT_MS (30 minutes). Separate from startup, join, and wait budgets. A timed-out result keeps partial output and reports elapsed runtime and the deadline.", minimum: 1, maximum: MAX_PROCESS_TIMEOUT_MS })),
+  executionTimeoutMs: Type.Optional(Type.Integer({ description: "run/spawn only: model/tool execution deadline, starting when the task is submitted. Positive integer milliseconds, at most 2 hours; off by default. Set this argument or PI_SUBAGENT_TIMEOUT_MS to opt in. Separate from startup, join, and wait budgets. A timed-out result keeps partial output and reports elapsed runtime and the deadline.", minimum: 1, maximum: MAX_PROCESS_TIMEOUT_MS })),
   startupTimeoutMs: Type.Optional(Type.Integer({ description: "run/spawn only: deadline for the RPC process, model selection, tool probe, and MCP readiness before the task starts. Positive integer milliseconds, at most 5 minutes; defaults to PI_SUBAGENT_STARTUP_TIMEOUT_MS (30 seconds).", minimum: 1, maximum: MAX_STARTUP_TIMEOUT_MS })),
   joinTimeoutMs: Type.Optional(Type.Integer({ description: "run only: how long this call waits before returning the running child for background delivery. Does not change the execution deadline. Defaults to PI_SUBAGENT_FOREGROUND_MS (60 seconds).", minimum: 1, maximum: MAX_WAIT_MS })),
   persist: Type.Optional(Type.Boolean({ description: "run/spawn only: save the Pi conversation for inspection/recovery, including after failure; default true. Set false to avoid retaining potentially sensitive prompts/tool results. Returns sessionFile for resume in the same cwd after the child stops; not a full token trace." })),
-  resume: Type.Optional(Type.String({ description: "run/spawn only: stopped child handle (sa-N) or saved session path to continue. Handle resume defaults to its original cwd; paths resolve against the parent cwd. Mutually exclusive with persist.", minLength: 1, maxLength: 4096 })),
+  resume: Type.Optional(Type.String({ description: "run/spawn only: continue a stopped conversation from handle (sa-N) or saved session path in a new child/handle; the earlier report stays readable. Handle resume defaults to its original cwd. Tools/model/effort/trust use normal launch rules, not the old child options. Paths resolve against the parent cwd. Mutually exclusive with persist.", minLength: 1, maxLength: 4096 })),
   trustProject: Type.Optional(Type.Boolean({ description: "run/spawn only: pass --approve to the child so project-local resources load without a trust prompt; default false." })),
 }, { additionalProperties: false });
 

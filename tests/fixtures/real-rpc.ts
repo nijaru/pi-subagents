@@ -42,6 +42,7 @@ export function realRpcFixture(respond: (body: any) => Delta | Response | Promis
     process.env.PI_OFFLINE = "1";
     process.env.PI_SKIP_VERSION_CHECK = "1";
     delete process.env.PI_SUBAGENT_CLI;
+    delete process.env.PI_SUBAGENT_TIMEOUT_MS;
     return { dir, requests, [Symbol.dispose]: dispose };
   } catch (error) {
     dispose();

@@ -24,6 +24,7 @@ const saved = { ...process.env };
 beforeEach(() => {
   process.env.PI_SUBAGENT_CLI = path.resolve(import.meta.dir, "fixtures/fake-rpc-cli.mjs");
   delete process.env.PI_SUBAGENT_SESSION_DIR;
+  delete process.env.PI_SUBAGENT_TIMEOUT_MS;
 });
 afterEach(() => {
   for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
@@ -180,6 +181,37 @@ describe("public RPC child host", () => {
     expect(result.timeoutPhase).toBe("execution");
     expect(result.output).toBe("partial");
     expect(result.errorMessage).toContain("Subagent timed out during execution");
+  });
+
+  test("default execution outlives startup without retaining its deadline and can still be cancelled", async () => {
+    const updates: ExecutionUpdate[] = [];
+    const ready = Promise.withResolvers<void>();
+    const controller = new AbortController();
+    let settled = false;
+    const pending = run(task(tempDir(), { prompt: "SCENARIO=slow", startupTimeoutMs: 300 }), controller.signal,
+      (data: ExecutionUpdate) => { updates.push(data); if (data.phase === "running") ready.resolve(); })
+      .then((result) => { settled = true; return result; });
+    try {
+      await ready.promise;
+      expect(updates.findLast((data) => data.phase === "running")?.deadline).toBeUndefined();
+      const startup = updates.find((data) => data.deadline?.phase === "startup")!.deadline!;
+      await Bun.sleep(Math.max(0, startup.expiresAt - Date.now()) + 50);
+      expect(settled).toBe(false);
+    } finally { controller.abort(); await pending; }
+    const result = await pending;
+    expect(result).toMatchObject({ outcome: "cancelled", cleanup: { status: "confirmed" } });
+    expect(result.deadline).toBeUndefined();
+    expect(result.output).toBe("partial");
+  });
+
+  test("a malformed configured execution limit fails before task work, but an explicit argument overrides it", async () => {
+    const dir = tempDir();
+    process.env.PI_SUBAGENT_TIMEOUT_MS = "invalid";
+    const rejected = await run(task(dir));
+    expect(rejected).toMatchObject({ outcome: "failed", errorKind: "startup" });
+    expect(rejected.errorMessage).toContain("PI_SUBAGENT_TIMEOUT_MS");
+    expect(fs.existsSync(path.join(fs.realpathSync.native(dir), ".fake-rpc-prompt"))).toBe(false);
+    expect((await run(task(dir, { executionTimeoutMs: 1_000 }))).outcome).toBe("completed");
   });
 
   test("reports the environment-resolved execution deadline without extending it on activity", async () => {

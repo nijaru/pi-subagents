@@ -6,7 +6,6 @@ export const MAX_DIAGNOSTIC_BYTES = 8 * 1024;
 export const MAX_STDERR_BYTES = 50 * 1024;
 export const MAX_PROTOCOL_LINE_BYTES = 16 * 1024 * 1024;
 export const MAX_TASK_BYTES = 100 * 1024;
-export const DEFAULT_PROCESS_TIMEOUT_MS = 30 * 60 * 1000;
 export const MAX_PROCESS_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 export const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
 export const MAX_STARTUP_TIMEOUT_MS = 5 * 60 * 1000;
@@ -22,18 +21,22 @@ export const TIMEOUT_ENV = "PI_SUBAGENT_TIMEOUT_MS";
 export const STARTUP_TIMEOUT_ENV = "PI_SUBAGENT_STARTUP_TIMEOUT_MS";
 export const FOREGROUND_ENV = "PI_SUBAGENT_FOREGROUND_MS";
 
-function configuredBudget(key: string, fallback: number, maximum: number): number {
+function configuredBudget(key: string, maximum: number): number | undefined {
   const configured = Number(process.env[key]);
-  return Number.isSafeInteger(configured) && configured > 0 && configured <= maximum ? configured : fallback;
+  return Number.isSafeInteger(configured) && configured > 0 && configured <= maximum ? configured : undefined;
 }
 
-export function processTimeoutMs(): number {
-  return configuredBudget(TIMEOUT_ENV, DEFAULT_PROCESS_TIMEOUT_MS, MAX_PROCESS_TIMEOUT_MS);
+/** Execution limits are opt-in; malformed explicit configuration is not no limit. */
+export function processTimeoutMs(): number | undefined {
+  if (process.env[TIMEOUT_ENV] === undefined) return undefined;
+  const budget = configuredBudget(TIMEOUT_ENV, MAX_PROCESS_TIMEOUT_MS);
+  if (budget === undefined) throw new Error(`${TIMEOUT_ENV} must be a positive integer at most ${MAX_PROCESS_TIMEOUT_MS}; unset it for no execution deadline.`);
+  return budget;
 }
 
 /** Deadline for RPC process, model selection, tool probe, and MCP readiness. */
 export function startupTimeoutMs(): number {
-  return configuredBudget(STARTUP_TIMEOUT_ENV, DEFAULT_STARTUP_TIMEOUT_MS, MAX_STARTUP_TIMEOUT_MS);
+  return configuredBudget(STARTUP_TIMEOUT_ENV, MAX_STARTUP_TIMEOUT_MS) ?? DEFAULT_STARTUP_TIMEOUT_MS;
 }
 
 /**
@@ -42,7 +45,7 @@ export function startupTimeoutMs(): number {
  * times out is still reported to its caller as a timed-out result.
  */
 export function foregroundBudgetMs(): number {
-  return configuredBudget(FOREGROUND_ENV, DEFAULT_FOREGROUND_MS, MAX_WAIT_MS);
+  return configuredBudget(FOREGROUND_ENV, MAX_WAIT_MS) ?? DEFAULT_FOREGROUND_MS;
 }
 
 /** Invalid or nonzero depth fails closed. Children cannot use this extension to delegate. */
