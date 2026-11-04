@@ -147,6 +147,11 @@ RPC preserves the normal Pi CLI runtime while supporting steering and session co
 
 `0.0.x` is pre-release: tool schema and result shape are not promised across patch releases.
 
+- **0.0.20**:
+  - Execution deadlines are off by default. Set `executionTimeoutMs` or `PI_SUBAGENT_TIMEOUT_MS` to opt in; task preflight follows the same policy. Startup protection and join budgets remain separate.
+  - Resume a saved conversation by handle or path, and retain completed answers across steering. Model and effort are explicitly established and verified before task submission.
+  - Child execution has one lifecycle owner. Cleanup uncertainty retains admission and session ownership without hiding the task outcome; RPC queues and public reports are bounded.
+  - **Migration:** remove `notify`, `stdout`, and synthetic `state.exitCode` usage. Result omissions and cleanup disposition are explicit; see [Migration](#migration).
 - **0.0.19**:
   - **Migration:** children now save recoverable conversations by default, including prompts and tool results; use `persist: false` for ephemeral work.
   - **Recovery:** results expose effective deadlines and interruption observations. Failed reports retain earlier visible work and authoritative completed text blocks, with truthful Unicode/truncation accounting. Activity distinguishes Pi retry backoff and compaction. Oversized batch details may explicitly omit session paths; inspect an individual child with `status` for its full path.
@@ -156,7 +161,7 @@ RPC preserves the normal Pi CLI runtime while supporting steering and session co
 
 ## Migration
 
-### Unreleased
+### 0.0.20
 
 - Execution deadlines are now opt-in. Omit `executionTimeoutMs` and leave `PI_SUBAGENT_TIMEOUT_MS` unset for no execution cutoff. Valid environment configuration still provides a global default; explicit arguments override it. Invalid execution-limit environment values now fail instead of falling back silently. Startup, foreground handoff, wait, and cleanup budgets are unchanged.
 - Initial task preflight no longer has a separate 30-second RPC acknowledgment cutoff; optional execution deadlines govern preflight as well as model/tool work.
