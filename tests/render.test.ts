@@ -41,7 +41,7 @@ describe("compact child rendering", () => {
   test("Pi's actual tool row passes context and expands without duplicate IDs", () => {
     initTheme("dark", false);
     let tool: ToolDefinition<any, any> | undefined;
-    extension({ registerTool(value: ToolDefinition<any, any>) { tool = value; }, registerMessageRenderer() {}, on() {} } as any);
+    extension({ registerTool(value: ToolDefinition<any, any>) { tool = value; }, registerMessageRenderer() {}, registerCommand() {}, on() {} } as any);
     const row = new ToolExecutionComponent("subagent", "test-call", { command: "wait", ids: [child.id] }, {}, tool, { requestRender() {} } as TUI, "/project");
     row.updateResult({ ...result("wait"), isError: false });
     const compact = row.render(80).map((line) => stripTerminalControls(line).trim()).filter(Boolean);

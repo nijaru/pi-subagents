@@ -1,8 +1,8 @@
 import { randomInt, randomUUID } from "node:crypto";
 import { truncateOutput } from "./bounds.ts";
 import { MAX_CONCURRENCY, MAX_DIAGNOSTIC_BYTES, MAX_RETAINED_RUNS } from "./limits.ts";
-import { copyReport, type ChildExecution, type ChildSupervisor, type ChildTask, type ExecutionReport, type ExecutionSnapshot } from "./execution.ts";
-import { addUsage, copyResult, emptyUsage, type ChildResult, type UsageRecord } from "./types.ts";
+import type { ChildExecution, ChildSupervisor, ChildTask, ExecutionReport, ExecutionSnapshot } from "./execution.ts";
+import { addUsage, emptyUsage, type ChildResult, type UsageRecord } from "./types.ts";
 
 export type StartChild = Omit<ChildTask, "id"> & { emit?: (result: ChildResult, progress: string) => void };
 interface RetainedChild {
@@ -44,7 +44,7 @@ export class SessionChildren {
     const child: RetainedChild = { task, handle: `sa-${this.nextHandle++}`, execution: { status: "active", owner }, collected: false, joins: 0 };
     this.children.set(task.id, child);
     void owner.done.then((report) => {
-      child.execution = { status: "finished", report: copyReport(report) };
+      child.execution = { status: "finished", report: structuredClone(report) };
       if (!this.closed) {
         this.pendingUsage ??= emptyUsage();
         addUsage(this.pendingUsage, report.usage);
@@ -73,9 +73,9 @@ export class SessionChildren {
     const execution: ExecutionSnapshot = child.execution.status === "active" ? child.execution.owner.snapshot() : { status: "finished", report: child.execution.report };
     const { task, handle } = child;
     const identity = { id: task.id, handle, prompt: task.prompt, cwd: task.cwd, tools: [...task.tools], model: task.model };
-    if (execution.status === "active") return copyResult({ ...identity, ...execution.facts, phase: execution.phase, state: { status: "running" } });
+    if (execution.status === "active") return structuredClone({ ...identity, ...execution.facts, phase: execution.phase, state: { status: "running" } });
     const { outcome, stopReason, finishedAt, cleanup, ...facts } = execution.report;
-    return copyResult({ ...identity, ...facts, prompt: truncateOutput(task.prompt, MAX_DIAGNOSTIC_BYTES), cleanup: { ...cleanup },
+    return structuredClone({ ...identity, ...facts, prompt: truncateOutput(task.prompt, MAX_DIAGNOSTIC_BYTES), cleanup: { ...cleanup },
       cleanupMs: Math.max(0, finishedAt - (facts.taskFinishedAt ?? finishedAt)),
       state: { status: "terminal", outcome, stopReason, finishedAt } });
   }

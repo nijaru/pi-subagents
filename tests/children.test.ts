@@ -31,7 +31,10 @@ function corrupt(result: ChildResult) {
   if (result.interruption) result.interruption.activeToolCount = 999;
   if (result.outputTruncation) result.outputTruncation.retainedBytes = 999;
   if (result.cleanup?.status === "unconfirmed") result.cleanup.taskOutcome = "completed";
-  result.state = { status: "terminal", outcome: "failed", finishedAt: 0 };
+  if (result.state.status === "terminal") {
+    result.state.outcome = "failed";
+    result.state.finishedAt = 0;
+  } else result.state = { status: "terminal", outcome: "failed", finishedAt: 0 };
 }
 
 describe("session ownership through detached results", () => {
@@ -122,13 +125,15 @@ describe("session ownership through detached results", () => {
     });
     execution.facts.usage.input = 5;
     execution.facts.usage.cost.total = 1;
+    execution.facts.usage.cacheWrite1h = 2;
+    execution.facts.usage.reasoning = 3;
     execution.publish("progress");
     const expected = {
       prompt: "original task", cwd: process.cwd(), tools: ["read"], output: "done",
       state: { status: "running" }, lastActivityAt: 10, activity: "tool", currentTool: "read",
       deadline: { phase: "execution", startedAt: 1, expiresAt: 11 },
       interruption: { activeToolCount: 1 }, outputTruncation: { retainedBytes: 4 },
-      usage: { input: 5, cost: { total: 1 } },
+      usage: { input: 5, cacheWrite1h: 2, reasoning: 3, cost: { total: 1, totalFromProvider: true } },
     };
     const snapshot = c.children.get(run.id);
     expect(snapshot).toMatchObject(expected);
@@ -143,13 +148,15 @@ describe("session ownership through detached results", () => {
     report.deadline!.expiresAt = 999;
     report.interruption!.activeToolCount = 999;
     report.outputTruncation!.retainedBytes = 999;
-    expect(c.children.get(run.id)).toMatchObject({
-      ...expected, activity: undefined, currentTool: undefined, state: { status: "terminal", outcome: "completed" },
+    const terminal = c.children.get(run.id);
+    expect(terminal).toMatchObject({
+      ...expected, activity: undefined, currentTool: undefined,
+      cleanup: { status: "confirmed" }, state: { status: "terminal", outcome: "completed", finishedAt: 3 },
     });
     corrupt(c.children.unread()[0]!);
     corrupt((await c.children.wait([run.id], 1))[0]!);
-    expect(c.children.get(run.id).usage.input).toBe(5);
-    expect(c.children.takePendingUsage()).toMatchObject({ input: 5, cost: { total: 1 } });
+    expect(c.children.get(run.id)).toEqual(terminal);
+    expect(c.children.takePendingUsage()).toMatchObject(expected.usage);
     await c.children.close();
   });
 

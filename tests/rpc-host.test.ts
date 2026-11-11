@@ -7,6 +7,7 @@ import * as path from "node:path";
 import { getRpcInvocation } from "../extensions/pi-subagents/launch.ts";
 import { runChild, type ExecutionUpdate, type ExecutionControl } from "./fixtures/run-child.ts";
 import type { ChildTask } from "../extensions/pi-subagents/execution.ts";
+import { RpcChildSupervisor } from "../extensions/pi-subagents/supervisor.ts";
 
 const directories: string[] = [];
 function tempDir(): string {
@@ -50,6 +51,41 @@ describe("public RPC child host", () => {
     expect(capture.args).toContain("--tools");
     expect(capture.args).toContain("read");
     expect(capture.cwd).toBe(fs.realpathSync.native(dir));
+  });
+
+  test("execution snapshots and completion reports never lend owner state", async () => {
+    const execution = new RpcChildSupervisor().create(task(tempDir(), {
+      prompt: "SCENARIO=activity-hang", executionTimeoutMs: 150,
+    }));
+    const initial = execution.snapshot();
+    expect(initial.status).toBe("active");
+    if (initial.status !== "active") throw new Error("Expected active execution");
+    expect(Object.hasOwn(initial.facts, "deadline")).toBe(false);
+    expect(Object.hasOwn(initial.facts, "interruption")).toBe(false);
+    const liveIsolation: boolean[] = [];
+    execution.start(() => {
+      const snapshot = execution.snapshot();
+      if (snapshot.status !== "active" || !snapshot.facts.deadline) return;
+      const before = JSON.stringify(snapshot);
+      snapshot.facts.deadline.expiresAt = 0;
+      snapshot.facts.usage.cost.total = 999;
+      liveIsolation.push(JSON.stringify(execution.snapshot()) === before);
+    });
+    const report = await execution.done;
+    expect(liveIsolation.length).toBeGreaterThan(0);
+    expect(liveIsolation.every(Boolean)).toBe(true);
+    expect(report).toMatchObject({ outcome: "timed_out", interruption: { activeToolCount: 1 }, cleanup: { status: "confirmed" } });
+    const before = JSON.stringify(execution.snapshot());
+    report.usage.cost.total = 999;
+    report.deadline!.expiresAt = 0;
+    report.interruption!.activeToolCount = 999;
+    report.cleanup.status = "unconfirmed";
+    expect(JSON.stringify(execution.snapshot())).toBe(before);
+    const snapshot = execution.snapshot();
+    if (snapshot.status !== "finished") throw new Error("Expected finished execution");
+    snapshot.report.usage.cost.total = 999;
+    snapshot.report.cleanup.status = "unconfirmed";
+    expect(JSON.stringify(execution.snapshot())).toBe(before);
   });
 
   test("establishes requested model and effort after startup drift", async () => {

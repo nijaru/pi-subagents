@@ -2,7 +2,7 @@ import type { StopReason } from "@earendil-works/pi-ai";
 import { boundedDiagnostic } from "./bounds.ts";
 import { timeoutSummary, withCredentialHint } from "./reports.ts";
 import { ChildTranscript } from "./transcript.ts";
-import { addUsage, copyUsage, emptyUsage, isUsage, textFromMessage, type ChildActivity, type ChildResult, type UsageRecord } from "./types.ts";
+import { addUsage, emptyUsage, isUsage, textFromMessage, type ChildActivity, type ChildResult, type UsageRecord } from "./types.ts";
 import type { ChildEvent } from "./rpc.ts";
 import type { ExecutionOutcome, ExecutionEnd } from "./execution.ts";
 
@@ -43,7 +43,7 @@ export class ChildObservations {
         this.record("model");
         break;
       case "message_update": {
-        if (isUsage(event.usage)) this.streamingUsage = copyUsage({ ...event.usage, turns: 0 });
+        if (isUsage(event.usage)) this.streamingUsage = structuredClone({ ...event.usage, turns: 0 });
         const update = event.assistantMessageEvent;
         switch (update?.type) {
           case "text_start": this.transcript.startBlock(update.contentIndex); this.record("text"); break;
@@ -130,7 +130,7 @@ export class ChildObservations {
   }
 
   snapshot(mode: "live" | "history" | "reports" = "live"): Observation {
-    return { ...this.transcript.snapshot(mode), usage: copyUsage(this.usage),
+    return { ...this.transcript.snapshot(mode), usage: structuredClone(this.usage),
       lastActivityAt: this.lastActivityAt, activity: this.activity,
       currentTool: this.currentTool, errorMessage: this.errorMessage };
   }

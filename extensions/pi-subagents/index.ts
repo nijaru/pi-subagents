@@ -133,7 +133,7 @@ export default function (pi: ExtensionAPI) {
       const activeTools = pi.getActiveTools();
       const callableTools = ctx.tools.map((tool) => tool.name);
       const tools = selectTools(params.tools, activeTools, callableTools);
-      const allToolNames = typeof pi.getAllTools === "function" ? pi.getAllTools().map((tool) => tool.name) : [];
+      const allToolNames = pi.getAllTools().map((tool) => tool.name);
       const excludeTools = excludedChildTools(tools, [...new Set([...activeTools, ...callableTools, ...allToolNames])]);
       const retained = params.resume !== undefined && /^sa-\d+$/.test(params.resume) ? owner.resumeTarget(params.resume) : undefined;
       const cwd = resolveCwd(ctx.cwd || process.cwd(), params.cwd ?? retained?.cwd);
@@ -190,7 +190,7 @@ export default function (pi: ExtensionAPI) {
     renderResult: renderChildResult,
   });
 
-  if (typeof pi.registerCommand === "function") pi.registerCommand("subagents", {
+  pi.registerCommand("subagents", {
     description: "List retained child agents, or clear completed read handles",
     async handler(args, ctx) {
       const action = args.trim().toLowerCase();

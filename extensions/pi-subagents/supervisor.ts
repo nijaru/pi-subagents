@@ -10,7 +10,7 @@ import { acquireSession, getRpcInvocation } from "./launch.ts";
 import { ChildRpc, type ChildEvent } from "./rpc.ts";
 import { ChildObservations } from "./observations.ts";
 import { prepareChild } from "./startup.ts";
-import { copyFacts, copyReport, type ChildExecution, type ChildSupervisor, type ChildTask, type ExecutionEnd, type ExecutionFacts, type ExecutionReport, type ExecutionSnapshot } from "./execution.ts";
+import type { ChildExecution, ChildSupervisor, ChildTask, ExecutionEnd, ExecutionFacts, ExecutionReport, ExecutionSnapshot } from "./execution.ts";
 
 /** The OS boundary is explicit so failure/cleanup guarantees can be exercised. */
 export interface ProcessRuntime {
@@ -56,9 +56,9 @@ class RpcExecution implements ChildExecution {
   }
 
   snapshot(): ExecutionSnapshot {
-    if (this.lifecycle.phase === "finished") return { status: "finished", report: copyReport(this.lifecycle.report) };
+    if (this.lifecycle.phase === "finished") return { status: "finished", report: structuredClone(this.lifecycle.report) };
     return { status: "active", phase: this.lifecycle.phase === "submitting" ? "running" : this.lifecycle.phase,
-      facts: copyFacts({ ...this.facts, ...this.observations.snapshot() }) };
+      facts: structuredClone({ ...this.facts, ...this.observations.snapshot() }) };
   }
 
   start(onUpdate?: (progress?: string) => void): void {
@@ -237,7 +237,7 @@ class RpcExecution implements ChildExecution {
       this.lifecycle = { phase: "finished", report };
       this.wakeReady();
       this.readyWaiters.clear();
-      this.completion.resolve(copyReport(report));
+      this.completion.resolve(structuredClone(report));
       this.publish();
       this.onUpdate = undefined;
       this.rpc = undefined; this.child = undefined; this.watchdog = undefined; this.releaseSession = undefined;

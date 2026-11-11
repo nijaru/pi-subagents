@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import extension from "../extensions/pi-subagents/index.ts";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const directories: string[] = [];
 const hosts: any[] = [];
@@ -23,6 +24,12 @@ function host() {
     registerCommand(name: string, command: any) { commands.set(name, command); },
     on(name: string, handler: any) { handlers.set(name, handler); },
     getActiveTools() { return ["read", "bash"]; },
+    getAllTools(): ReturnType<ExtensionAPI["getAllTools"]> {
+      return ["read", "bash", "inactive_tool"].map((name) => ({
+        name, description: name, parameters: { type: "object", properties: {} }, exposure: "direct",
+        sourceInfo: { path: `fixture:${name}`, source: "sdk", scope: "temporary", origin: "top-level" },
+      }));
+    },
   } as any);
   const cwd = tempDir();
   const context = {
@@ -65,7 +72,11 @@ describe("RPC-backed subagent tool", () => {
     expect(value.structuredContent).toEqual(value.details);
     const capture = JSON.parse(fs.readFileSync(path.join(fs.realpathSync.native(h.cwd), ".fake-rpc-capture.json"), "utf8"));
     expect(capture.args).toContain("--exclude-tools");
-    expect(capture.args[capture.args.indexOf("--exclude-tools") + 1]).toContain("mcp__*");
+    const excluded = capture.args[capture.args.indexOf("--exclude-tools") + 1].split(",");
+    expect(excluded).toContain("mcp__*");
+    expect(excluded).toContain("inactive_tool");
+    expect(excluded).toContain("bash");
+    expect(excluded).not.toContain("read");
   });
 
   test("starts in the background, steers, and joins", async () => {

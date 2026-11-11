@@ -25,20 +25,6 @@ export function outcomeOf(result: ChildResult): AgentOutcome | undefined {
 
 export type SubagentDetails = Static<typeof SubagentDetailsSchema>;
 
-export function copyUsage(usage: UsageSummary): UsageSummary {
-  return { ...usage, cost: { ...usage.cost } };
-}
-
-/** Snapshots never lend mutable session-owned fields to callers. */
-export function copyResult(result: ChildResult): ChildResult {
-  return { ...result, tools: result.tools ? [...result.tools] : undefined, omittedFields: result.omittedFields ? [...result.omittedFields] : undefined, state: { ...result.state },
-    cleanup: result.cleanup ? { ...result.cleanup } : undefined,
-    deadline: result.deadline ? { ...result.deadline } : undefined,
-    interruption: result.interruption ? { ...result.interruption } : undefined,
-    outputTruncation: result.outputTruncation ? { ...result.outputTruncation } : undefined,
-    usage: copyUsage(result.usage) };
-}
-
 export function emptyUsage(): UsageSummary {
   return {
     input: 0,

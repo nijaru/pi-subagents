@@ -64,13 +64,3 @@ export interface ChildSupervisor { create(task: ChildTask): ChildExecution; }
 export type ExecutionEnd = { kind: "settled" } | { kind: "cancelled" }
   | { kind: "deadline"; phase: "startup" | "execution"; budget: number; elapsed: number }
   | { kind: "failure"; message: string; startup: boolean };
-
-export function copyFacts<T extends ExecutionFacts>(facts: T): T {
-  return { ...facts, usage: { ...facts.usage, cost: { ...facts.usage.cost } },
-    deadline: facts.deadline ? { ...facts.deadline } : undefined,
-    interruption: facts.interruption ? { ...facts.interruption } : undefined,
-    outputTruncation: facts.outputTruncation ? { ...facts.outputTruncation } : undefined };
-}
-export function copyReport(report: ExecutionReport): ExecutionReport {
-  return { ...copyFacts(report), cleanup: { ...report.cleanup } };
-}

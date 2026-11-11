@@ -1,5 +1,5 @@
 import { MAX_DIAGNOSTIC_BYTES, MAX_OUTPUT_BYTES, MAX_STDERR_BYTES } from "./limits.ts";
-import { copyUsage, type ChildResult, type SubagentDetails } from "./types.ts";
+import type { ChildResult, SubagentDetails } from "./types.ts";
 
 /** Return a UTF-8 prefix without splitting a code point. */
 export function utf8Prefix(value: string, maxBytes: number): string {
@@ -133,7 +133,7 @@ export function minimalChildResult(result: ChildResult): ChildResult {
     state: { ...result.state },
     outputTruncation: truncationFor(result, ""),
     stderr: "",
-    usage: copyUsage(result.usage),
+    usage: structuredClone(result.usage),
   };
 }
 
