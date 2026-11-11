@@ -147,6 +147,7 @@ RPC preserves the normal Pi CLI runtime while supporting steering and session co
 
 `0.0.x` is pre-release: tool schema and result shape are not promised across patch releases.
 
+- **0.0.21**: simplify snapshot copying and host API integration without changing tool behavior or the Pi 1.3 minimum.
 - **0.0.20**:
   - Execution deadlines are off by default. Set `executionTimeoutMs` or `PI_SUBAGENT_TIMEOUT_MS` to opt in; task preflight follows the same policy. Startup protection and join budgets remain separate.
   - Resume a saved conversation by handle or path, and retain completed answers across steering. Model and effort are explicitly established and verified before task submission.
