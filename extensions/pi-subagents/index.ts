@@ -8,7 +8,7 @@ import { SubagentParamsSchema, excludedChildTools, resolveCwd, selectTools, vali
 import { DEFAULT_WAIT_MS, RUNNING_PROGRESS_TEXT, RUNTIME_UPDATE_INTERVAL_MS, foregroundBudgetMs, isChildProcess } from "./limits.ts";
 import { truncateOutput } from "./bounds.ts";
 import { childResponse as answer } from "./response.ts";
-import { addUsage, failed, isRunning } from "./types.ts";
+import { addUsage, isRunning } from "./types.ts";
 import { SubagentDetailsSchema } from "./result-schema.ts";
 import type { ChildResult, SubagentDetails } from "./types.ts";
 import { childListText, renderChildCall, renderChildResult, renderChildNotice } from "./render.ts";
@@ -35,7 +35,7 @@ function outcome(command: "run" | "wait", results: ChildResult[]): AgentToolResu
     ? `${waitExpired ? "Wait budget expired; children continue." : "Returned ready reports; remaining children continue."} Wait again only on remaining ids when their results block progress.\n\n`
     : "";
   // The model authored run prompts; keep them only where the call lacks them.
-  return { ...answer(command, results, (view) => preamble + childReports(view, { includePrompt: command !== "run" }), waitExpired), isError: results.some(failed) };
+  return answer(command, results, (view) => preamble + childReports(view, { includePrompt: command !== "run" }), waitExpired);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -90,18 +90,20 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
-    description: "Delegate one self-contained task to a fresh Pi child over the public RPC protocol. run joins within a join budget, then lets the child finish as background work; spawn returns a handle immediately. status, wait, stop, and steer control session-scoped children. Defaults to read/search/web tools; request bash, edit, or write explicitly for mutating work. Children are leaves. Child conversations are saved locally by default for inspection/recovery; use persist: false to opt out. Use resume with a stopped child's handle or sessionFile for a focused continuation.",
+    description: "Delegate a self-contained task to a fresh Pi child. run/spawn require prompt; optional label identifies the task. run joins briefly, then returns a running handle if unfinished; spawn returns immediately. wait with ids retrieves reports when any selected child finishes. status inspects without collecting; stop cancels; steer queues instructions into active work. Defaults to read/search/web tools; request mutation tools explicitly. Children are leaves. Conversations are saved by default; persist:false opts out. resume continues a stopped conversation with a new handle. Inspect state.outcome and cleanup independently: a completed task with unconfirmed cleanup must not be rerun just because the tool reports an error.",
     parameters: SubagentParamsSchema,
+    constrainedSampling: { type: "json_schema", strict: "prefer" },
     outputSchema: SubagentDetailsSchema,
     executionMode: "parallel",
     promptSnippet: "Use run for a fresh-context result, spawn for independent work alongside useful local work, and steer to redirect a running child.",
     promptGuidelines: [
-      "Delegate self-contained work with relevant evidence, constraints, expected output and checks. Prefer direct work for routine or tightly coupled tasks; the parent owns integration and verification.",
-      "Request mutation tools explicitly. Concurrent writers, including parent and child, need separate worktrees; tool allowlists and subprocesses are not sandboxes.",
-      "Spawn independent tasks before waiting. Use wait with handles when blocked; it wakes when any finishes. Collect reports after completion notices, which announce handles only. Do not poll or relaunch a running child when a join expires.",
-      "Cancelling wait leaves children running; stop cancels them. Use steer for running children and resume with a stopped child's handle or sessionFile for a focused continuation. Handle resume defaults to the child's original cwd; tools/model options follow normal launch rules.",
-      "Execution deadlines are off unless executionTimeoutMs or PI_SUBAGENT_TIMEOUT_MS is set. Startup and join/wait budgets remain separate; join/wait expiry does not stop work. On failure or timeout, inspect retained output, timing and session before recovery; deadline expiry or silence is not a cause diagnosis. Resume does not roll back side effects or make interrupted mutations safe to repeat.",
-      "Sessions are saved locally by default and may contain sensitive prompts/tool results; use persist: false to opt out. Completion notices never wake an idle parent.",
+      "Give subagent tasks relevant evidence, scope, constraints, expected output and checks. Prefer direct work for routine or tightly coupled tasks; the parent owns integration and verification. Use short labels to distinguish parallel tasks; control children by handles, not labels.",
+      "Request subagent mutation tools explicitly. Concurrent writers, including parent and child, need separate worktrees; tool allowlists and subprocesses are not sandboxes.",
+      "Spawn independent subagent tasks before waiting. Use subagent wait with handles when blocked; it wakes when any selected child finishes. Completion notices announce handles, not reports: collect them with wait. Do not poll or relaunch when a join expires.",
+      "Cancelling subagent wait leaves children running; stop cancels them. Use steer for active work and resume for a stopped conversation with a new handle. Handle resume defaults to the original cwd; tools/model/effort/trust use normal launch rules.",
+      "Subagent execution deadlines are off unless executionTimeoutMs or PI_SUBAGENT_TIMEOUT_MS is set. Startup and join/wait budgets are separate. On failure or timeout, inspect output, timing and saved history before recovery; silence or deadline expiry is not a cause diagnosis. Resume is not rollback or permission to replay mutations.",
+      "Read subagent state.outcome independently of cleanup.status. Unconfirmed cleanup remains a tool error and reserves resources, even if the task completed; reconcile process/workspace state rather than rerunning completed work. Successful output lists completed answers newest-first; earlier answers may add findings but may be superseded by corrections.",
+      "Subagent sessions are saved locally by default and may contain sensitive prompts/tool results; persist:false opts out. Completion notices never wake an idle parent.",
     ],
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       if (!Check(SubagentParamsSchema, params)) {
@@ -156,7 +158,7 @@ export default function (pi: ExtensionAPI) {
       // A completed join reads the result; only unread results are eligible
       // for automatic delivery at an active parent boundary; never wake an idle parent.
       const run = owner.start({
-        prompt: params.prompt, tools, cwd,
+        prompt: params.prompt, label: params.label?.trim(), tools, cwd,
         model, thinking, strictThinking: params.thinking !== undefined,
         executionTimeoutMs: params.executionTimeoutMs,
         startupTimeoutMs: params.startupTimeoutMs,
@@ -168,7 +170,7 @@ export default function (pi: ExtensionAPI) {
       });
       if (!foreground) {
         const snapshot = owner.get(run.id);
-        return answer("spawn", [snapshot], ([view]) => `Started child ${view!.handle}. Completion is announced at an active boundary or on a later tool result; idle parents are not woken. Continue non-overlapping work; use wait when its result blocks finishing your task, or status/stop with this handle.${view!.sessionFile ? `\nSession: ${view!.sessionFile}` : ""}`);
+        return answer("spawn", [snapshot], ([view]) => `Started child ${view!.handle}${view!.label ? ` (${view!.label})` : ""}. Completion is announced at an active boundary or on a later tool result; idle parents are not woken. Continue non-overlapping work; use wait when its result blocks finishing your task, or status/stop with this handle.${view!.sessionFile ? `\nSession: ${view!.sessionFile}` : ""}`);
       }
       // Presentation stops at the foreground join, even when execution continues.
       const timer = onUpdate ? setInterval(() => {

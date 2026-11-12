@@ -10,11 +10,11 @@ test("successful output retains completed reports across steering, not narration
   transcript.append(0, "Follow-up");
   transcript.finish("Follow-up", "stop");
   expect(transcript.snapshot().output).toBe("Follow-up");
-  expect(transcript.snapshot("reports").output).toBe("Original review\n\nFollow-up");
+  expect(transcript.snapshot("reports").output).toBe("Follow-up\n\n[Earlier completed answer]\n\nOriginal review");
   expect(transcript.snapshot("history").output).toBe("Tool narration\n\nOriginal review\n\nFollow-up");
 });
 
-test("completed reports retain a bounded UTF-8 prefix with truthful combined sizes", () => {
+test("newest completed answer survives an oversized earlier report with truthful UTF-8 sizes", () => {
   const transcript = new ChildTranscript();
   const first = "界🙂".repeat(MAX_OUTPUT_BYTES);
   const second = "Follow-up";
@@ -22,9 +22,24 @@ test("completed reports retain a bounded UTF-8 prefix with truthful combined siz
   transcript.finish("not a report", "toolUse");
   transcript.finish(second, "stop");
   const result = transcript.snapshot("reports");
-  expect(result.outputTruncation).toEqual({ truncated: true, originalBytes: Buffer.byteLength(first + "\n\n" + second), retainedBytes: Buffer.byteLength(result.output!) });
+  expect(result.outputTruncation).toEqual({ truncated: true, originalBytes: Buffer.byteLength(second + "\n\n[Earlier completed answer]\n\n" + first), retainedBytes: Buffer.byteLength(result.output!) });
   expect(Buffer.byteLength(result.output!)).toBeLessThanOrEqual(MAX_OUTPUT_BYTES);
+  expect(result.output).toStartWith(second + "\n\n[Earlier completed answer]\n\n");
   expect(result.output).not.toContain("�");
+});
+
+test("completed answers remain newest-first after repeated truncation and oversized corrections", () => {
+  const transcript = new ChildTranscript();
+  transcript.finish("FIRST".repeat(MAX_OUTPUT_BYTES), "stop");
+  const latest = "CORRECTED🙂".repeat(MAX_OUTPUT_BYTES);
+  transcript.finish(latest, "stop");
+  expect(transcript.snapshot("reports").output).toStartWith("CORRECTED🙂");
+  transcript.finish("final correction", "stop");
+  const snapshot = transcript.snapshot("reports");
+  expect(snapshot.output).toStartWith("final correction\n\n[Earlier completed answer]\n\nCORRECTED🙂");
+  expect(snapshot.outputTruncation!.originalBytes).toBe(Buffer.byteLength(
+    "final correction\n\n[Earlier completed answer]\n\n" + latest + "\n\n[Earlier completed answer]\n\n" + "FIRST".repeat(MAX_OUTPUT_BYTES),
+  ));
 });
 
 test("authoritative block text replaces deltas by index without losing other text blocks", () => {

@@ -115,10 +115,10 @@ export class ChildTranscript {
     }
     this.historyBytes += Buffer.byteLength(separator) + this.latestBytes;
     if (stopReason === "stop") {
-      const separator = this.reportBytes ? "\n\n" : "";
-      if (this.reportBytes === Buffer.byteLength(this.reports)) {
-        this.reports = utf8Prefix(this.reports + separator + text, MAX_OUTPUT_BYTES);
-      }
+      const separator = this.reportBytes ? "\n\n[Earlier completed answer]\n\n" : "";
+      // A steering correction must outrank an older answer, even after the
+      // retained report filled its budget. Diagnostic history stays chronological.
+      this.reports = utf8Prefix(text + separator + this.reports, MAX_OUTPUT_BYTES);
       this.reportBytes += Buffer.byteLength(separator) + this.latestBytes;
     }
   }

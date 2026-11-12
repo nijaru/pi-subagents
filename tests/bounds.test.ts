@@ -178,14 +178,18 @@ describe("serialized result bounds", () => {
     expect(rebound.omittedFields).toEqual(["cwd", "tools"]);
   });
 
-  test("truncation guidance points at the retained handle", () => {
+  test("truncation guidance avoids repeat waits for a single report and identifies batch recovery by handle", () => {
     const result = { ...child("child-uuid"), handle: "sa-42",
       state: { status: "terminal", outcome: "completed", stopReason: "stop", finishedAt: 2 } as const,
       errorMessage: undefined, model: undefined, output: "x".repeat(5_000),
       outputTruncation: { truncated: false, originalBytes: 5_000, retainedBytes: 5_000 } };
-    const text = formatReports([boundChildResult(result, 1000)]);
-    expect(text).toContain('ids: ["sa-42"]');
-    expect(text).not.toContain(`ids: ["${result.id}"]`);
+    const bounded = boundChildResult(result, 1000);
+    const single = formatReports([bounded]);
+    expect(single).toContain("Waiting again cannot restore text omitted");
+    expect(single).not.toContain("alone with wait");
+    const batch = formatReports([bounded, { ...child("other-child"), output: "ok", outputTruncation: undefined }]);
+    expect(batch).toContain("Inspect sa-42 alone with wait");
+    expect(batch).not.toContain(`Inspect ${result.id} alone`);
   });
 
   test("small batch reports return unused space to the large report in both envelopes", () => {

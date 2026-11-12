@@ -3,7 +3,7 @@ import { getMarkdownTheme, keyText } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { truncateHeadTail, truncateOutput } from "./bounds.ts";
 import { MAX_OUTPUT_BYTES, MAX_RETAINED_RUNS } from "./limits.ts";
-import { activitySummary, deadlineSummary, formatElapsed, isTimeoutSummary, lastActivitySummary, resultText, runtimeLabel } from "./reports.ts";
+import { activitySummary, cleanupSummary, deadlineSummary, formatElapsed, isTimeoutSummary, lastActivitySummary, resultText, runtimeLabel } from "./reports.ts";
 import type { SubagentDetails } from "./types.ts";
 import { Check } from "typebox/value";
 import { ChildResultSchema } from "./result-schema.ts";
@@ -77,7 +77,7 @@ export function childListText(results: readonly ChildResult[]): string {
       : result.state.outcome;
     const handle = result.handle ?? result.id.slice(0, 8);
     const tools = result.tools === undefined ? "tools omitted" : `${result.tools.length} tool${result.tools.length === 1 ? "" : "s"}`;
-    return `${handle} [${status}] · ${tools} · ${result.cwd === undefined ? "cwd omitted" : oneLineBounded(result.cwd, 512)}`;
+    return `${handle} [${status}]${result.label ? ` · ${oneLine(result.label)}` : ""} · ${tools} · ${result.cwd === undefined ? "cwd omitted" : oneLineBounded(result.cwd, 512)}`;
   }).join("\n");
 }
 
@@ -88,8 +88,9 @@ export function childListText(results: readonly ChildResult[]): string {
  */
 function collapsedPreview(child: ChildResult, command: SubagentDetails["command"] | undefined): string {
   const statusList = command === "status";
-  if (child.state.status === "running" || statusList) return child.prompt === undefined ? "task not retained" : oneLine(child.prompt);
-  if (child.state.outcome === "completed") return "";
+  if (child.state.status === "running" || statusList) return oneLine(child.label ?? child.prompt ?? "task not retained");
+  if (child.cleanup?.status === "unconfirmed") return oneLine(child.cleanup.error);
+  if (child.state.outcome === "completed") return child.label ? oneLine(child.label) : "";
   // The timeout heading already says what happened and how long it ran; the
   // expanded view carries the elapsed/deadline summary.
   if (child.state.outcome === "timed_out" && isTimeoutSummary(child.errorMessage)) return "";
@@ -121,7 +122,9 @@ export function renderChildCall(args: Record<string, unknown>, theme: Theme, con
   const target = targetId(args);
   const id = target ? ` ${displayId(target, expanded)}` : Array.isArray(args.ids) ? ` · ${args.ids.length} children` : "";
   const container = new Container();
-  container.addChild(new Text(theme.fg("toolTitle", theme.bold(`subagent ${command}${id}`)), 0, 0));
+  // Partial arguments render before launch validation enforces label limits.
+  const label = typeof args.label === "string" ? ` · ${oneLineBounded(args.label, 320)}` : "";
+  container.addChild(new Text(theme.fg("toolTitle", theme.bold(`subagent ${command}${id}${label}`)), 0, 0));
   // Prompts and steering messages are agent-facing instruction text; humans see
   // them only on expansion. Steering shows its message, never the original task.
   const detail = command === "steer" ? args.message : args.prompt;
@@ -151,14 +154,15 @@ function childHeading(child: ChildResult, theme: Theme, options: { expanded: boo
   const status = active
     ? child.phase === "starting" || child.phase === "stopping" ? child.phase : command === "spawn" ? "started" : "running"
     : outcome!.replaceAll("_", " ");
-  const color = active ? "muted" : outcome === "cancelled" || outcome === "incomplete" ? "warning" : failed(child) ? "error" : "success";
-  const icon = active ? "○" : outcome === "cancelled" ? "−" : outcome === "incomplete" ? "!" : failed(child) ? "✗" : "✓";
+  const uncertain = child.cleanup?.status === "unconfirmed";
+  const color = active ? "muted" : uncertain ? "error" : outcome === "cancelled" || outcome === "incomplete" ? "warning" : failed(child) ? "error" : "success";
+  const icon = active ? "○" : uncertain ? "!" : outcome === "cancelled" ? "−" : outcome === "incomplete" ? "!" : failed(child) ? "✗" : "✓";
   const id = showId ? `${theme.fg("accent", displayId(child.handle ?? child.id, expanded))} ` : "";
   // Spawn/status/wait are snapshots, not live activity indicators.
   const duration = active && command !== "run" ? "" : runtimeLabel(child);
   const activity = active && child.activity
     ? ` · ${child.activity}${child.currentTool ? `: ${oneLine(clean(child.currentTool, 256))}` : ""}` : "";
-  return `${theme.fg(color, icon)} ${id}${theme.fg(color, status)}${duration ? theme.fg("dim", ` · ${duration}`) : ""}${theme.fg("dim", activity)}`;
+  return `${theme.fg(color, icon)} ${id}${theme.fg(color, status + (uncertain ? " · cleanup unconfirmed" : ""))}${duration ? theme.fg("dim", ` · ${duration}`) : ""}${theme.fg("dim", activity)}`;
 }
 
 function renderChildren(details: unknown, expanded: boolean, theme: Theme, targetId?: string): Component | undefined {
@@ -184,6 +188,8 @@ function renderChildren(details: unknown, expanded: boolean, theme: Theme, targe
       // The heading already carries live activity; expansion adds only the last time.
       const activity = active && child.activity ? lastActivitySummary(child) : activitySummary(child);
       if (activity) container.addChild(new Text(theme.fg("dim", clean(activity, 512)), 0, 0));
+      const cleanup = cleanupSummary(child);
+      if (cleanup) container.addChild(new Text(theme.fg("warning", clean(cleanup, 2048)), 0, 0));
       const deadline = deadlineSummary(child);
       if (deadline) container.addChild(new Text(theme.fg("dim", deadline), 0, 0));
       // Status/wait/stop rows need task labels; run/spawn/steer payloads are in their call header.

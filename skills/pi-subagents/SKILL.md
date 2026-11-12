@@ -10,17 +10,17 @@ Requires Pi 1.3.0+ from a Node/npm installation with the `pi` CLI and Node 22.19
 ## Normal workflow
 
 1. Give each child a concrete task with evidence, scope, constraints, expected output, and checks. Fresh children do not receive parent conversation history; their own Pi configuration, skills, and applicable AGENTS.md files still load.
-2. Use **run** for a result, or **spawn** for independent work alongside useful local work. Spawn independent tasks before waiting.
+2. Use **run** for a result, or **spawn** for independent work alongside useful local work. Spawn independent tasks before waiting. Optional `label` gives each task a short name (at most 80 characters, one line); use returned handles for control, not labels.
 3. Use **wait** with `ids` containing handles (`sa-4821`) when results block progress. It wakes when any selected child finishes, returns ready reports, and identifies remaining children. Wait again only on remaining handles; do not poll or duplicate running work.
 4. Inspect reports and changes, integrate, and verify in the parent.
 
 ```json
-{"command":"spawn","prompt":"Investigate the retry failure in src/client.ts. Report concrete regressions with file/line and evidence. Do not edit files.","tools":["read"]}
+{"command":"spawn","label":"retry investigation","prompt":"Investigate the retry failure in src/client.ts. Report concrete regressions with file/line and evidence. Do not edit files.","tools":["read"]}
 {"command":"steer","id":"sa-4821","message":"Also check the empty-input case."}
 {"command":"wait","ids":["sa-4821"]}
 ```
 
-**steer** queues an instruction after the running child's current assistant turn and tool calls. During startup it joins readiness. It cannot interrupt a model request or tool batch; acceptance is not proof of delivery. Cancelling steering stops waiting, not the child, and cannot recall an instruction already sent. A missing or cancelled acknowledgment has unknown acceptance; do not resend automatically. Successful output retains completed answers before and after steering, excluding tool-use narration.
+**steer** queues an instruction after the running child's current assistant turn and tool calls. During startup it joins readiness. It cannot interrupt a model request or tool batch; acceptance is not proof of delivery. Cancelling steering stops waiting, not the child, and cannot recall an instruction already sent. A missing or cancelled acknowledgment has unknown acceptance; do not resend automatically. Successful output retains completed answers newest-first, excluding tool-use narration. `[Earlier completed answer]` separates older answers. Give corrections precedence, but do not assume a follow-up restates all prior findings. The newest answer gets the first share of the bounded report; failed/interrupted history stays chronological.
 
 **status** inspects one handle or lists retained children without collecting reports. **stop** cancels a child and joins cleanup; safe to repeat. `status`, `wait`, `stop`, and `steer` also accept full UUIDs.
 
@@ -59,7 +59,7 @@ RPC cannot show project-trust prompts. Set `trustProject: true` for one-shot `--
 
 Environment defaults: `PI_SUBAGENT_STARTUP_TIMEOUT_MS` and `PI_SUBAGENT_FOREGROUND_MS`. Execution has no extension deadline unless `executionTimeoutMs` or `PI_SUBAGENT_TIMEOUT_MS` is set; explicit arguments override the environment. Unset the execution variable for no global limit; malformed values fail before task work. Without a limit, cost and admission occupancy can continue until completion, stop, or parent shutdown. Pi/provider transport limits still apply. Join/wait expiry leaves children running and does not change execution deadlines. Never relaunch because a join expired. Cancelling `run` cancels its child and joins cleanup even beyond the join budget; cancelling `wait` leaves children running.
 
-Failed `run`/`wait` reports are tool errors. Codemode still returns `{ command, results, waitExpired? }`: inspect each `state`, `errorKind`, `timeoutPhase`, and `output`. Mixed waits retain successful reports; do not repeat that work. Invalid requests and cancelled waits reject. `incomplete` means a model output limit, not success. `waitExpired: true` means no selected child completed within the wait budget, not an execution timeout.
+Failed `run`/`wait` reports are tool errors. Unconfirmed cleanup is also a tool error, even on `status`/`stop`, without changing the primary task outcome. Codemode still returns `{ command, results, waitExpired? }`: inspect each `state.outcome`, `cleanup.status`, `errorKind`, `timeoutPhase`, and `output`. If the task completed but cleanup is unconfirmed, reconcile resources; do not rerun completed work solely because the tool returned an error. Mixed waits retain successful reports; do not repeat that work. Invalid requests and cancelled waits reject. `incomplete` means a model output limit, not success. `waitExpired: true` means no selected child completed within the wait budget, not an execution timeout.
 
 On timeout or failure, inspect retained output, timing, and saved history before choosing recovery. `deadline` records the effective phase cutoff; activity never extends it. `lastActivityAt` and live `activity`/`currentTool` distinguish model, thinking, text, tool, Pi retry, and compaction observations without exposing private payloads. Neither silence nor activity proves a stall or useful progress; deadline expiry does not establish its cause.
 

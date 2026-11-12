@@ -1,7 +1,7 @@
 import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
 import { boundDetails, jsonBytes, minimalChildResult } from "./bounds.ts";
 import { MAX_OUTPUT_BYTES } from "./limits.ts";
-import type { ChildResult, SubagentDetails } from "./types.ts";
+import { failed, type ChildResult, type SubagentDetails } from "./types.ts";
 
 /** Select one view that fits both wire and text budgets; all consumers see it. */
 export function childResponse(
@@ -29,5 +29,11 @@ export function childResponse(
       else high = middle - 1;
     }
   }
-  return { content: [{ type: "text", text: selected.text }], details: selected.details, structuredContent: selected.details };
+  return {
+    content: [{ type: "text", text: selected.text }], details: selected.details, structuredContent: selected.details,
+    // Status is observational and stop can successfully cancel a task. Unsafe
+    // resources remain an error for every command, without changing task state.
+    isError: results.some((result) => result.cleanup?.status === "unconfirmed"
+      || ((command === "run" || command === "wait") && failed(result))),
+  };
 }

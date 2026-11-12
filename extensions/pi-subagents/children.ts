@@ -72,7 +72,7 @@ export class SessionChildren {
   private project(child: RetainedChild): ChildResult {
     const execution: ExecutionSnapshot = child.execution.status === "active" ? child.execution.owner.snapshot() : { status: "finished", report: child.execution.report };
     const { task, handle } = child;
-    const identity = { id: task.id, handle, prompt: task.prompt, cwd: task.cwd, tools: [...task.tools], model: task.model };
+    const identity = { id: task.id, handle, label: task.label, prompt: task.prompt, cwd: task.cwd, tools: [...task.tools], model: task.model };
     if (execution.status === "active") return structuredClone({ ...identity, ...execution.facts, phase: execution.phase, state: { status: "running" } });
     const { outcome, stopReason, finishedAt, cleanup, ...facts } = execution.report;
     return structuredClone({ ...identity, ...facts, prompt: truncateOutput(task.prompt, MAX_DIAGNOSTIC_BYTES), cleanup: { ...cleanup },

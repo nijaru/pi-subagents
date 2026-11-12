@@ -79,6 +79,31 @@ describe("RPC-backed subagent tool", () => {
     expect(excluded).not.toContain("read");
   });
 
+  test("invalid resource limits cannot launch children or reserve admission", async () => {
+    const h = host();
+    for (const options of [{ tools: ["read", "read"] }, { startupTimeoutMs: 0 }, { label: "line\nbreak" }, { prompt: "🙂".repeat(30000) }]) {
+      await expect(h.execute({ command: "run", prompt: "x", ...options })).rejects.toThrow();
+    }
+    expect((await h.execute({ command: "status" })).details.results).toEqual([]);
+    expect(fs.existsSync(path.join(h.cwd, ".fake-rpc-capture.json"))).toBe(false);
+  });
+
+  test("retains explicit labels across launch, report collection, and status without using them as IDs", async () => {
+    const h = host();
+    const launched = await h.execute({ command: "run", prompt: "PRIVATE_TASK", label: "  parser review  ", tools: [] });
+    const child = launched.details.results[0];
+    expect(child.label).toBe("parser review");
+    expect(launched.content[0].text).toContain(`${child.handle} [completed] · parser review`);
+    for (const command of [{ command: "wait", ids: [child.handle] }, { command: "status", id: child.handle }]) {
+      const response = await h.execute(command);
+      expect(response.details.results[0].label).toBe("parser review");
+      expect(response.content[0].text).toContain("parser review");
+    }
+    await expect(h.execute({ command: "status", id: "parser review" })).rejects.toThrow("Unknown child");
+    const next = await h.execute({ command: "run", prompt: "different task", label: "parser review", tools: [] });
+    expect(next.details.results[0].handle).not.toBe(child.handle);
+  });
+
   test("starts in the background, steers, and joins", async () => {
     const h = host();
     const started = await h.execute({ command: "spawn", prompt: "SCENARIO=steer", tools: [] });
@@ -87,7 +112,7 @@ describe("RPC-backed subagent tool", () => {
     const steered = await h.execute({ command: "steer", id: handle, message: "focus" });
     expect(steered.details.command).toBe("steer");
     const joined = await h.execute({ command: "wait", ids: [handle], timeoutMs: 5000 });
-    expect(joined.details.results[0].output).toBe("waiting for steer\n\nsteered: Steering instruction:\n\nfocus");
+    expect(joined.details.results[0].output).toBe("steered: Steering instruction:\n\nfocus\n\n[Earlier completed answer]\n\nwaiting for steer");
     expect(joined.details.results[0].state).toMatchObject({ status: "terminal", outcome: "completed" });
   });
 

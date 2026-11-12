@@ -160,7 +160,7 @@ test("steering preserves a completed review alongside its follow-up through real
     await (await ready.promise).steer("FOLLOW_UP_MARKER");
     release.resolve({ content: "ORIGINAL_REVIEW" });
     const result = await pending;
-    expect(result).toMatchObject({ outcome: "completed", output: "ORIGINAL_REVIEW\n\nFOLLOW_UP" });
+    expect(result).toMatchObject({ outcome: "completed", output: "FOLLOW_UP\n\n[Earlier completed answer]\n\nORIGINAL_REVIEW" });
     expect(f.requests).toHaveLength(2);
     expect(JSON.stringify(f.requests[1].messages)).toContain("FOLLOW_UP_MARKER");
   } finally {

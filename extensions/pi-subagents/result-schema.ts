@@ -44,13 +44,14 @@ const ToolNameSchema = Type.String({ maxLength: 256, pattern: "^[A-Za-z][A-Za-z0
 export const ChildResultSchema = Type.Object({
   id: Type.String(),
   handle: Type.Optional(Type.String({ description: "Short session-scoped handle; preferred in wait/status/stop/steer calls." })),
+  label: Type.Optional(Type.String({ maxLength: 80, description: "Caller-supplied task label; display only, never a control identity." })),
   phase: Type.Optional(Type.Enum(["starting", "running", "stopping"] as const, { type: "string", description: "Live execution phase; absent once terminal." })),
-  errorKind: Type.Optional(Type.Enum(["startup", "provider", "protocol", "deadline", "cancelled", "cleanup", "unknown"] as const, { type: "string" })),
+  errorKind: Type.Optional(Type.Enum(["startup", "provider", "protocol", "deadline", "cancelled", "unknown"] as const, { type: "string" })),
   timeoutPhase: Type.Optional(Type.Enum(["startup", "execution"] as const, { type: "string", description: "Which deadline expired for a timed_out result." })),
   cleanup: Type.Optional(Type.Union([
     Type.Object({ status: Type.Literal("confirmed") }, { additionalProperties: false }),
-    Type.Object({ status: Type.Literal("unconfirmed"), error: Type.String(), taskOutcome: OutcomeSchema }, { additionalProperties: false }),
-  ], { description: "Resource disposition after task termination. Unconfirmed cleanup retains admission and any session lease; taskOutcome preserves the primary outcome." })),
+    Type.Object({ status: Type.Literal("unconfirmed"), error: Type.String() }, { additionalProperties: false }),
+  ], { description: "Resource disposition after task termination. Unconfirmed cleanup retains admission and any session lease without changing state.outcome. It remains a tool error; do not rerun completed work solely because of cleanup." })),
   cleanupMs: Type.Optional(Type.Integer({ minimum: 0, description: "Process-tree cleanup time excluded from the reported task runtime." })),
   taskFinishedAt: Type.Optional(Type.Number({ minimum: 0, description: "Leader exit or terminal-cause time, before cleanup." })),
   deadline: Type.Optional(Type.Object({
@@ -73,7 +74,7 @@ export const ChildResultSchema = Type.Object({
   omittedFields: Type.Optional(Type.Array(Type.Enum(["prompt", "cwd", "tools", "sessionFile"] as const, { type: "string" }), {
     uniqueItems: true, description: "Fields absent to fit the response budget; absence is not an empty execution value. Retrieve an omitted sessionFile with status for this child alone.",
   })),
-  output: Type.Optional(Type.String({ description: "Completed assistant reports from this execution on success (including steering/follow-ups); bounded visible assistant-text history on failure or interruption. Not a complete execution trace." })),
+  output: Type.Optional(Type.String({ description: "Completed assistant answers newest-first on success, separated by [Earlier completed answer] (including steering/follow-ups); bounded chronological visible assistant-text history on failure or interruption. Not a complete execution trace." })),
   outputTruncation: Type.Optional(OutputTruncationSchema),
   startedAt: Type.Optional(Type.Number({ minimum: 0 })),
   state: ChildStateSchema,

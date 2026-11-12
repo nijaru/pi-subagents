@@ -53,6 +53,27 @@ describe("compact child rendering", () => {
     row.setExpanded(false);
     expect(row.render(40).map((line) => stripTerminalControls(line).trim()).filter(Boolean)).toEqual(compact);
   });
+  test("completed tasks with uncertain cleanup remain usable answers, not failed tasks", () => {
+    const unsafe = { ...child, cleanup: { status: "unconfirmed", error: "descendant still alive" } as const };
+    const compact = lines("wait", { command: "wait", ids: [child.id] }, false, [unsafe], 160).join("\n");
+    expect(compact).toContain("completed");
+    expect(compact).toContain("cleanup unconfirmed");
+    const full = lines("wait", { command: "wait", ids: [child.id] }, true, [unsafe], 160).join("\n");
+    expect(full).toContain("Do not rerun solely because of cleanup");
+    expect(full).toContain("descendant still alive");
+    expect(full).toContain(child.output!);
+    expect(full).not.toContain("Child did not complete");
+    expect(childStatus(unsafe)).toContain("Do not rerun solely because of cleanup");
+  });
+  test("explicit labels identify tasks without exposing their prompts in compact rows", () => {
+    const named = { ...child, label: "parser review", prompt: "PRIVATE_TASK_PROMPT" };
+    const active = { ...named, state: { status: "running" } as const, startedAt: undefined };
+    const text = lines("status", { command: "status" }, false, [active]).join("\n");
+    expect(text).toContain("parser review");
+    expect(text).not.toContain("PRIVATE_TASK_PROMPT");
+    expect(childListText([named])).toContain("parser review");
+    expect(lines("spawn", { command: "spawn", label: named.label }, false, [active]).join("\n")).toContain("parser review");
+  });
   test("foreground runs show status only; reports stay behind expansion", () => {
     expect(lines("run", { command: "run", prompt: child.prompt })).toEqual([
       "subagent run", "✓ 900c096e completed · 8s",
@@ -224,6 +245,17 @@ describe("compact child rendering", () => {
       expect(rows).toHaveLength(1);
       for (const row of rows) expect(visibleWidth(row)).toBeLessThanOrEqual(width);
     }
+  });
+  test.each(["x".repeat(100000), "界🙂".repeat(20000)])("partial labels stay byte-bounded before argument validation", (label) => {
+    const args = { command: "spawn", label: "\x1b[31m" + label };
+    const rows = renderChildCall(args, theme).render(80);
+    const text = rows.join("\n");
+    expect(Buffer.byteLength(text)).toBeLessThanOrEqual(512);
+    expect(rows.length).toBeLessThanOrEqual(8);
+    expect(rows.every((row) => visibleWidth(row) <= 80)).toBe(true);
+    expect(text).toContain("subagent spawn");
+    expect(text).not.toContain("\x1b");
+    expect(text).not.toContain("�");
   });
   test("prompts are hidden until expansion, then shown without terminal controls", () => {
     const args = { command: "run", prompt: "hello\n\tworld\x1b[31m " + "x".repeat(500) };

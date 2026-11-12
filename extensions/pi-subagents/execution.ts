@@ -5,6 +5,7 @@ import type { AgentOutcome, ChildResult, UsageSummary } from "./types.ts";
 export interface ChildTask {
   readonly id: string;
   readonly prompt: string;
+  readonly label?: string;
   readonly cwd: string;
   readonly tools: readonly string[];
   readonly model?: string;
@@ -39,12 +40,12 @@ export interface ExecutionOutcome {
   outcome: AgentOutcome;
   stopReason?: StopReason;
   errorMessage?: string;
-  errorKind?: "startup" | "provider" | "protocol" | "deadline" | "cancelled" | "cleanup" | "unknown";
+  errorKind?: "startup" | "provider" | "protocol" | "deadline" | "cancelled" | "unknown";
   timeoutPhase?: "startup" | "execution";
 }
 export interface ExecutionReport extends ExecutionFacts, ExecutionOutcome {
   finishedAt: number;
-  cleanup: { status: "confirmed" } | { status: "unconfirmed"; error: string; taskOutcome: AgentOutcome };
+  cleanup: { status: "confirmed" } | { status: "unconfirmed"; error: string };
 }
 export type ExecutionSnapshot =
   | { status: "active"; phase: "starting" | "running" | "stopping"; facts: ExecutionFacts }

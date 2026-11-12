@@ -30,7 +30,7 @@ function corrupt(result: ChildResult) {
   if (result.deadline) result.deadline.expiresAt = 999;
   if (result.interruption) result.interruption.activeToolCount = 999;
   if (result.outputTruncation) result.outputTruncation.retainedBytes = 999;
-  if (result.cleanup?.status === "unconfirmed") result.cleanup.taskOutcome = "completed";
+  if (result.cleanup?.status === "unconfirmed") result.cleanup.error = "rewritten";
   if (result.state.status === "terminal") {
     result.state.outcome = "failed";
     result.state.finishedAt = 0;
@@ -81,9 +81,9 @@ describe("session ownership through detached results", () => {
     const runs = outcomes.map(() => c.start({ persist: true }));
     c.executions[0]!.facts.usage.input = 7;
     const sourceReports = c.executions.map((execution, index) => execution.finish({
-      outcome: "failed", errorKind: "cleanup", errorMessage: "descendant still alive",
+      outcome: outcomes[index]!,
       sessionFile: `/sessions/child-${index}.jsonl`,
-      cleanup: { status: "unconfirmed", error: "descendant still alive", taskOutcome: outcomes[index]! },
+      cleanup: { status: "unconfirmed", error: "descendant still alive" },
     }));
     await Promise.all(c.executions.map((execution) => execution.done));
     for (const source of sourceReports) source.cleanup.status = "confirmed";
@@ -91,12 +91,12 @@ describe("session ownership through detached results", () => {
     const reports = await c.children.wait(runs.map((run) => run.id), 1);
     reports.forEach((report, index) => {
       expect(report).toMatchObject({
-        state: { status: "terminal", outcome: "failed" }, sessionFile: `/sessions/child-${index}.jsonl`,
-        cleanup: { status: "unconfirmed", error: "descendant still alive", taskOutcome: outcomes[index] },
+        state: { status: "terminal", outcome: outcomes[index] }, sessionFile: `/sessions/child-${index}.jsonl`,
+        cleanup: { status: "unconfirmed", error: "descendant still alive" },
       });
       corrupt(report);
       expect(() => c.children.resumeTarget(runs[index]!.id)).toThrow("cleanup is unconfirmed");
-      expect(c.children.get(runs[index]!.id).cleanup).toMatchObject({ taskOutcome: outcomes[index] });
+      expect(c.children.get(runs[index]!.id)).toMatchObject({ state: { outcome: outcomes[index] }, cleanup: { error: "descendant still alive" } });
     });
     expect(c.children.unread()).toEqual([]);
     expect(c.children.pruneCollected()).toBe(0);

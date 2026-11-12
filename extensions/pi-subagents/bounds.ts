@@ -117,6 +117,7 @@ export function minimalChildResult(result: ChildResult): ChildResult {
   return {
     id: result.id,
     ...(result.handle === undefined ? {} : { handle: result.handle }),
+    ...(result.label === undefined ? {} : { label: result.label }),
     ...(result.phase === undefined ? {} : { phase: result.phase }),
     ...(result.errorKind === undefined ? {} : { errorKind: result.errorKind }),
     ...(result.timeoutPhase === undefined ? {} : { timeoutPhase: result.timeoutPhase }),

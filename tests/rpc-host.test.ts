@@ -281,7 +281,7 @@ describe("public RPC child host", () => {
     while (!control) await Bun.sleep(5);
     await control.steer("focus");
     const steered = await pending;
-    expect(steered.output).toBe("waiting for steer\n\nsteered: Steering instruction:\n\nfocus");
+    expect(steered.output).toBe("steered: Steering instruction:\n\nfocus\n\n[Earlier completed answer]\n\nwaiting for steer");
     expect(steered.outcome).toBe("completed");
   });
 
@@ -403,10 +403,10 @@ test("fails before prompting when the probe command is unavailable", async () =>
 });
 
 test.each([
-  { prompt: "inspect", taskOutcome: "completed", outcome: "failed", errorKind: "cleanup" },
-  { prompt: "SCENARIO=slow", taskOutcome: "timed_out", outcome: "timed_out", errorKind: "deadline", executionTimeoutMs: 100 },
-  { prompt: "SCENARIO=fail", taskOutcome: "failed", outcome: "failed", errorKind: "provider" },
-] as const)("unconfirmed cleanup retains the lease and original $taskOutcome cause after leader exit", async (options) => {
+  { prompt: "inspect", outcome: "completed", errorKind: undefined },
+  { prompt: "SCENARIO=slow", outcome: "timed_out", errorKind: "deadline", executionTimeoutMs: 100 },
+  { prompt: "SCENARIO=fail", outcome: "failed", errorKind: "provider" },
+] as const)("unconfirmed cleanup retains the lease without changing the $outcome task outcome", async (options) => {
   const dir = tempDir();
   const session = path.join(dir, "owned.jsonl");
   fs.writeFileSync(session, `${JSON.stringify({ type: "session", cwd: dir })}\n`);
@@ -419,11 +419,18 @@ test.each([
     },
   });
   expect(result).toMatchObject({
-    outcome: options.outcome, errorKind: options.errorKind,
-    cleanup: { status: "unconfirmed", taskOutcome: options.taskOutcome },
+    outcome: options.outcome,
+    cleanup: { status: "unconfirmed", error: "Injected cleanup uncertainty after real resource cleanup" },
   });
-  if (options.taskOutcome === "timed_out") expect(result.errorMessage).toContain("Subagent timed out during execution");
-  if (options.taskOutcome === "failed") expect(result.errorMessage).toContain("Child provider returned an error.");
+  expect(result.errorKind).toBe(options.errorKind);
+  expect(result.cleanup).not.toHaveProperty("taskOutcome");
+  expect(result.errorMessage ?? "").not.toContain("cleanup uncertainty");
+  if (options.outcome === "completed") {
+    expect(result.output).toBe("done");
+    expect(result.errorMessage).toBeUndefined();
+  }
+  if (options.outcome === "timed_out") expect(result.errorMessage).toContain("Subagent timed out during execution");
+  if (options.outcome === "failed") expect(result.errorMessage).toContain("Child provider returned an error.");
   expect(fs.existsSync(`${session}.subagent-lock`)).toBe(true);
   const contender = await run(task(dir, { resume: session }));
   expect(contender).toMatchObject({ outcome: "failed", errorKind: "startup" });

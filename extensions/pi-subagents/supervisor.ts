@@ -222,17 +222,12 @@ class RpcExecution implements ChildExecution {
         try { this.releaseSession?.(); } catch (error) { cleanupError = `Session ownership release failed: ${error instanceof Error ? error.message : error}`; }
       }
       const outcome = this.observations.outcome(end);
-      const taskOutcome = outcome.outcome;
-      if (cleanupError) {
-        // Keep an interrupted task's primary cause; a successful task is not a
-        // successful execution if its resource lifetime could not be closed.
-        if (outcome.outcome === "completed") { outcome.outcome = "failed"; outcome.errorKind = "cleanup"; }
-        outcome.errorMessage = [outcome.errorMessage, cleanupError, this.facts.sessionFile ? "Session ownership lock retained; admission remains reserved." : "Admission remains reserved."].filter(Boolean).join("\n");
-      }
+      // Resource uncertainty does not change the task outcome or its answer.
+      // Admission and the session lease remain held by the unconfirmed disposition.
       const report: ExecutionReport = {
         ...this.facts, ...this.observations.snapshot(outcome.outcome === "completed" ? "reports" : "history"),
         stderr: this.rpc?.diagnostics ?? "", ...outcome, finishedAt: Date.now(),
-        cleanup: cleanupError ? { status: "unconfirmed", error: cleanupError, taskOutcome } : { status: "confirmed" },
+        cleanup: cleanupError ? { status: "unconfirmed", error: boundedDiagnostic(cleanupError)! } : { status: "confirmed" },
       };
       this.lifecycle = { phase: "finished", report };
       this.wakeReady();

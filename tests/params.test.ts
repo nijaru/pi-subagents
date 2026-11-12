@@ -64,12 +64,13 @@ describe("tool selection", () => {
   test("executionTimeoutMs is a run/spawn option within the two-hour bound", () => {
     expect(Check(SubagentParamsSchema, { command: "run", prompt: "x", executionTimeoutMs: 1 })).toBe(true);
     expect(Check(SubagentParamsSchema, { command: "spawn", prompt: "x", executionTimeoutMs: MAX_PROCESS_TIMEOUT_MS })).toBe(true);
-    for (const value of [0, -1, 1.5, "1000", MAX_PROCESS_TIMEOUT_MS + 1]) {
-      expect(Check(SubagentParamsSchema, { command: "run", prompt: "x", executionTimeoutMs: value })).toBe(false);
+    for (const value of [0, -1, 1.5, MAX_PROCESS_TIMEOUT_MS + 1]) {
+      expect(() => validateCommand({ command: "run", prompt: "x", executionTimeoutMs: value })).toThrow("executionTimeoutMs");
     }
+    expect(Check(SubagentParamsSchema, { command: "run", prompt: "x", executionTimeoutMs: "1000" })).toBe(false);
     expect(() => validateCommand({ command: "run", prompt: "x", executionTimeoutMs: 1000 })).not.toThrow();
     expect(() => validateCommand({ command: "spawn", prompt: "x", executionTimeoutMs: 1000 })).not.toThrow();
-    expect(() => validateCommand({ command: "run", prompt: "x", timeoutMs: 1000 })).toThrow("executionTimeoutMs");
+    expect(() => validateCommand({ command: "run", prompt: "x", timeoutMs: 1000 })).toThrow("child creation options");
     expect(() => validateCommand({ command: "wait", ids: ["x"], executionTimeoutMs: 1000 })).toThrow("does not accept child creation or join options");
     expect(() => validateCommand({ command: "status", executionTimeoutMs: 1000 })).toThrow("does not accept child creation or join options");
     expect(() => validateCommand({ command: "stop", id: "x", executionTimeoutMs: 1000 })).toThrow("does not accept child creation or join options");
@@ -79,11 +80,59 @@ describe("tool selection", () => {
       expect(Check(SubagentParamsSchema, { command: "run", prompt: "x", startupTimeoutMs: value })).toBe(true);
     }
     for (const value of [0, -1, 1.5, MAX_STARTUP_TIMEOUT_MS + 1]) {
-      expect(Check(SubagentParamsSchema, { command: "spawn", prompt: "x", startupTimeoutMs: value })).toBe(false);
+      expect(() => validateCommand({ command: "spawn", prompt: "x", startupTimeoutMs: value })).toThrow("startupTimeoutMs");
     }
     expect(Check(SubagentParamsSchema, { command: "run", prompt: "x", joinTimeoutMs: 1000 })).toBe(true);
     expect(() => validateCommand({ command: "spawn", prompt: "x", joinTimeoutMs: 1000 })).toThrow("spawn does not join");
     expect(Check(SubagentParamsSchema, { command: "spawn", prompt: "x", notify: "turn" })).toBe(false);
+  });
+});
+
+describe("provider-neutral argument limits", () => {
+  test.each([
+    ["model", 512], ["cwd", 4096], ["id", 128], ["resume", 4096], ["label", 80],
+  ] as const)("%s retains its length bounds outside the sampling schema", (field, maximum) => {
+    const base = field === "id" ? { command: "status" } : { command: "run", prompt: "x" };
+    expect(() => validateCommand({ ...base, [field]: "x".repeat(maximum) } as any)).not.toThrow();
+    for (const value of ["", "x".repeat(maximum + 1)]) {
+      const input = { ...base, [field]: value } as any;
+      expect(Check(SubagentParamsSchema, input)).toBe(true);
+      expect(() => validateCommand(input)).toThrow(field);
+    }
+  });
+  test("labels are display-only, nonblank, one-line Unicode strings scoped to launch", () => {
+    for (const label of ["review", "🙂".repeat(80)]) expect(() => validateCommand({ command: "run", prompt: "x", label })).not.toThrow();
+    for (const label of ["  ", "line\nbreak", "escape\x1b", "control\u0085", "line\u2028break", "paragraph\u2029break"]) {
+      expect(() => validateCommand({ command: "run", prompt: "x", label })).toThrow("label");
+    }
+    for (const input of [{ command: "status" }, { command: "wait", ids: ["sa-1"] }, { command: "stop", id: "sa-1" }, { command: "steer", id: "sa-1", message: "x" }]) {
+      expect(() => validateCommand({ ...input, label: "review" } as any)).toThrow("does not accept child creation");
+    }
+  });
+  test("arrays preserve cardinality, item limits, name syntax, and duplicate rejection", () => {
+    for (const tools of [[], ["read"], ["a".repeat(256)]]) expect(() => validateCommand({ command: "run", prompt: "x", tools })).not.toThrow();
+    for (const tools of [["read", "read"], [""], ["a".repeat(257)], ["bad name"], ["9bad"], Array.from({ length: 65 }, (_, i) => `tool${i}`)]) {
+      expect(() => validateCommand({ command: "run", prompt: "x", tools })).toThrow("tools");
+    }
+    expect(() => validateCommand({ command: "wait", ids: Array.from({ length: 32 }, (_, i) => `sa-${i}`) })).not.toThrow();
+    for (const ids of [[], ["sa-1", "sa-1"], [""], ["x".repeat(129)], Array.from({ length: 33 }, (_, i) => `sa-${i}`)]) {
+      expect(() => validateCommand({ command: "wait", ids })).toThrow("ids");
+    }
+  });
+  test.each([
+    ["timeoutMs", { command: "wait", ids: ["sa-1"] }, MAX_WAIT_MS],
+    ["joinTimeoutMs", { command: "run", prompt: "x" }, MAX_WAIT_MS],
+    ["startupTimeoutMs", { command: "spawn", prompt: "x" }, MAX_STARTUP_TIMEOUT_MS],
+    ["executionTimeoutMs", { command: "run", prompt: "x" }, MAX_PROCESS_TIMEOUT_MS],
+  ])("%s enforces integer clock limits before launch or joining", (field, base, maximum) => {
+    for (const value of [1, maximum]) expect(() => validateCommand({ ...base, [field]: value } as any)).not.toThrow();
+    for (const value of [0, -1, 1.5, maximum + 1, Infinity, NaN]) expect(() => validateCommand({ ...base, [field]: value } as any)).toThrow(field);
+  });
+  test("task and steering byte limits still apply to multibyte text", () => {
+    expect(() => validateCommand({ command: "run", prompt: "x".repeat(102400) })).not.toThrow();
+    expect(() => validateCommand({ command: "run", prompt: "界".repeat(40000) })).toThrow("prompt");
+    expect(() => validateCommand({ command: "steer", id: "sa-1", message: "🙂".repeat(30000) })).toThrow("message");
+    expect(() => validateCommand({ command: "run", prompt: "x", message: "" })).toThrow("child creation options");
   });
 });
 

@@ -75,6 +75,14 @@ export function activitySummary(result: ChildResult): string {
   return [[current, lastActivitySummary(result)].filter(Boolean).join(" · "), observed, warning].filter(Boolean).join("\n");
 }
 
+export function cleanupSummary(result: ChildResult): string {
+  if (result.cleanup?.status !== "unconfirmed") return "";
+  const task = result.state.status === "terminal" && result.state.outcome === "completed"
+    ? "Task completed. Do not rerun solely because of cleanup. "
+    : "";
+  return `Cleanup unconfirmed; admission and any session lease remain reserved. ${task}Reconcile process/workspace state before resuming or relaunching.\nCleanup cause: ${result.cleanup.error}`;
+}
+
 /** Failure causes precede partial output so bounds cannot hide why the child stopped. */
 export function resultText(result: ChildResult): string {
   if (!failed(result)) return result.output || "(no output)";
@@ -107,10 +115,8 @@ export function childSummary(result: ChildResult, includePrompt = true): string 
   const model = result.model ? `\nmodel: ${truncateOutput(result.model, 512)}${result.thinking ? ` · thinking: ${result.thinking}` : ""}` : "";
   const session = result.sessionFile ? `\nsession: ${result.sessionFile}` : "";
   const handle = result.handle ?? result.id;
-  const cleanup = result.cleanup?.status === "unconfirmed"
-    ? "Cleanup unconfirmed; admission and any session lease remain reserved. Do not resume or relaunch until process/workspace state is reconciled." : "";
-  const observations = [deadlineSummary(result), activitySummary(result), cleanup].filter(Boolean).join("\n");
-  const head = `${handle} [${status}]${duration ? ` · ${duration}` : ""}${observations ? `\n${observations}` : ""}${model}${session}`;
+  const observations = [deadlineSummary(result), activitySummary(result), cleanupSummary(result)].filter(Boolean).join("\n");
+  const head = `${handle} [${status}]${result.label ? ` · ${result.label}` : ""}${duration ? ` · ${duration}` : ""}${observations ? `\n${observations}` : ""}${model}${session}`;
   return includePrompt && result.prompt !== undefined ? `${head}\n${truncateOutput(result.prompt, 256)}` : head;
 }
 
@@ -124,8 +130,11 @@ export function childReports(results: ChildResult[], { includePrompt = true } = 
   return results.map((result) => {
     const head = childSummary(result, includePrompt);
     if (isRunning(result)) return head;
+    const recovery = results.length > 1
+      ? `Inspect ${result.handle ?? result.id} alone with wait to avoid sharing the batch budget.`
+      : "Waiting again cannot restore text omitted from this retained report.";
     const truncation = result.outputTruncation?.truncated
-      ? `\nChild report truncated: ${result.outputTruncation.retainedBytes}/${result.outputTruncation.originalBytes} UTF-8 bytes retained. Use subagent wait with ids: ["${result.handle ?? result.id}"] for a longer retained report; saved sessions may retain completed messages.`
+      ? `\nChild report truncated: ${result.outputTruncation.retainedBytes}/${result.outputTruncation.originalBytes} UTF-8 bytes retained. ${recovery} Saved sessions may retain completed messages.`
       : "";
     return `${head}${truncation}\n\n${resultText(result)}`;
   }).join("\n\n---\n\n");

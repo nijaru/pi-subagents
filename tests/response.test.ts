@@ -29,15 +29,40 @@ test("optional recovery paths cannot crowd primary causes out of a full failure 
   }
 });
 
+test.each(["run", "wait", "status", "stop"] as const)("a %s result preserves completed work while flagging unsafe cleanup", (command) => {
+  const child: ChildResult = {
+    id: "child", state: { status: "terminal", outcome: "completed", finishedAt: 2 },
+    cleanup: { status: "unconfirmed", error: "descendant not confirmed stopped" },
+    output: "usable answer", stderr: "", usage: emptyUsage(),
+  };
+  const response = childResponse(command, [child], childReports);
+  expect(response.isError).toBe(true);
+  expect(response.details!.results[0]).toMatchObject({ state: { outcome: "completed" }, output: "usable answer" });
+  expect(response.structuredContent).toEqual(response.details);
+  const text = response.content[0]!;
+  if (text.type !== "text") throw new Error("Expected text report");
+  expect(text.text).toContain("Do not rerun solely because of cleanup");
+  expect(text.text).not.toContain("Partial report");
+});
+
+test.each(["run", "wait", "status", "stop"] as const)("a %s result distinguishes task failure from inspection and stopping", (command) => {
+  const child: ChildResult = {
+    id: "child", state: { status: "terminal", outcome: "cancelled", finishedAt: 2 },
+    cleanup: { status: "confirmed" }, stderr: "", usage: emptyUsage(),
+  };
+  const response = childResponse(command, [child], childReports);
+  expect(response.isError).toBe(command === "run" || command === "wait");
+});
+
 test.each(["completed", "failed"] as const)("one projected view supplies every %s report in text and structured results", (outcome) => {
   const original = Array.from({ length: 32 }, (_, index): ChildResult => ({
-    id: `child-${index}`, handle: `sa-${index + 1}`, prompt: "task ".repeat(200), cwd: "/workspace", tools: ["read"],
+    id: `child-${index}`, handle: `sa-${index + 1}`, label: `task ${index}: ${"界".repeat(70)}`, prompt: "task ".repeat(200), cwd: "/workspace", tools: ["read"],
     state: { status: "terminal", outcome, finishedAt: 1_700_000_003_100 },
     startedAt: 1_700_000_000_000, taskFinishedAt: 1_700_000_003_000,
     deadline: { phase: "execution", startedAt: 1_700_000_000_000, expiresAt: 1_700_000_003_000 },
     lastActivityAt: 1_700_000_002_000, model: "m".repeat(200),
     interruption: outcome === "failed" ? { activity: "tool", activeToolCount: 3, currentTool: "a".repeat(256) } : undefined,
-    cleanup: outcome === "failed" ? { status: "unconfirmed", taskOutcome: "failed", error: "cleanup cause ".repeat(1000) } : { status: "confirmed" },
+    cleanup: outcome === "failed" ? { status: "unconfirmed", error: "cleanup cause ".repeat(1000) } : { status: "confirmed" },
     errorMessage: outcome === "failed" ? `primary failure ${index}: ${"e".repeat(512)}` : undefined,
     output: `REPORT ${index}: ${"界😀x".repeat(4000)}`, stderr: "", usage: emptyUsage(),
   }));
@@ -50,12 +75,13 @@ test.each(["completed", "failed"] as const)("one projected view supplies every %
   if (text.type !== "text") throw new Error("Expected text report");
   expect(Buffer.byteLength(text.text)).toBeLessThanOrEqual(51200);
   expect(text.text).toBe(childReports(response.details!.results));
-  for (const result of response.details!.results) {
-    expect(text.text).toContain(`${result.handle} [${outcome}]`);
+  for (const [index, result] of response.details!.results.entries()) {
+    expect(result.label).toBe(original[index]!.label);
+    expect(text.text).toContain(`${result.handle} [${outcome}] · ${result.label}`);
     if (result.output) expect(text.text).toContain(result.output);
     expect(result.outputTruncation?.retainedBytes).toBe(Buffer.byteLength(result.output ?? ""));
     if (outcome === "failed") {
-      expect(result.cleanup).toMatchObject({ status: "unconfirmed", taskOutcome: "failed" });
+      expect(result.cleanup).toMatchObject({ status: "unconfirmed" });
       expect(text.text).toContain("Cleanup unconfirmed; admission and any session lease remain reserved");
     }
   }

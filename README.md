@@ -25,10 +25,10 @@ One tool, `subagent`, with six commands:
 | `stop` | Cancel a child and join its cleanup. |
 | `steer` | Queue a steering message into a running child. Delivered after its current assistant turn and tool calls. |
 
-Every child gets a short session-scoped handle (`sa-<n>`). `wait`, `status`, `stop`, and `steer` accept the handle or the full UUID.
+Every child gets a short session-scoped handle (`sa-<n>`). `wait`, `status`, `stop`, and `steer` accept the handle or the full UUID. Optional `label` on `run`/`spawn` gives the task a name in reports and the UI: at most 80 characters, nonblank, on one line. Labels may repeat; they are not control identities.
 
 ```json
-{"command":"run","prompt":"Review the parser changes. Report concrete regressions with file/line and evidence. Do not edit files.","tools":["read"]}
+{"command":"run","label":"parser review","prompt":"Review the parser changes. Report concrete regressions with file/line and evidence. Do not edit files.","tools":["read"]}
 ```
 
 ```json
@@ -38,6 +38,8 @@ Every child gets a short session-scoped handle (`sa-<n>`). `wait`, `status`, `st
 ```
 
 `run` is the synchronous convenience: it starts and joins. `spawn` is the background form. A `run` whose join expires returns a running handle; it does not stop the child. Cancelling a `run` call cancels its child and joins cleanup, even beyond the join budget; cancelling a `wait` leaves children running.
+
+The tool requests strict JSON-schema argument sampling when the host/provider supports it, including OpenAI and Codex Responses. Other backends can use ordinary tool calls. The advertised schema describes types and enums; the extension enforces resource limits and command-specific requirements before any launch or join, regardless of provider. This does not constrain the child’s final answer to a JSON schema.
 
 Task prompts are wrapped in a `Task:` envelope and steering messages in a `Steering instruction:` envelope before they reach RPC. This prevents RPC from interpreting a leading `/command`, `/skill:...`, or `/template` as a child command. The task content itself is otherwise unchanged.
 
@@ -70,7 +72,7 @@ Interrupted execution also retains `interruption`: the observed `activity`, an `
 
 Every armed phase exposes its effective `deadline`: `{ phase, startedAt, expiresAt }`, with Unix millisecond timestamps after defaults and environment settings are resolved. Startup protection and its metadata clear when a task is submitted without an execution limit. An explicitly configured execution deadline—or a failed-startup deadline—remains in terminal details; running and failed text reports show it too. Activity never extends the cutoff. The library does not automatically retry, extend the budget, or send a wrap-up prompt: queued steering cannot interrupt a long model request or tool call.
 
-At startup/execution expiry the child is stopped and its result retains bounded visible assistant text across messages, including unfinished text. Completed text blocks replace their interim deltas even if the whole assistant message never finishes. Successful results retain completed assistant reports from that execution, including answers before and after steering or follow-ups; tool-use narration is excluded. The combined report is byte-bounded, with a retained prefix and explicit truncation metadata. Join/wait expiry leaves the child running. `errorKind` distinguishes `startup`, `provider`, `protocol`, `deadline`, `cancelled`, and `cleanup`; `timeoutPhase` names the expired deadline. Reported runtime excludes process-tree cleanup; `cleanupMs` records the excluded portion.
+At startup/execution expiry the child is stopped and its result retains bounded visible assistant text across messages, including unfinished text. Completed text blocks replace their interim deltas even if the whole assistant message never finishes. Successful results retain completed assistant answers **newest-first**, including answers before and after steering or follow-ups. Earlier answers follow `[Earlier completed answer]` separators; tool-use narration is excluded. A later correction gets the first share of the byte budget instead of being crowded out by an older answer. Earlier answers can still contain additional findings; a follow-up is not necessarily a self-contained replacement. Failed/interrupted history remains chronological. Both views retain bounded prefixes with explicit truncation metadata. Join/wait expiry leaves the child running. `errorKind` distinguishes primary task causes such as `startup`, `provider`, `protocol`, `deadline`, and `cancelled`; cleanup uncertainty is separate under `cleanup.status` and `cleanup.error`; `timeoutPhase` names the expired deadline. Reported runtime excludes process-tree cleanup; `cleanupMs` records the excluded portion.
 
 ## Child execution
 
@@ -93,7 +95,7 @@ Persisted and resumed sessions have an exclusive, cooperative `<sessionFile>.sub
 
 Normal completion, cancellation, and failed startup release ownership only after confirmed cleanup; leader exit alone is insufficient. A hard parent crash or unconfirmed cleanup leaves the lock in place. Confirmation covers the managed root group and captured descendants, not all possible external effects. If the leader exits before its descendant tree can be observed, cleanup is unconfirmed rather than assumed safe. Locks never expire automatically: verify that the old child has stopped before manually removing an orphaned lock. The lock records the parent PID and child run ID. This conservative recovery avoids allowing two writers while an old child is still alive.
 
-Terminal reports expose `cleanup.status`: `confirmed` or `unconfirmed`. Unconfirmed cleanup retains the admission slot and any session lease, even after the report is collected. Such handles cannot be resumed, cleared, or evicted in that parent session. `cleanup.taskOutcome` preserves the outcome before cleanup; a completed task becomes a failed execution if cleanup cannot be confirmed, while timeout/provider causes remain primary. Reconcile process and workspace state before recovery; a new parent session clears handle reservations, not orphaned lock files.
+Terminal reports expose `cleanup.status`: `confirmed` or `unconfirmed`. Unconfirmed cleanup retains the admission slot and any session lease, even after the report is collected. Such handles cannot be resumed, cleared, or evicted in that parent session. `state.outcome` always describes the task, independently of cleanup. A completed task remains `completed` and keeps its answer; cleanup does not replace the task’s diagnostics. Unconfirmed cleanup still marks the tool result as an error, including inspection and stop results. **Do not rerun completed work solely because of cleanup.** Reconcile process and workspace state before recovery; a new parent session clears handle reservations, not orphaned lock files.
 
 ## Tools and context
 
@@ -139,7 +141,7 @@ bun install --frozen-lockfile
 bun run check
 ```
 
-Pi loads the TypeScript extension directly; there is no build step. Checks use a fake RPC child for deterministic lifecycle tests and a real Pi CLI with a local mock provider for the public-protocol integration test. No live model calls are needed.
+Pi loads the TypeScript extension directly; there is no build step. Checks use a fake RPC child for deterministic lifecycle tests and real Pi parent/child processes with local mock Chat Completions, Responses, and Codex Responses endpoints. Integration tests cover strict arguments, optional-null normalization, and a backend without strict-tool support. No live model calls are needed.
 
 RPC preserves the normal Pi CLI runtime while supporting steering and session continuation. Print/JSON mode is simpler for one-shot jobs but cannot steer a running task; an SDK worker would require a separate bootstrap, and an in-process session would share the parent's failure domain. Terminal attachment and independent background survival are outside this tool's scope.
 
@@ -161,6 +163,12 @@ RPC preserves the normal Pi CLI runtime while supporting steering and session co
 - **0.0.13**: replace the custom SDK child bootstrap with Pi's public RPC protocol. Add `steer`, persisted/resumable child sessions (`persist`, `resume`), and opt-in `trustProject`. Remove `jiti`, private Pi imports, and the custom fd-3 child protocol. Add an active-tool probe so missing tools fail before prompting. Wrap prompts and steering to prevent RPC command expansion, exclude all unselected tools from nested calls, preserve orderly child shutdown hooks, ignore oversized `agent_end` history, retain the latest partial report, and expose persisted session paths in model-facing text. Notices announce handles without consuming reports. Persisted sessions have exclusive ownership, startup operations share one deadline, and children inherit the ordinary process environment.
 
 ## Migration
+
+### Unreleased
+
+- Successful `output` is now newest-first, with `[Earlier completed answer]` separators. Do not assume the first answer is the earliest, or that a follow-up repeats all earlier findings. Failed/interrupted history remains chronological.
+- Read the primary task outcome from `state.outcome` and resource disposition from `cleanup.status`. `cleanup.taskOutcome` and `errorKind: "cleanup"` are removed. Unconfirmed cleanup remains a tool error and retains admission/session ownership, but no longer turns a completed task into a failed one. Do not blindly rerun completed work.
+- Parameter schemas now express portable structural types for strict-tool backends; resource limits and cross-field requirements remain enforced at runtime. Consumers that previously used the exported schema alone for full validation must also use `validateCommand()` from `extensions/pi-subagents/params.ts`.
 
 ### 0.0.20
 
