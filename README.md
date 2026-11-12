@@ -149,6 +149,11 @@ RPC preserves the normal Pi CLI runtime while supporting steering and session co
 
 `0.0.x` is pre-release: tool schema and result shape are not promised across patch releases.
 
+- **0.0.22**:
+  - Request strict tool arguments on supported backends, including Codex/OpenAI, while enforcing resource and command limits for every provider.
+  - Add optional task labels and keep successful answers newest-first so steering corrections get priority within bounded reports.
+  - Preserve the primary task outcome independently of cleanup uncertainty, and clarify recovery without blindly rerunning completed work.
+  - **Migration:** report ordering and cleanup fields changed; see [Migration](#migration).
 - **0.0.21**: simplify snapshot copying and host API integration without changing tool behavior or the Pi 1.3 minimum.
 - **0.0.20**:
   - Execution deadlines are off by default. Set `executionTimeoutMs` or `PI_SUBAGENT_TIMEOUT_MS` to opt in; task preflight follows the same policy. Startup protection and join budgets remain separate.
@@ -164,7 +169,7 @@ RPC preserves the normal Pi CLI runtime while supporting steering and session co
 
 ## Migration
 
-### Unreleased
+### 0.0.22
 
 - Successful `output` is now newest-first, with `[Earlier completed answer]` separators. Do not assume the first answer is the earliest, or that a follow-up repeats all earlier findings. Failed/interrupted history remains chronological.
 - Read the primary task outcome from `state.outcome` and resource disposition from `cleanup.status`. `cleanup.taskOutcome` and `errorKind: "cleanup"` are removed. Unconfirmed cleanup remains a tool error and retains admission/session ownership, but no longer turns a completed task into a failed one. Do not blindly rerun completed work.
