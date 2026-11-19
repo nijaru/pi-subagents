@@ -451,7 +451,7 @@ describe("join, collection, and retention contracts", () => {
     await c.children.close();
   });
 
-  test("shutdown fences admission, progress, completion notices, and all pending usage before joining cleanup", async () => {
+  test("shutdown fences admission, progress and notices but retains usage through cleanup", async () => {
     const c = controlled({ finishOnCancel: false });
     const completed = c.start();
     c.executions[0]!.facts.usage.input = 5;
@@ -469,7 +469,6 @@ describe("join, collection, and retention contracts", () => {
     expect(c.children.isClosed).toBe(true);
     expect(() => c.start()).toThrow("closing");
     expect(c.children.unread()).toEqual([]);
-    expect(c.children.takePendingUsage()).toBeUndefined();
     expect(c.executions[1]!.cancelCalls).toBe(1);
     c.executions[1]!.finish({ outcome: "cancelled" });
     await closing;
@@ -477,6 +476,9 @@ describe("join, collection, and retention contracts", () => {
     expect(updates).toBe(0);
     expect(c.notices).toEqual([completed.id]);
     expect(c.children.list()).toEqual([]);
+    const failure = () => c.children.persistPendingUsage(() => { throw new Error("append failed"); });
+    expect(failure).toThrow("append failed");
+    expect(c.children.takePendingUsage()?.input).toBe(12);
     expect(c.children.takePendingUsage()).toBeUndefined();
     await c.children.close();
   });

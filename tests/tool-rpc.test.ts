@@ -18,7 +18,10 @@ function host() {
   const commands = new Map<string, any>();
   const handlers = new Map<string, any>();
   const notifications: string[] = [];
+  const entries: { customType: string; data: unknown }[] = [];
+  const activity = { idle: false };
   extension({
+    appendEntry(customType: string, data: unknown) { entries.push({ customType, data }); },
     registerTool(value: any) { tool = value; },
     registerMessageRenderer() {},
     registerCommand(name: string, command: any) { commands.set(name, command); },
@@ -33,12 +36,12 @@ function host() {
   } as any);
   const cwd = tempDir();
   const context = {
-    cwd, hasUI: false, tools: [{ name: "read" }, { name: "bash" }],
+    cwd, hasUI: false, isIdle: () => activity.idle, tools: [{ name: "read" }, { name: "bash" }],
     model: { provider: "parent", id: "model" }, thinkingLevel: "high",
     sessionManager: { getBranch: () => [], getSessionFile: (): string | undefined => undefined }, ui: { notify: (message: string) => notifications.push(message) },
   };
   const instance = {
-    tool, cwd, commands, notifications, context, handlers,
+    tool, cwd, commands, notifications, context, handlers, entries, activity,
     execute: (params: any, signal?: AbortSignal) => tool.execute("call", params, signal, undefined, context),
   };
   hosts.push(instance);
@@ -77,6 +80,41 @@ describe("RPC-backed subagent tool", () => {
     expect(excluded).toContain("inactive_tool");
     expect(excluded).toContain("bash");
     expect(excluded).not.toContain("read");
+  });
+
+  test.each(["idle", "settled", "shutdown"] as const)("records pending usage once at %s without charging a later tool result", async (boundary) => {
+    const h = host();
+    const launched = await h.execute({ command: "spawn", prompt: "background", tools: [] });
+    const handle = launched.details.results[0].handle;
+    const toolResult = () => h.handlers.get("tool_result")({ toolName: "subagent" });
+    expect(toolResult()).toBeUndefined();
+    h.activity.idle = boundary === "idle";
+    const joined = await h.execute({ command: "wait", ids: [handle], timeoutMs: 5000 });
+    expect(joined.details.results[0].state.status).toBe("terminal");
+    if (boundary !== "idle") expect(h.entries).toEqual([]);
+    if (boundary === "settled") {
+      h.activity.idle = true;
+      h.handlers.get("agent_settled")({ aborted: true }, h.context);
+    }
+    if (boundary === "shutdown") await h.handlers.get("session_shutdown")();
+    expect(h.entries).toEqual([{ customType: "subagent-usage", data: expect.objectContaining({ input: 2, output: 3, totalTokens: 9 }) }]);
+    expect(toolResult()).toBeUndefined();
+    h.handlers.get("agent_settled")({ aborted: false }, h.context);
+    await h.handlers.get("session_shutdown")();
+    expect(h.entries).toHaveLength(1);
+  });
+
+  test("native tool-result accounting drains usage before settlement or shutdown", async () => {
+    const h = host();
+    const run = await h.execute({ command: "run", prompt: "foreground", tools: [] });
+    const { turns: _turns, ...usage } = run.details.results[0].usage;
+    const event = { toolName: "subagent", usage, isError: true };
+    expect(h.handlers.get("tool_result")(event)?.usage).toMatchObject({ input: 4, totalTokens: 18 });
+    expect(event.usage.input).toBe(2);
+    expect(h.handlers.get("tool_result")(event)).toBeUndefined();
+    h.handlers.get("agent_settled")({ aborted: false }, h.context);
+    await h.handlers.get("session_shutdown")();
+    expect(h.entries).toEqual([]);
   });
 
   test("invalid resource limits cannot launch children or reserve admission", async () => {

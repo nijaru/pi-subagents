@@ -126,9 +126,9 @@ Child reports remain bounded in memory; they are not spilled to disk. Text, stru
 
 Child usage includes assistant calls, completed compaction summaries, and usage reported by child tools. Interrupted calls retain the latest reported cumulative usage; updates are not added repeatedly. Providers that report usage only at finalization can leave interrupted usage unknown.
 
-After cleanup, each child's usage is added once to the next parent tool result, including failed results. Repeated `status`, `wait`, or `stop` calls do not charge it again.
+After cleanup, child usage goes to the next parent tool result if one arrives first, including failed results. Otherwise, pi-subagents records it as a `subagent-usage` entry when the parent settles, a child finishes while the parent is idle, or the parent shuts down. This includes observed usage from children cancelled during graceful shutdown. Repeated `status`, `wait`, or `stop` calls do not charge it again.
 
-Pi cannot attach usage to a custom completion message. Background costs enter native totals on the next parent tool result; until then they remain visible in child details. Quit, reload, or session replacement discards unreported usage.
+Pi 1.5.2 has no extension API for standalone entries that count toward native usage totals. Only tool-result usage appears in those totals; `subagent-usage` entries are saved in the parent session and do not reach the model. A parent started with `--no-session` does not save them to disk.
 
 ## Parent shutdown
 

@@ -45,10 +45,10 @@ export class SessionChildren {
     this.children.set(task.id, child);
     void owner.done.then((report) => {
       child.execution = { status: "finished", report: structuredClone(report) };
-      if (!this.closed) {
-        this.pendingUsage ??= emptyUsage();
-        addUsage(this.pendingUsage, report.usage);
-      }
+      // Closing fences presentation, not accounting: cancellation can still
+      // produce a final report with usage observed before interruption.
+      this.pendingUsage ??= emptyUsage();
+      addUsage(this.pendingUsage, report.usage);
       this.changed();
       this.announce();
     });
@@ -93,6 +93,18 @@ export class SessionChildren {
     const usage = this.pendingUsage;
     this.pendingUsage = undefined;
     return usage;
+  }
+
+  persistPendingUsage(append: (usage: UsageRecord) => void): void {
+    const usage = this.takePendingUsage();
+    if (!usage) return;
+    try {
+      append(usage);
+    } catch (error) {
+      if (this.pendingUsage) addUsage(usage, this.pendingUsage);
+      this.pendingUsage = usage;
+      throw error;
+    }
   }
 
   pruneCollected(): number {
@@ -189,7 +201,6 @@ export class SessionChildren {
 
   async close(): Promise<void> {
     this.closed = true;
-    this.pendingUsage = undefined;
     const active = [...this.children.values()].flatMap((child) => child.execution.status === "active" ? [child.execution.owner] : []);
     for (const owner of active) owner.cancel();
     await Promise.all(active.map((owner) => owner.done));

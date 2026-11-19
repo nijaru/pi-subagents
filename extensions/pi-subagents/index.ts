@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import { canonicalSession } from "./launch.ts";
-import type { AgentToolResult, ExtensionAPI, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, ExtensionContext, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
 import { Check, Errors } from "typebox/value";
 import { SessionChildren } from "./children.ts";
 import { RpcChildSupervisor } from "./supervisor.ts";
@@ -41,17 +41,29 @@ function outcome(command: "run" | "wait", results: ChildResult[]): AgentToolResu
 export default function (pi: ExtensionAPI) {
   pi.registerMessageRenderer("subagent-ready", renderChildNotice);
   const createRuntime = () => {
-    let delivery: CompletionDelivery;
-    const children = new SessionChildren(new RpcChildSupervisor(), () => delivery.refreshStatus());
-    delivery = new CompletionDelivery(children);
-    return { children, delivery };
+    let ctx: ExtensionContext | undefined;
+    // Pi exposes tool-result usage, but no extension API to append native
+    // usage out of band. Use a non-context session entry when no result can carry it.
+    const persistUsage = () => children.persistPendingUsage((usage) => pi.appendEntry("subagent-usage", usage));
+    const children = new SessionChildren(new RpcChildSupervisor(), () => {
+      delivery.refreshStatus();
+      if (ctx?.isIdle()) persistUsage();
+    });
+    const delivery = new CompletionDelivery(children);
+    return {
+      children, delivery, persistUsage,
+      bind(context: ExtensionContext) {
+        ctx = context;
+        delivery.bind(context);
+      },
+    };
   };
   let runtime = createRuntime();
   // Use the host's usage channel, including for failed tool results. Charging
   // snapshots or notices would duplicate costs on repeated wait/status calls.
   pi.on("tool_result", (event): ToolResultEventResult | undefined => {
     runtime.delivery.refreshStatus();
-    const usage = runtime.children.takePendingUsage();
+    const usage = runtime.children.isClosed ? undefined : runtime.children.takePendingUsage();
     // Nested/codemode results only reach the calling tool, never the model.
     const inbox = event.parentToolCallId !== undefined || event.toolName === "subagent" ? [] : runtime.delivery.inbox();
     if (!usage && inbox.length === 0) return;
@@ -69,14 +81,16 @@ export default function (pi: ExtensionAPI) {
     return result;
   });
   pi.on("session_shutdown", async () => {
-    runtime.delivery.close();
-    await runtime.children.close();
+    const owner = runtime;
+    owner.delivery.close();
+    await owner.children.close();
+    owner.persistUsage();
   });
   pi.on("session_start", async (_event, ctx) => {
     runtime.delivery.close();
     await runtime.children.close();
     runtime = createRuntime();
-    runtime.delivery.bind(ctx);
+    runtime.bind(ctx);
   });
   // agent_start also fires for retries/boundary continuations. Rearm notices
   // only for a new external run, or a dropped notice can cause a restart loop.
@@ -85,7 +99,10 @@ export default function (pi: ExtensionAPI) {
   pi.on("turn_start", () => runtime.delivery.turnStarted());
   pi.on("turn_end", (event, ctx) => runtime.delivery.boundary(event, ctx));
   pi.on("agent_before_settle", (event, ctx) => runtime.delivery.boundary(event, ctx));
-  pi.on("agent_settled", (_event, ctx) => runtime.delivery.settled(ctx));
+  pi.on("agent_settled", (_event, ctx) => {
+    runtime.delivery.settled(ctx);
+    if (!runtime.children.isClosed) runtime.persistUsage();
+  });
 
   pi.registerTool({
     name: "subagent",
@@ -114,7 +131,7 @@ export default function (pi: ExtensionAPI) {
       if (isChildProcess()) throw new Error("Children are leaves; nested subagent calls are not supported.");
       // Capture the owner: an old foreground call must never read a new session's registry.
       const owner = runtime.children;
-      runtime.delivery.bind(ctx);
+      runtime.bind(ctx);
       if (params.command === "status") {
         const results = params.id ? [owner.get(params.id)] : owner.list();
         return answer("status", results, childStatuses);

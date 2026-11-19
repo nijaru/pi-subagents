@@ -252,6 +252,5 @@ describe("non-consuming readiness announcements", () => {
     expect(c.statuses).toHaveLength(count);
     expect(c.delivery.inbox()).toEqual([]);
     expect(c.children.unread()).toEqual([]);
-    expect(c.children.takePendingUsage()).toBeUndefined();
   });
 });

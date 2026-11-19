@@ -9,10 +9,12 @@ test.each(([
   ["openai-completions", "run", true], ["openai-completions", "spawn", true],
   ["openai-responses", "run", true], ["openai-responses", "spawn", true],
   ["openai-codex-responses", "run", true], ["openai-codex-responses", "spawn", true],
-  ["openai-completions", "run", false],
+  ["openai-completions", "run", false], ["openai-completions", "idle", true],
 ] as const).map(([api, mode, supportsStrictMode]) => ({ api, mode, supportsStrictMode })))("real Pi $api parent delegates with $mode (strict supported: $supportsStrictMode)", async ({ api, mode, supportsStrictMode }) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rpc-parent-"));
   const requests: any[] = [];
+  const parentIdle = path.join(dir, "parent-idle");
+  const parentSessions = path.join(dir, "parent-sessions");
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
@@ -35,11 +37,11 @@ test.each(([
       if (isParent && !returned) {
         delta = { tool_calls: [{ index: 0, id: "parent_subagent", type: "function", function: {
           name: "subagent",
-          arguments: args({ command: mode, label: "fixture review", prompt: "/capture CHILD_SENTINEL: read fixture.txt and report it.", tools: ["read"] }),
+          arguments: args({ command: mode === "idle" ? "spawn" : mode, label: "fixture review", prompt: "/capture CHILD_SENTINEL: read fixture.txt and report it.", tools: ["read"] }),
         } }] };
       } else if (isParent) {
         const text = JSON.stringify(messages);
-        if (mode === "run" || messages.some((message: any) => isToolResult(message) && JSON.stringify(message.content ?? message.output).includes("CHILD_OK"))) {
+        if (mode === "idle" || mode === "run" || messages.some((message: any) => isToolResult(message) && JSON.stringify(message.content ?? message.output).includes("CHILD_OK"))) {
           delta = { content: "PARENT_OK" };
         } else {
           const handle = /Started child (sa-\d+)/.exec(text)?.[1];
@@ -54,6 +56,12 @@ test.each(([
           } }] };
         }
       } else if (isChild && !returned) {
+        // Keep the child running until the parent's last turn has settled.
+        if (mode === "idle") {
+          const deadline = Date.now() + 8000;
+          while (!fs.existsSync(parentIdle) && Date.now() < deadline) await Bun.sleep(10);
+          if (!fs.existsSync(parentIdle)) return new Response("Parent did not settle", { status: 400 });
+        }
         delta = { tool_calls: [{ index: 0, id: "child_read", type: "function", function: {
           name: "read", arguments: JSON.stringify({ path: "fixture.txt" }),
         } }] };
@@ -91,7 +99,21 @@ test.each(([
   try {
     fs.writeFileSync(path.join(dir, "fixture.txt"), "FILE_SENTINEL");
     fs.writeFileSync(path.join(dir, "capture.ts"), `import { writeFileSync } from "node:fs";
-export default (pi: any) => pi.registerCommand("capture", { handler: async () => { writeFileSync("command-ran", "yes"); } });`);
+import { setTimeout as delay } from "node:timers/promises";
+export default (pi: any) => {
+  pi.registerCommand("capture", { handler: async () => { writeFileSync("command-ran", "yes"); } });
+  if (${mode === "idle"} && process.env.PI_SUBAGENT_DEPTH === "0") {
+    pi.on("agent_settled", async (_event: any, ctx: any) => {
+      writeFileSync(${JSON.stringify(parentIdle)}, "yes");
+      // Hold the print-mode parent open while the child finishes during idle.
+      const deadline = Date.now() + 8000;
+      while (!ctx.sessionManager.getBranch().some((e: any) => e.type === "custom" && e.customType === "subagent-usage")) {
+        if (Date.now() >= deadline) throw new Error("Idle child usage was not persisted");
+        await delay(10);
+      }
+    });
+  }
+};`);
     fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ extensions: [path.join(dir, "capture.ts")], transport: "sse", cacheWarming: "off" }));
     fs.writeFileSync(path.join(dir, "models.json"), JSON.stringify({ providers: { fixture: {
       baseUrl: `http://127.0.0.1:${server.port}/v1`, api,
@@ -106,7 +128,7 @@ export default (pi: any) => pi.registerCommand("capture", { handler: async () =>
     const cli = path.resolve(import.meta.dir, "../node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
     const extension = process.env.PI_SUBAGENT_TEST_EXTENSION ?? path.resolve(import.meta.dir, "../extensions/pi-subagents/index.ts");
     proc = Bun.spawn([
-      "node", cli, "--mode", "json", "-p", "--no-session", "--extension", extension,
+      "node", cli, "--mode", "json", "-p", ...(mode === "idle" ? ["--session-dir", parentSessions] : ["--no-session"]), "--extension", extension,
       "--tools", "subagent,read", "--model", "fixture/model",
       "PARENT_SENTINEL: delegate the bounded task.",
     ], {
@@ -124,7 +146,7 @@ export default (pi: any) => pi.registerCommand("capture", { handler: async () =>
     const err = await stderr;
     expect({ exit, stderr: err }).toEqual({ exit: 0, stderr: "" });
     expect(out).toContain("PARENT_OK");
-    expect(out).toContain("CHILD_OK");
+    if (mode !== "idle") expect(out).toContain("CHILD_OK");
     const events = out.trim().split("\n").map((line) => JSON.parse(line));
     const delegated = events.find((event) => event.type === "message_end" && event.message.role === "toolResult" && event.message.toolName === "subagent");
     expect(delegated.message.isError).toBe(false);
@@ -137,14 +159,23 @@ export default (pi: any) => pi.registerCommand("capture", { handler: async () =>
     expect(JSON.stringify(declaration.parameters)).not.toMatch(/"(?:minLength|maxLength|uniqueItems|pattern|minimum|maximum|minItems|maxItems)":/);
     const billedInput = events.filter((event) => event.type === "message_end" && event.message.role === "toolResult")
       .reduce((sum, event) => sum + (event.message.usage?.input ?? 0), 0);
-    expect(billedInput).toBe(40); // Two child calls, charged once regardless of retrieval.
+    expect(billedInput).toBe(mode === "idle" ? 0 : 40);
+    if (mode === "idle") {
+      const sessionFiles = fs.readdirSync(parentSessions).filter((name) => name.endsWith(".jsonl"));
+      expect(sessionFiles).toHaveLength(1);
+      const entries = fs.readFileSync(path.join(parentSessions, sessionFiles[0]!), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      expect(entries.filter((entry) => entry.customType === "subagent-usage")).toEqual([
+        expect.objectContaining({ type: "custom", data: expect.objectContaining({ input: 40, output: 4 }) }),
+      ]);
+      expect(out).not.toContain("Child results ready:");
+    }
     // Structured results belong to execution events; transcript tool messages
     // intentionally retain only content/details/usage on the host.
     const execution = events.find((event) => event.type === "tool_execution_end" && event.toolName === "subagent");
     expect(execution.result.structuredContent).toEqual(execution.result.details);
     if (mode === "run") expect(JSON.stringify(delegated.message)).toContain("CHILD_OK");
     else expect(delegated.message.details.command).toBe("spawn");
-    if (mode === "run") expect(requests).toHaveLength(4);
+    if (mode !== "spawn") expect(requests).toHaveLength(4);
     else {
       const announced = requests.find((request) => JSON.stringify(request.messages ?? request.input).includes("Child results ready:"));
       expect(announced).toBeDefined();
